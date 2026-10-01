@@ -1,0 +1,32 @@
+# pkapp AppSpec（协议 B B.w 校验；字段含义见 docs/PACKAGER_SPEC.md §2）
+[app]
+name = "helloworld"
+version = "0.1.0"
+entry = "app.main:app"
+min_app_version = "0.1.0"      # V9 防回滚地板：低于此版本的签名包将被壳拒绝
+min_pkapp_version = "0.1.0"
+coexist = false                # 升级共存开关（默认关闭）
+
+[dependencies]
+python = [
+    "applocal>=0.1.0",         # 契约层（协议 A/C）；必装件
+    "uvicorn>=0.30",           # ASGI server（用户应用自带，applocal 惰性导入）
+]
+
+[heartbeat]                    # 壳轮询参数（SHELL_PROTOCOL §5，AppSpec 可调）
+interval_s = 5
+timeout_s = 30
+cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap 返回）
+
+[dist]
+dir = "dist"                   # 前端产物目录（恒存在；空缺时 build 生成占位页）
+
+[platforms]                    # 平台段：依赖追加式合并（公共 + 平台），未知段名报错
+[platforms.windows]
+# dependencies = [ "pywin32>=306", ]   # 仅 Windows 装的依赖
+# icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
+[platforms.android]            # M3 预留
+package = "com.example.helloworld"
+abis = ["arm64-v8a"]
+[platforms.linux]              # M2 预留
+setproctitle = true

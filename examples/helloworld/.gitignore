@@ -1,0 +1,7 @@
+.venv/
+.dev/
+build/
+release/
+.pkapp/
+__pycache__/
+*.pyc

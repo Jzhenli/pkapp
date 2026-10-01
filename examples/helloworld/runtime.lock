@@ -1,0 +1,5 @@
+# 运行时快照注册（CPython 来源：python-build 产物，快照锁定）。
+# build 前把 dir 指向解压后的 PBS 安装目录（须含 python3XX.dll / Lib/ / DLLs/，B.t①）。
+# [runtime.windows]
+# python_version = "3.12.14"
+# dir = "D:/runtimes/pbs-cpython-3.12.14"

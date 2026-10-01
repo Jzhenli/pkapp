@@ -52,6 +52,9 @@ pkapp package windows   :: 产物：release\myapp.zip
 已默认进 .gitignore）。Android 打包另需本机 JDK17 + SDK 35 + NDK 27.3 工具链，
 布局约定见 [shell-android/README.md](shell-android/README.md)。
 
+**最小示例**：[examples/helloworld](examples/helloworld/) —— 纯 ASGI + 一次性握手鉴权
++ 前端自检页的完整打包样例。
+
 **安全模型**：spk 用 Ed25519 签名，验签公钥烧进壳；`pkapp create` 生成项目级
 `.pkapp/sign.key`（已默认进 .gitignore，绝不入库）。壳默认严格鉴权
 （握手码一次性换取 token，API 调用带 `x-myapp-token`）。
@@ -75,3 +78,7 @@ CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）跑前两层；壳�
 - **Linux**：规划中（M3，tar.gz 形态）。
 
 当前为早期开发阶段，接口与格式可能变动（文档内 ★vX.Y★ 为变更标记）。
+
+## 许可证
+
+[LGPL-3.0](LICENSE)
