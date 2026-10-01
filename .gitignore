@@ -12,6 +12,7 @@ venv/
 
 # 产物
 dist/
+!examples/**/dist/
 build/
 *.spk
 *.tar.gz

@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Hello World</title>
+<style>
+  body { font-family: "Microsoft YaHei UI", system-ui, sans-serif; margin: 0;
+         min-height: 100vh; display: flex; flex-direction: column;
+         align-items: center; justify-content: center; background: #f7f8fa; }
+  h1 { font-size: 3rem; color: #1f2937; margin: 0 0 .5rem; }
+  p  { color: #6b7280; margin: .25rem 0; }
+  code { background: #eef1f5; padding: .15rem .4rem; border-radius: 4px; }
+</style></head>
+<body>
+<h1>Hello, World!</h1>
+<p>pkapp 打包链演示：create → build → 换名重编壳 → 装壳启动。</p>
+<p>接口自检：<code id="api">请求 /api/hello …</code></p>
+<script>
+  // 鉴权握手：壳导航带一次性 ?handshake= 码 → POST /auth 换 token → API 带 x-myapp-token 头。
+  // token 存 sessionStorage，页面刷新免重复握手。
+  (function () {
+    var el = document.getElementById('api');
+    var qs = new URLSearchParams(location.search);
+    var call = function (tk) {
+      sessionStorage.setItem('tk', tk);
+      fetch('/api/hello', { headers: { 'x-myapp-token': tk } })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          el.textContent = 'version=' + j.version + ' · data_dir=' + j.data_dir;
+        })
+        .catch(function (e) { el.textContent = '失败: ' + e; });
+    };
+    var tk = sessionStorage.getItem('tk');
+    if (tk) { call(tk); return; }
+    fetch('/auth', { method: 'POST',
+                     headers: { 'content-type': 'application/json' },
+                     body: JSON.stringify({ handshake: qs.get('handshake') }) })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { call(j.token); })
+      .catch(function (e) { el.textContent = '失败: ' + e; });
+  })();
+</script>
+</body></html>
