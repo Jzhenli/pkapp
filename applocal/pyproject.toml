@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "applocal"
+version = "0.1.0"
+description = "pkapp 契约层：壳 ⇄ applocal（协议 A）与 applocal ⇄ 用户代码（协议 C）"
+requires-python = ">=3.10"
+dependencies = [] # 零强制依赖：uvicorn 仅在 bootstrap 内惰性导入，由用户应用自带
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["applocal"]

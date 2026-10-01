@@ -1,0 +1,29 @@
+name: ci
+# 工具 CI 骨架（方案 §十一.9）：applocal 契约测试 + pkapp golden test。
+# 占位（随 M1 推进补齐）：示例回归（示例项目一键构建冒烟）、strict-auth 冒烟（§4.3）。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]        # 自用主开发环境；后续可加 ubuntu
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install applocal + pkapp
+        run: |
+          python -m pip install -e applocal -q
+          python -m pip install -e pkapp -q
+      - name: applocal 契约测试（协议 A §12.1）
+        run: python -m pytest applocal/tests -q
+      - name: pkapp 工具测试（含 golden G1-G7，mock runtime）
+        run: python -m pytest pkapp/tests -q

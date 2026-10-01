@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M2 Android 壳（SHELL_PROTOCOL §10.2）：壳=引导器——验签由 APK 签名承担，
+     单实例由 launcher/singleTask 承担；本壳职责：assets 解压 → JNI 引导 → WebView → 心跳轮询 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="PKApp Shell"
+        android:icon="@drawable/ic_app"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!-- singleTask：第二实例并入首实例（单实例语义的平台承担者，协议 §12.2⑤ 的 Android 形态）；
+             configChanges 全收：旋转/深浅色不重建 Activity（重建会重走 boot）-->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|locale|layoutDirection|fontScale|navigation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 前台服务：把进程抬出 cached 桶，保证前后台切换/息屏时 uvicorn 与心跳不死（M2 验收项） -->
+        <service
+            android:name=".BootService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="embedded-python-local-server" />
+        </service>
+    </application>
+</manifest>

@@ -1,0 +1,45 @@
+# 运行时实体（下载的 CPython 快照与原型布局，可用 make_runtime_proto.py 重建）
+.cache/
+tools/.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 产物
+dist/
+build/
+*.spk
+*.tar.gz
+*.tar.zst
+
+# 签名私钥（绝不入库）
+.pkapp/
+
+# 本机大体积环境（CPython 快照 / Android 工具链 / 测试链产物）
+toolchain/
+runtimes/
+out/
+
+# Android/Gradle
+.gradle/
+.cxx/
+.kotlin/
+local.properties
+
+# Android 壳解释器件（prepare_runtime.py / prepare_libpython.py 从 flet 快照铺设，可再生成）
+**/jniLibs/
+**/assets/stdlib.zip
+
+# 编译产物散件
+*.obj
+*.pdb
+*.apk
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,1550 @@
+/* shell.cpp — pkapp Windows 壳（协议 A v1.2 §3 九步职责）。
+ *
+ * 职责边界：壳 = dumb loader（"让一个可信的 Python 在正确的位置醒来"）。
+ *   0  单实例互斥（覆盖验签→LoadLibrary 全程）
+ *   1  验签（format_version → Ed25519 → 版本单调性 → spk_hash）
+ *   2  指纹比对 / 全量解压（staging → 原子 rename）
+ *   3  预清理旧 ready 与旧握手码
+ *   4  设置环境变量（含新 token）
+ *   5  stdio 重定向（双保险，覆盖 Initialize 前窗口期）
+ *   6  LoadLibraryEx(manifest.python_dll, LOAD_WITH_ALTERED_SEARCH_PATH)
+ *   7  记账 runtime.version（LoadLibrary 成功后——指纹规则③′）
+ *   8  import applocal; bootstrap(entry) → PyEval_SaveThread（V1 致命条款）
+ *   8.5 等待 ready（seq 主判据 + 冷启动 120s 档）→ 握手码导航
+ *   9  心跳消费（30s seq 无增长 / ready 消失 / ready{false} → 判死 → diag 错误页）
+ * 线程模型四注记见 README.md；退出一律 ExitProcess（不做 Py_Finalize）。
+ */
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <bcrypt.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <io.h>
+#include <objbase.h>
+#include <shellapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <time.h>
+
+#include "ed25519.h"
+#include "manifest.h"
+#include "sha256.h"
+#include "spk.h"
+#include "WebView2.h"
+
+#ifndef APP_NAME_W
+#define APP_NAME_W L"MyApp"
+#endif
+
+/* AppSpec 可调项（构建期定义；协议 §5 冷启动超时默认 120s） */
+#ifndef BOOT_TIMEOUT_MS
+#define BOOT_TIMEOUT_MS 120000
+#endif
+#define HEARTBEAT_DEAD_MS 30000 /* seq 判死窗口（§5：30s，5s/次容忍 5 拍） */
+#define TICK_MS 500             /* 轮询节拍（主线程 WM_TIMER；协议禁独立线程） */
+
+#define IDT_TICK 1
+#define IDC_RESTART 1001
+#define IDC_QUIT 1002
+#define IDC_ERRTEXT 1003
+
+/* ---------- 全局路径与应用身份 ---------- */
+static std::wstring g_install;         /* 安装目录（exe 所在） */
+static std::wstring g_runtime;         /* 展开区 <install>\_runtime */
+static std::wstring g_spk;             /* <install>\<APP_NAME>.spk */
+static std::wstring g_data, g_cache, g_logdir;
+static std::wstring g_ready, g_diag, g_handshake;
+static std::wstring g_runtime_version; /* 指纹记账 <runtime>\runtime.version */
+
+/* 应用身份 = exe 文件名 stem（运行时派生，setup_paths 覆写默认值）：
+ * 数据目录 / 互斥键 / 窗口类 / 日志名 / <stem>.spk 全部随之——壳模板同二进制适配任意名 */
+static std::wstring g_appname = APP_NAME_W;
+
+static std::wstring g_class;           /* 窗口类名（与互斥键同名约定派生，方案 §5.5） */
+static std::wstring g_title;
+
+static HWND g_hwnd;
+static HWND g_splash;      /* 启动加载层（STATIC 子窗口，覆盖客户区） */
+static HFONT g_splash_font;
+static ICoreWebView2Environment *g_env2;
+static ICoreWebView2Controller *g_ctl2;
+static ICoreWebView2 *g_web2;
+static EventRegistrationToken g_navtoken, g_proctoken, g_navdonetoken;
+
+/* ready 轮询状态机 */
+enum Phase { PH_COLD = 0, PH_RUNTIME = 1, PH_DEAD = 2 };
+static Phase g_phase = PH_COLD;
+static DWORD g_boot_start;
+static long g_last_seq = -1;
+static DWORD g_last_seq_change;
+static int g_port = 0;
+
+/* ================= 基础工具 ================= */
+
+static std::wstring utf8_to_wide(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    std::wstring w(n > 0 ? n : 1, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+    while (!w.empty() && w.back() == L'\0') w.pop_back();
+    return w;
+}
+
+static std::string wide_to_utf8(const std::wstring &w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
+    std::string s(n > 0 ? n : 1, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, NULL, NULL);
+    return s;
+}
+
+static std::wstring join_path(const std::wstring &a, const wchar_t *b) {
+    if (!a.empty() && a.back() == L'\\') return a + b;
+    return a + L"\\" + b;
+}
+
+static BOOL file_exists(const std::wstring &p) {
+    DWORD at = GetFileAttributesW(p.c_str());
+    return at != INVALID_FILE_ATTRIBUTES && !(at & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL dir_exists(const std::wstring &p) {
+    DWORD at = GetFileAttributesW(p.c_str());
+    return at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* 32 字节随机 → 64 hex（token / 握手码） */
+static BOOL random_hex64(char out[65]) {
+    uint8_t raw[32];
+    if (BCryptGenRandom(NULL, raw, sizeof(raw), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        return FALSE;
+    for (int i = 0; i < 32; i++) sprintf(out + 2 * i, "%02x", raw[i]);
+    out[64] = 0;
+    return TRUE;
+}
+
+/* 导航 URL 中的握手码（?handshake=<64hex>；无码/畸形 → FALSE）。
+   码由壳生成恒为小写 hex，故不做百分号解码、不收大写。 */
+static BOOL handshake_code_from_url(const wchar_t *uri, char out[65]) {
+    const wchar_t *q = wcschr(uri, L'?');
+    if (!q) return FALSE;
+    q++;
+    while (q && *q) {
+        if (wcsncmp(q, L"handshake=", 10) == 0) {
+            const wchar_t *v = q + 10;
+            for (int i = 0; i < 64; i++) {
+                wchar_t c = v[i];
+                if (c < L'0' || c > L'f' || (c > L'9' && c < L'a')) return FALSE;
+                out[i] = (char)c;
+            }
+            out[64] = 0;
+            return v[64] == 0 || v[64] == L'&';
+        }
+        q = wcschr(q, L'&');
+        if (q) q++;
+    }
+    return FALSE;
+}
+
+/* 原子写（项目硬约束：tmp + rename） */
+static BOOL atomic_write_utf8(const std::wstring &path, const char *data, size_t len) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD written = 0;
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    if (!WriteFile(h, data, (DWORD)len, &written, NULL) || written != len ||
+        !FlushFileBuffers(h)) {
+        CloseHandle(h);
+        DeleteFileW(tmp.c_str());
+        return FALSE;
+    }
+    CloseHandle(h);
+    return MoveFileExW(tmp.c_str(), path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+/* ================= diag.json（协议 §9） ================= */
+
+static void json_escape(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 8 < cap; p++) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20) o += (size_t)sprintf(out + o, "\\u%04x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+}
+
+static void diag_write(const char *stage, const char *error, const char *detail,
+                       int recoverable) {
+    char err_e[1024], det_e[4096], *json;
+    json_escape(error, err_e, sizeof(err_e));
+    json_escape(detail ? detail : "", det_e, sizeof(det_e));
+    json = (char *)malloc(strlen(err_e) + strlen(det_e) + 256);
+    if (!json) return;
+    sprintf(json,
+            "{\"stage\": \"%s\", \"error\": \"%s\", \"detail\": \"%s\", "
+            "\"recoverable\": %s, \"ts\": %lld}",
+            stage, err_e, det_e, recoverable ? "true" : "false", (long long)time(NULL));
+    atomic_write_utf8(g_diag, json, strlen(json));
+    free(json);
+    printf("[diag] stage=%s error=%s\n", stage, error); /* 同步落日志便于排查 */
+}
+
+/* 读 diag.json 的 error 字段（错误页摘要；迷你解析仅服务自有写入器） */
+static void diag_read_summary(char *out, size_t cap) {
+    FILE *f = _wfopen(g_diag.c_str(), L"rb");
+    char buf[8192];
+    size_t n;
+    out[0] = 0;
+    if (!f) return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char *k = strstr(buf, "\"error\"");
+    if (!k) return;
+    k = strchr(k + 7, ':');
+    if (!k) return;
+    k++;
+    while (*k == ' ' || *k == '\t') k++;
+    if (*k != '"') return;
+    k++;
+    {
+        size_t o = 0;
+        while (*k && *k != '"' && o + 2 < cap) {
+            if (*k == '\\' && k[1]) { out[o++] = k[1]; k += 2; }
+            else out[o++] = *k++;
+        }
+        out[o] = 0;
+    }
+}
+
+/* ================= stdio 重定向（§7 双保险 + 按天轮转留 7 份） ================= */
+
+static void stdio_redirect_to_log(void) {
+    char date[16];
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_s(&lt, &now);
+    sprintf(date, "%04d%02d%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+
+    /* 清理 >7 天旧日志（按天命名 + mtime 双重判据） */
+    {
+        std::wstring pattern =
+            join_path(g_logdir, (g_appname + L"-*.log").c_str());
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE) {
+            FILETIME ftNow;
+            ULONGLONG now100;
+            GetSystemTimeAsFileTime(&ftNow);
+            now100 = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
+            do {
+                ULONGLONG ft = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                               fd.ftLastWriteTime.dwLowDateTime;
+                if (now100 > ft && (now100 - ft) / 10000000ULL > 7ULL * 86400) {
+                    std::wstring full = join_path(g_logdir, fd.cFileName);
+                    SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    DeleteFileW(full.c_str());
+                }
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+    }
+
+    std::wstring log = join_path(
+        g_logdir, (g_appname + L"-" + utf8_to_wide(date) + L".log").c_str());
+    /* GUI 子系统下 stdout/stderr 的 FILE* 内部绑定不可靠：fd 层 _write 可用，但 printf
+     * 走 FILE* 层静默丢失（e2e PROBE 实测：_write(1) 落盘、printf 无踪）。
+     * _wfreopen 一并重绑 FILE* 与 fd 1/2 → CRT/Python 双通道都落到日志（协议 §7 双保险）。 */
+    FILE *f1 = _wfreopen(log.c_str(), L"at", stdout);
+    FILE *f2 = _wfreopen(log.c_str(), L"at", stderr);
+    if (f1) SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(1));
+    if (f2) SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(2));
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    /* CI 断言锚点（协议 §7）：该行必须出现在日志文件中 */
+    printf("PRE-INIT-PROBE\n");
+    fflush(stdout);
+}
+
+/* 引导阶段日志锚点（立即落盘——卡死时也必须看得到卡点） */
+static void slog(const char *s) {
+    printf("[shell] %s\n", s);
+    fflush(stdout);
+}
+
+/* ================= 目录契约与 B.t③ 防御 ================= */
+
+static BOOL setup_paths(void) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return FALSE;
+    std::wstring exep(exe);
+    size_t slash = exep.find_last_of(L'\\');
+    g_install = (slash == std::wstring::npos) ? L"." : exep.substr(0, slash);
+    /* 身份派生：exe 文件名 stem（无扩展名；找不到扩展名时用全名） */
+    {
+        std::wstring exefile = (slash == std::wstring::npos) ? exep : exep.substr(slash + 1);
+        size_t dot = exefile.find_last_of(L'.');
+        g_appname = (dot == std::wstring::npos || dot == 0) ? exefile : exefile.substr(0, dot);
+    }
+
+    const wchar_t *lad = _wgetenv(L"LOCALAPPDATA");
+    if (!lad || !*lad) return FALSE;
+    std::wstring base = join_path(lad, g_appname.c_str());
+    g_data = join_path(base, L"data");
+    g_cache = join_path(base, L"cache");
+    g_logdir = join_path(g_cache, L"log");
+    g_ready = join_path(g_cache, L"ready");
+    g_diag = join_path(g_cache, L"diag.json");
+    g_handshake = join_path(g_cache, L"handshake");
+    g_runtime = join_path(g_install, L"_runtime");
+    g_spk = join_path(g_install, (g_appname + L".spk").c_str());
+    g_runtime_version = join_path(g_runtime, L"runtime.version");
+
+    g_class = L"pkapp-" + g_appname + L"-window";
+    g_title = g_appname;
+
+    CreateDirectoryW(base.c_str(), NULL);
+    CreateDirectoryW(g_data.c_str(), NULL);
+    CreateDirectoryW(g_cache.c_str(), NULL);
+    CreateDirectoryW(g_logdir.c_str(), NULL);
+    return TRUE;
+}
+
+/* B.t③：安装目录严禁 <EXE-stem>._pth——展开区缺 _pth 时会被 fallback 命中并
+   静默指向不存在的目录。壳侧一并防御（协议 §2.1②）。 */
+static BOOL check_install_dir_clean(char *err, size_t cap) {
+    std::wstring pth = join_path(g_install, (g_appname + L"._pth").c_str());
+    if (file_exists(pth)) {
+        _snprintf(err, cap - 1, "安装目录存在 %ls._pth（B.t 禁令）——删除后重试", g_appname.c_str());
+        err[cap - 1] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ================= 递归删除与解压（步骤 2） ================= */
+
+static BOOL rm_tree(const std::wstring &dir) {
+    std::wstring pattern = join_path(dir, L"*");
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring full = join_path(dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!rm_tree(full)) { FindClose(find); return FALSE; }
+            } else {
+                SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(full.c_str());
+            }
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    return RemoveDirectoryW(dir.c_str()) != 0;
+}
+
+static void wide_path_from_entry(const char *rel, wchar_t *out, size_t cap) {
+    /* spk 路径 UTF-8 + '/' 分隔 → wide + '\' */
+    std::wstring w = utf8_to_wide(rel);
+    for (size_t i = 0; i < w.size(); i++)
+        if (w[i] == L'/') w[i] = L'\\';
+    _snwprintf(out, cap - 1, L"%s", w.c_str());
+    out[cap - 1] = 0;
+}
+
+static void mk_parent_dirs(const std::wstring &file) {
+    size_t pos = 0;
+    while ((pos = file.find(L'\\', pos + 1)) != std::wstring::npos)
+        CreateDirectoryW(file.substr(0, pos).c_str(), NULL);
+}
+
+/* 展开全部条目到 staging（manifest 条目落 staging 根，同协议 B §1 布局） */
+static int extract_all(spk_file *spk, const std::wstring &staging, char *err, size_t cap) {
+    CreateDirectoryW(staging.c_str(), NULL);
+    for (int i = 0; i < spk->count; i++) {
+        wchar_t rel[1024];
+        std::wstring full;
+        HANDLE h;
+        DWORD written = 0;
+        wide_path_from_entry(spk->entries[i].path, rel, 1024);
+        full = join_path(staging, rel);
+        mk_parent_dirs(full);
+        h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            _snprintf(err, cap - 1, "写出条目失败: %s (GetLastError=%lu)",
+                      spk->entries[i].path, (unsigned long)GetLastError());
+            err[cap - 1] = 0;
+            return -1;
+        }
+        if (!WriteFile(h, spk->entries[i].data, spk->entries[i].size, &written, NULL) ||
+            written != spk->entries[i].size) {
+            _snprintf(err, cap - 1, "条目写入不完整: %s", spk->entries[i].path);
+            err[cap - 1] = 0;
+            CloseHandle(h);
+            return -1;
+        }
+        CloseHandle(h);
+    }
+    return 0;
+}
+
+static std::wstring stage_dir_with(const wchar_t *tag) {
+    wchar_t pid[16];
+    _snwprintf(pid, 15, L"%lu", (unsigned long)GetCurrentProcessId());
+    return g_install + L"\\_runtime." + tag + L"-" + pid;
+}
+
+/* 目录 rename：新写入的 DLL/pyd 会被 Defender/索引器瞬时握柄（无 FILE_SHARE_DELETE），
+ * MoveFileExW 报 ERROR_ACCESS_DENIED/SHARING_VIOLATION——需带预算重试（总上限 60s，
+ * 实测 5s 预算在 Defender 首扫时必炸）。 */
+static BOOL move_dir_retry(const std::wstring &from, const std::wstring &to) {
+    /* Defender 首扫 32MB/576 文件可锁目录数十秒（实测 5s 预算必炸 → 就位失败误报）：
+     * 预算 60s，每 5s 打一条进度锚点（stderr→日志） */
+    for (int i = 0; i < 120; i++) {
+        if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH)) return TRUE;
+        DWORD e = GetLastError();
+        if (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION &&
+            e != ERROR_LOCK_VIOLATION)
+            return FALSE;
+        if (i % 10 == 0) {
+            char buf[96];
+            _snprintf(buf, sizeof(buf) - 1,
+                      "promote retry %d/120 (GetLastError=%lu, Defender scanning?)", i,
+                      (unsigned long)e);
+            buf[sizeof(buf) - 1] = 0;
+            slog(buf);
+        }
+        Sleep(500);
+    }
+    return FALSE;
+}
+
+/* staging 写完 → 旧区让位 → staging 就位 → 删旧（铁律①：严禁覆盖式解压） */
+static int promote_staging(const std::wstring &staging, char *err, size_t cap) {
+    std::wstring oldp = stage_dir_with(L"old");
+    if (dir_exists(oldp)) rm_tree(oldp);
+    if (dir_exists(g_runtime)) {
+        if (!move_dir_retry(g_runtime, oldp)) {
+            _snprintf(err, cap - 1, "旧展开区让位失败 (GetLastError=%lu)",
+                      (unsigned long)GetLastError());
+            err[cap - 1] = 0;
+            return -1;
+        }
+    }
+    if (!move_dir_retry(staging, g_runtime)) {
+        _snprintf(err, cap - 1, "staging 就位失败 (GetLastError=%lu)",
+                  (unsigned long)GetLastError());
+        err[cap - 1] = 0;
+        return -1;
+    }
+    if (dir_exists(oldp)) rm_tree(oldp);
+    return 0;
+}
+
+/* 指纹记账："app_version=<v>\nspk_hash=<hex>\n"（规则①原子写、②损坏=全量重建） */
+struct Fingerprint {
+    char version[64];
+    char hash[65];
+    BOOL present;
+};
+
+static void fingerprint_read(Fingerprint *fp) {
+    FILE *f = _wfopen(g_runtime_version.c_str(), L"rb");
+    char buf[512];
+    size_t n;
+    memset(fp, 0, sizeof(*fp));
+    if (!f) return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char *v = strstr(buf, "app_version=");
+    const char *h = strstr(buf, "spk_hash=");
+    if (v && h) {
+        sscanf(v + 12, "%63s", fp->version);
+        sscanf(h + 9, "%64s", fp->hash);
+        fp->present = TRUE;
+    }
+}
+
+/* ================= 版本单调性（协议 B §2 + V9 双防线） ================= */
+
+/* min_app_version 持久防线：data\version_floor（只见更高才推进） */
+static BOOL version_floor_check_ge(const char *app_version, char *err, size_t cap) {
+    std::wstring floor_path = join_path(g_data, L"version_floor");
+    FILE *f = _wfopen(floor_path.c_str(), L"rb");
+    char floor[64] = {0};
+    if (f) {
+        char buf[128];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        sscanf(buf, "%63s", floor);
+    }
+    if (floor[0]) {
+        int c = manifest_version_cmp(app_version, floor);
+        if (c == -2) {
+            _snprintf(err, cap - 1, "版本号格式非法: %s", app_version);
+            err[cap - 1] = 0;
+            return FALSE;
+        }
+        if (c < 0) {
+            _snprintf(err, cap - 1,
+                      "版本回滚被拒绝: %s < 已安装底线 %s（min_app_version 防线）",
+                      app_version, floor);
+            err[cap - 1] = 0;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void version_floor_update(const char *app_version) {
+    std::wstring floor_path = join_path(g_data, L"version_floor");
+    FILE *f = _wfopen(floor_path.c_str(), L"rb");
+    char floor[64] = {0};
+    if (f) {
+        char buf[128];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        sscanf(buf, "%63s", floor);
+    }
+    if (!floor[0] || manifest_version_cmp(app_version, floor) > 0) {
+        char line[80];
+        sprintf(line, "%s\n", app_version);
+        atomic_write_utf8(floor_path, line, strlen(line));
+    }
+}
+
+/* ================= WebView2（动态加载 loader，零 import 依赖） ================= */
+
+typedef HRESULT(WINAPI *PFN_GetAvailVer)(PCWSTR, LPWSTR *);
+typedef HRESULT(WINAPI *PFN_CreateEnv)(PCWSTR, PCWSTR,
+                                       ICoreWebView2EnvironmentOptions *,
+                                       ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
+
+/* 前置声明（WebView2 回调内使用错误页与代理清理） */
+static void show_error_ui(const char *summary_utf8, int recoverable);
+
+/* 浏览器进程退出后代理已死：必须整体置空。任何残留的非空指针被再次触
+ * 虚调用（如 WM_SIZE → put_Bounds）都是 0xC0000005（实测崩溃 @wnd_proc）。 */
+static void webview_teardown(void) {
+    if (g_web2) { g_web2->Release(); g_web2 = NULL; }
+    if (g_ctl2) { g_ctl2->Release(); g_ctl2 = NULL; }
+    if (g_env2) { g_env2->Release(); g_env2 = NULL; }
+}
+
+/* 启动加载层文案。boot_python 阻塞主线程期间消息泵不可用（WM_PAINT 不派发），
+ * SetWindowText 对同线程窗口同步执行 + UpdateWindow 强制立即重绘，保证阶段
+ * 文案在阻塞期也能上屏。 */
+static void set_splash(const char *utf8) {
+    if (!g_splash) return;
+    SetWindowTextW(g_splash, utf8_to_wide(utf8).c_str());
+    UpdateWindow(g_splash);
+}
+
+class EnvHandler : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (riid == __uuidof(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler) ||
+            riid == __uuidof(IUnknown)) {
+            *ppv = (IUnknown *)this;
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2Environment *env) override;
+private:
+    LONG ref_ = 1;
+};
+
+class CtlHandler : public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (riid == __uuidof(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler) ||
+            riid == __uuidof(IUnknown)) {
+            *ppv = (IUnknown *)this;
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2Controller *ctl) override;
+private:
+    LONG ref_ = 1;
+};
+
+class NavHandler : public ICoreWebView2NavigationStartingEventHandler {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (riid == __uuidof(ICoreWebView2NavigationStartingEventHandler) ||
+            riid == __uuidof(IUnknown)) {
+            *ppv = (IUnknown *)this;
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    /* 协议步骤 9（★v1.2 修正★）：主框架导航重写握手码。此前无条件写新随机码，
+       会把本次导航 URL 所附码作废（URL 码≠文件码）→ 页面 /auth 必 403。
+       现改为镜像导航 URL 中的码（本次加载的页面可成功握手）；
+       无码导航才写新随机码，作废可能遗留的未用码。 */
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
+                                     ICoreWebView2NavigationStartingEventArgs *args) override {
+        (void)sender;
+        LPWSTR uri = NULL;
+        char code[65];
+        if (!args) return S_OK;
+        if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
+            if (!handshake_code_from_url(uri, code) && !random_hex64(code)) {
+                CoTaskMemFree(uri);
+                return S_OK;
+            }
+            atomic_write_utf8(g_handshake, code, 64);
+            CoTaskMemFree(uri);
+        }
+        return S_OK;
+    }
+private:
+    LONG ref_ = 1;
+};
+
+/* 浏览器进程退出 → 清理僵尸代理 + 错误页（§9 绝不黑屏/绝不 AV） */
+class ProcFailHandler : public ICoreWebView2ProcessFailedEventHandler {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (riid == __uuidof(ICoreWebView2ProcessFailedEventHandler) ||
+            riid == __uuidof(IUnknown)) {
+            *ppv = (IUnknown *)this;
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
+                                     ICoreWebView2ProcessFailedEventArgs *args) override {
+        (void)sender;
+        COREWEBVIEW2_PROCESS_FAILED_KIND kind;
+        char det[96];
+        args->get_ProcessFailedKind(&kind);
+        sprintf(det, "process failed kind=%d", (int)kind);
+        diag_write("runtime", "WebView2 进程失败", det, TRUE);
+        if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED) {
+            webview_teardown();
+            show_error_ui("WebView2 浏览器进程异常退出。", TRUE);
+        } else {
+            /* 渲染进程级失败：Chromium 自动恢复，仅留痕 */
+            printf("[shell] webview2 process failed kind=%d (recoverable)\n", (int)kind);
+            fflush(stdout);
+        }
+        return S_OK;
+    }
+private:
+    LONG ref_ = 1;
+};
+
+/* 导航完成锚点：白屏排查的关键观测（服务端 200 但浏览器死亡时永不触发；
+ * 失败也走此回调 IsSuccess=FALSE——新头文件已无 NavigationFailed 事件） */
+class NavDoneHandler : public ICoreWebView2NavigationCompletedEventHandler {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = NULL;
+        if (riid == __uuidof(ICoreWebView2NavigationCompletedEventHandler) ||
+            riid == __uuidof(IUnknown)) {
+            *ppv = (IUnknown *)this;
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
+                                     ICoreWebView2NavigationCompletedEventArgs *args) override {
+        (void)sender;
+        BOOL ok = FALSE;
+        args->get_IsSuccess(&ok);
+        printf("[shell] nav completed ok=%d\n", ok ? 1 : 0);
+        fflush(stdout);
+        if (ok) {
+            if (g_splash) { /* 页面已实际渲染：撤掉加载层 */
+                DestroyWindow(g_splash);
+                g_splash = NULL;
+            }
+        } else {
+            set_splash("页面加载失败，请查看诊断日志。");
+        }
+        return S_OK;
+    }
+private:
+    LONG ref_ = 1;
+};
+
+/* 导航到应用首页（附一次性握手码） */
+static void navigate_to_app(void) {
+    char code[65];
+    wchar_t url[160];
+    if (!g_web2 || !g_port) return;
+    if (!random_hex64(code)) return;
+    atomic_write_utf8(g_handshake, code, 64);
+    _snwprintf(url, 159, L"http://127.0.0.1:%d/?handshake=%hs", g_port, code);
+    url[159] = 0;
+    printf("[shell] navigate port=%d\n", g_port);
+    g_web2->Navigate(url);
+}
+
+HRESULT EnvHandler::Invoke(HRESULT result, ICoreWebView2Environment *env) {
+    if (FAILED(result) || !env) {
+        diag_write("load", "WebView2 环境创建失败", "", TRUE);
+        return S_OK;
+    }
+    env->AddRef();
+    g_env2 = env;
+    CtlHandler *ctlh = new CtlHandler();
+    env->CreateCoreWebView2Controller(g_hwnd, ctlh);
+    ctlh->Release();
+    return S_OK;
+}
+
+HRESULT CtlHandler::Invoke(HRESULT result, ICoreWebView2Controller *ctl) {
+    if (FAILED(result) || !ctl) {
+        diag_write("load", "WebView2 控制器创建失败", "", TRUE);
+        return S_OK;
+    }
+    ctl->AddRef();
+    g_ctl2 = ctl;
+    ctl->get_CoreWebView2(&g_web2);
+    if (g_web2) {
+        NavHandler *nav = new NavHandler();
+        g_web2->add_NavigationStarting(nav, &g_navtoken);
+        nav->Release();
+        ProcFailHandler *pfh = new ProcFailHandler();
+        g_web2->add_ProcessFailed(pfh, &g_proctoken);
+        pfh->Release();
+        NavDoneHandler *dh = new NavDoneHandler();
+        g_web2->add_NavigationCompleted(dh, &g_navdonetoken);
+        dh->Release();
+        if (g_phase == PH_RUNTIME && g_port) navigate_to_app();
+    }
+    if (g_splash) { /* webview 宿主子窗口创建得更晚、在加载层之上：抬回顶端继续遮挡白屏 */
+        set_splash("正在加载页面…");
+        SetWindowPos(g_splash, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    slog("webview2 controller ready");
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    ctl->put_Bounds(rc);
+    return S_OK;
+}
+
+static void webview_start(void) {
+    HMODULE loader;
+    PFN_GetAvailVer pGet;
+    PFN_CreateEnv pCreate;
+    LPWSTR ver = NULL;
+    loader = LoadLibraryW(L"WebView2Loader.dll");
+    if (!loader) {
+        diag_write("load", "WebView2Loader.dll 缺失（应与 exe 同目录）", "", FALSE);
+        return;
+    }
+    pGet = (PFN_GetAvailVer)GetProcAddress(loader,
+                                           "GetAvailableCoreWebView2BrowserVersionString");
+    pCreate = (PFN_CreateEnv)GetProcAddress(loader,
+                                            "CreateCoreWebView2EnvironmentWithOptions");
+    if (!pGet || !pCreate) {
+        diag_write("load", "WebView2Loader.dll 导出不完整", "", FALSE);
+        return;
+    }
+    if (FAILED(pGet(NULL, &ver)) || !ver || !*ver) {
+        diag_write("load", "WebView2 运行时未检测到（Evergreen 缺失且无 Fixed Version）",
+                   "安装 Evergreen 运行时或在安装目录放置 WebView2Runtime/", FALSE);
+        if (ver) CoTaskMemFree(ver);
+        return;
+    }
+    CoTaskMemFree(ver);
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    {
+        std::wstring udf = join_path(g_cache, L"webview2");
+        CreateDirectoryW(udf.c_str(), NULL);
+        EnvHandler *h = new EnvHandler();
+        pCreate(NULL, udf.c_str(), NULL, h);
+        h->Release();
+    }
+}
+
+/* ================= ready 文件（§5 迷你解析；写方为 applocal 原子写） ================= */
+
+struct ReadyInfo {
+    BOOL exists;
+    BOOL ready;
+    long port;
+    long seq;
+};
+
+static void ready_read(ReadyInfo *ri) {
+    FILE *f = _wfopen(g_ready.c_str(), L"rb");
+    char buf[1024];
+    size_t n;
+    memset(ri, 0, sizeof(*ri));
+    ri->port = -1;
+    ri->seq = -1;
+    if (!f) return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    ri->exists = TRUE;
+    /* 解析失败按"未就绪/序列不变"处理（项目硬约束） */
+    const char *k = strstr(buf, "\"ready\"");
+    if (k) {
+        const char *c = strchr(k + 7, ':');
+        if (c && strstr(c, "true")) ri->ready = TRUE;
+    }
+    k = strstr(buf, "\"port\"");
+    if (k) {
+        const char *c = strchr(k + 6, ':');
+        if (c) ri->port = strtol(c + 1, NULL, 10);
+    }
+    k = strstr(buf, "\"seq\"");
+    if (k) {
+        const char *c = strchr(k + 5, ':');
+        if (c) ri->seq = strtol(c + 1, NULL, 10);
+    }
+}
+
+/* ================= 窗口与错误页（§9：绝不黑屏；recoverable → 重启按钮） ================= */
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+/* DPI 感知（PerMonitorV2）：必须先于任何窗口创建——未声明时 DWM 对整窗位图拉伸（界面发糊）。
+   动态加载兼容旧 SDK；已声明（如 manifest）时调用失败无害回退。 */
+static void enable_dpi_awareness(void) {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (!u32) return;
+    typedef BOOL(WINAPI * FnSetCtx)(HANDLE);
+    typedef BOOL(WINAPI * FnSetAware)(void);
+    FnSetCtx setCtx = (FnSetCtx)(void *)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+    if (setCtx) {
+        /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4，SYSTEM_AWARE = -2 */
+        if (setCtx((HANDLE)-4) || setCtx((HANDLE)-2)) return;
+    }
+    FnSetAware setAware = (FnSetAware)(void *)GetProcAddress(u32, "SetProcessDPIAware");
+    if (setAware) setAware();
+}
+
+/* 物理像素换算：DIP 值按系统 DPI 缩放（PMv2 下 CreateWindow/CreateFont 皆物理像素） */
+static int dpi_scaled(int dip, UINT dpi) { return MulDiv(dip, (int)dpi, 96); }
+
+static void ensure_window(void) {
+    if (g_hwnd) return;
+    UINT dpi = GetDpiForSystem();
+    WNDCLASSW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = g_class.c_str();
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    RegisterClassW(&wc);
+    g_hwnd = CreateWindowExW(0, g_class.c_str(), g_title.c_str(), WS_OVERLAPPEDWINDOW,
+                             CW_USEDEFAULT, CW_USEDEFAULT, dpi_scaled(1280, dpi),
+                             dpi_scaled(800, dpi), NULL, NULL, wc.hInstance, NULL);
+    /* 启动加载层：白底居中文案，随启动阶段更新（set_splash）；
+     * 页面渲染完成（nav completed）后销毁。ShowWindow 前创建保证首帧即有。 */
+    g_splash_font = CreateFontW(-dpi_scaled(30, dpi), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                L"Microsoft YaHei UI");
+    g_splash = CreateWindowExW(0, L"STATIC", L"正在启动，请稍候…",
+                               WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+                               0, 0, dpi_scaled(1280, dpi), dpi_scaled(800, dpi),
+                               g_hwnd, NULL, wc.hInstance, NULL);
+    SendMessageW(g_splash, WM_SETFONT, (WPARAM)g_splash_font, TRUE);
+    ShowWindow(g_hwnd, SW_SHOW);
+}
+
+static void run_message_loop(void) {
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+static void show_error_ui(const char *summary_utf8, int recoverable) {
+    RECT zero = {0, 0, 0, 0};
+    if (g_splash) { /* 错误页接管：撤掉加载层 */
+        DestroyWindow(g_splash);
+        g_splash = NULL;
+    }
+    if (g_ctl2) g_ctl2->put_Bounds(zero);
+    std::string text = wide_to_utf8(g_appname) + " 启动失败\n\n";
+    text += summary_utf8;
+    text += "\n\n诊断详情: ";
+    text += wide_to_utf8(g_diag);
+    text += "\n日志目录: ";
+    text += wide_to_utf8(g_logdir);
+    ensure_window();
+    {
+        /* 错误页控件坐标同样按窗口 DPI 缩放（物理像素） */
+        UINT dpi = GetDpiForWindow(g_hwnd);
+        CreateWindowExW(0, L"EDIT", utf8_to_wide(text.c_str()).c_str(),
+                        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+                            WS_EX_CLIENTEDGE,
+                        dpi_scaled(16, dpi), dpi_scaled(16, dpi), dpi_scaled(560, dpi),
+                        dpi_scaled(380, dpi), g_hwnd, (HMENU)(INT_PTR)IDC_ERRTEXT, NULL,
+                        NULL);
+        if (recoverable)
+            CreateWindowExW(0, L"BUTTON", L"重启", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                            dpi_scaled(16, dpi), dpi_scaled(410, dpi), dpi_scaled(120, dpi),
+                            dpi_scaled(36, dpi), g_hwnd, (HMENU)(INT_PTR)IDC_RESTART, NULL,
+                            NULL);
+        CreateWindowExW(0, L"BUTTON", L"退出", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        dpi_scaled(152, dpi), dpi_scaled(410, dpi), dpi_scaled(120, dpi),
+                        dpi_scaled(36, dpi), g_hwnd, (HMENU)(INT_PTR)IDC_QUIT, NULL, NULL);
+    }
+    g_phase = PH_DEAD;
+    KillTimer(g_hwnd, IDT_TICK);
+}
+
+/* 启动早期失败路径：窗口可能尚未创建（§9 绝不黑屏——原生错误页兜底） */
+static void show_error_ui_at_startup(const char *summary, int recoverable) {
+    show_error_ui(summary, recoverable);
+    run_message_loop(); /* 阻塞至用户关闭/重启 */
+}
+
+/* ================= 心跳消费（§5 判死分档） ================= */
+
+static void on_tick(void) {
+    ReadyInfo ri;
+    DWORD now = GetTickCount();
+
+    if (g_phase == PH_COLD) {
+        ready_read(&ri);
+        if (ri.exists && ri.ready && ri.port > 0) {
+            g_port = (int)ri.port;
+            g_last_seq = ri.seq;
+            g_last_seq_change = now;
+            g_phase = PH_RUNTIME;
+            if (g_web2) navigate_to_app();
+            printf("[shell] ready seen port=%d seq=%ld\n", g_port, g_last_seq);
+            return;
+        }
+        if (now - g_boot_start > BOOT_TIMEOUT_MS) {
+            char summary[512];
+            diag_read_summary(summary, sizeof(summary));
+            diag_write("bootstrap", "冷启动超时（未见 ready）", summary, TRUE);
+            show_error_ui("启动超时：120 秒内未收到就绪信号。", TRUE);
+        }
+        return;
+    }
+    if (g_phase == PH_RUNTIME) {
+        ready_read(&ri);
+        if (!ri.exists) { /* 仅"曾出现过"后消失才判死（§5 v1.1 前提） */
+            diag_write("runtime", "ready 文件消失（心跳中断）", "", TRUE);
+            show_error_ui("运行时心跳中断（ready 文件消失）。", TRUE);
+            return;
+        }
+        if (!ri.ready) {
+            diag_write("runtime", "ready 置为 false", "", TRUE);
+            show_error_ui("运行时报告未就绪。", TRUE);
+            return;
+        }
+        if (ri.seq >= 0 && ri.seq != g_last_seq) {
+            g_last_seq = ri.seq;
+            g_last_seq_change = now;
+            if (ri.port > 0 && (long)g_port != ri.port) g_port = (int)ri.port;
+        }
+        if (now - g_last_seq_change > HEARTBEAT_DEAD_MS) {
+            char summary[512];
+            diag_read_summary(summary, sizeof(summary));
+            diag_write("runtime", "心跳判死：30s 内 seq 无增长", summary, TRUE);
+            show_error_ui("运行时心跳超时（30 秒无响应）。", TRUE);
+        }
+    }
+}
+
+/* ================= Python 引导（步骤 6–8，线程模型①） ================= */
+
+typedef void (*fn_Py_Initialize)(void);
+typedef int (*fn_Py_IsInitialized)(void);
+typedef int (*fn_PyRun_SimpleString)(const char *);
+typedef void *(*fn_PyEval_SaveThread)(void);
+
+static void py_escape_entry(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const char *p = in; *p && o + 2 < cap; p++) {
+        if (*p == '\\' || *p == '"') out[o++] = '\\';
+        out[o++] = *p;
+    }
+    out[o] = 0;
+}
+
+/* 返回 0 成功；失败返回 -1（已写 diag）。步骤 6/7/8 严格按协议顺序。 */
+static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
+                       const char *app_version, const char *spk_hash_hex,
+                       char *err, size_t cap) {
+    fn_Py_Initialize pInit;
+    fn_Py_IsInitialized pIsInit;
+    fn_PyRun_SimpleString pRun;
+    fn_PyEval_SaveThread pSave;
+    HMODULE py;
+    char script[512], entry_esc[256];
+    std::wstring dll = join_path(g_runtime, utf8_to_wide(python_dll_utf8).c_str());
+
+    /* 步骤 6：python_dll 从 manifest 读（禁止硬编码） */
+    py = LoadLibraryExW(dll.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!py) {
+        _snprintf(err, cap - 1, "LoadLibraryEx 失败: %s (GetLastError=%lu)",
+                  python_dll_utf8, (unsigned long)GetLastError());
+        err[cap - 1] = 0;
+        diag_write("load", err, "", FALSE);
+        return -1;
+    }
+
+    /* 步骤 7：记账（LoadLibrary 成功后——指纹规则③′）+ version_floor 推进 */
+    {
+        char rec[160];
+        sprintf(rec, "app_version=%s\nspk_hash=%s\n", app_version, spk_hash_hex);
+        if (!atomic_write_utf8(g_runtime_version, rec, strlen(rec))) {
+            _snprintf(err, cap - 1, "指纹记账失败（runtime.version 写入）");
+            err[cap - 1] = 0;
+            diag_write("extract", err, "", TRUE);
+            return -1;
+        }
+        version_floor_update(app_version);
+    }
+
+    pInit = (fn_Py_Initialize)GetProcAddress(py, "Py_Initialize");
+    pIsInit = (fn_Py_IsInitialized)GetProcAddress(py, "Py_IsInitialized");
+    pRun = (fn_PyRun_SimpleString)GetProcAddress(py, "PyRun_SimpleString");
+    pSave = (fn_PyEval_SaveThread)GetProcAddress(py, "PyEval_SaveThread");
+    if (!pInit || !pIsInit || !pRun || !pSave) {
+        _snprintf(err, cap - 1, "解释器导出缺失（需 Py_Initialize/Py_IsInitialized/"
+                                "PyRun_SimpleString/PyEval_SaveThread）");
+        err[cap - 1] = 0;
+        diag_write("load", err, "", FALSE);
+        return -1;
+    }
+
+    pInit();
+    if (!pIsInit()) {
+        _snprintf(err, cap - 1, "Py_Initialize 后解释器未初始化");
+        err[cap - 1] = 0;
+        diag_write("load", err, "", FALSE);
+        return -1;
+    }
+    slog("Py_Initialize ok");
+    set_splash("正在初始化应用…");
+
+    /* 步骤 8：entry 经 manifest.entry 传递（协议禁硬编码） */
+    py_escape_entry(entry_utf8, entry_esc, sizeof(entry_esc));
+    _snprintf(script, sizeof(script) - 1,
+              "import applocal\napplocal.bootstrap(\"%s\")\n", entry_esc);
+    script[sizeof(script) - 1] = 0;
+    slog("applocal bootstrap begin");
+    if (pRun(script) != 0) {
+        /* applocal 已写 detail diag；壳补 stage 级记录 */
+        _snprintf(err, cap - 1, "applocal.bootstrap 异常退出（详见 diag.json）");
+        err[cap - 1] = 0;
+        diag_write("bootstrap", err, "", TRUE);
+        return -1;
+    }
+    slog("applocal bootstrap ok");
+    set_splash("正在启动应用服务…");
+
+    /* V1（致命）：立即归还 GIL，主线程此后永不触碰 Python C API */
+    pSave();
+    return 0;
+}
+
+/* ================= 单实例互斥（步骤 0，方案 §5.5） ================= */
+
+static BOOL acquire_single_instance(char *err, size_t cap) {
+    std::wstring mutex_name = std::wstring(L"Local\\MyApp-") + g_appname + L"-instance";
+    CreateMutexW(NULL, TRUE, mutex_name.c_str());
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        /* 激活首实例：窗口匹配键与互斥键同名约定派生（方案 §5.5） */
+        HWND prev = FindWindowW(g_class.c_str(), NULL);
+        if (prev) {
+            if (IsIconic(prev)) ShowWindowAsync(prev, SW_RESTORE);
+            SetForegroundWindow(prev);
+        } else {
+            /* 已有实例但窗口尚未创建（首启验签/解压中）：必须给出可见反馈，
+             * 否则连点看起来像"没反应" */
+            std::wstring msg = g_appname + L" 已在启动中，请稍候几秒。";
+            MessageBoxW(NULL, msg.c_str(), g_appname.c_str(), MB_OK | MB_ICONINFORMATION);
+        }
+        _snprintf(err, cap - 1, "已有实例在运行");
+        err[cap - 1] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ================= 窗口过程 ================= */
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SIZE:
+        if (g_splash) SetWindowPos(g_splash, NULL, 0, 0, LOWORD(lp), HIWORD(lp),
+                                   SWP_NOZORDER);
+        if (g_ctl2) {
+            if (wp == SIZE_MINIMIZED) {
+                g_ctl2->put_IsVisible(FALSE); /* 最小化暂停合成（官方指引）；不 put_Bounds */
+            } else {
+                g_ctl2->put_IsVisible(TRUE);
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                g_ctl2->put_Bounds(rc);
+            }
+        }
+        return 0;
+    case WM_DPICHANGED: {
+        /* PMv2 跨屏拖动：用系统建议矩形移动+缩放；WM_SIZE 随之同步 webview bounds。
+           （splash 字体不随重建：启动早期跨屏属极端场景，页面渲染后加载层即销毁） */
+        const RECT *sug = (const RECT *)lp;
+        SetWindowPos(hwnd, NULL, sug->left, sug->top, sug->right - sug->left,
+                     sug->bottom - sug->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lp == g_splash) { /* 加载层：白底灰字，与窗口背景无缝 */
+            SetBkMode((HDC)wp, TRANSPARENT);
+            SetTextColor((HDC)wp, RGB(0x55, 0x55, 0x55));
+            return (LRESULT)GetStockObject(WHITE_BRUSH);
+        }
+        break;
+    case WM_TIMER:
+        if (wp == IDT_TICK) on_tick();
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_RESTART) {
+            /* 协议 §11③：重启 = ExitProcess(非零) + 外层看门狗 */
+            ExitProcess(3);
+        }
+        if (LOWORD(wp) == IDC_QUIT) ExitProcess(0);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ================= 自检（--selftest：算法向量；--selftest-spk：差分入口） ================= */
+
+static void hex_to_bytes_self(const char *hex, uint8_t *out, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned hi = hex[2 * i] <= '9' ? hex[2 * i] - '0' : (hex[2 * i] | 32) - 'a' + 10;
+        unsigned lo =
+            hex[2 * i + 1] <= '9' ? hex[2 * i + 1] - '0' : (hex[2 * i + 1] | 32) - 'a' + 10;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+static int selftest_expect_hex(const char *name, const uint8_t *got, size_t n,
+                               const char *want_hex) {
+    char got_hex[129];
+    for (size_t i = 0; i < n; i++) sprintf(got_hex + 2 * i, "%02x", got[i]);
+    got_hex[2 * n] = 0;
+    if (strcmp(got_hex, want_hex) != 0) {
+        printf("SELFTEST-FAIL %s\n  got  %s\n  want %s\n", name, got_hex, want_hex);
+        return -1;
+    }
+    printf("SELFTEST-OK %s\n", name);
+    return 0;
+}
+
+static int run_selftest(void) {
+    uint8_t d[64];
+    int fail = 0;
+    /* SHA-256（SHA-512 经 Ed25519 RFC 向量间接覆盖） */
+    pkapp_sha256((const uint8_t *)"abc", 3, d);
+    fail |= selftest_expect_hex("sha256-abc", d, 32,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    pkapp_sha256((const uint8_t *)"", 0, d);
+    fail |= selftest_expect_hex("sha256-empty", d, 32,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    /* Ed25519（RFC 8032 TEST 1/2/3，含篡改负例） */
+    {
+        struct {
+            const char *pub, *msg, *sig;
+            int msglen;
+        } tv[] = {
+            {"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+             "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b", 0},
+            {"3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "\x72",
+             "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+             "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00", 1},
+            {"fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+             "\xaf\x82",
+             "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+             "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a", 2},
+        };
+        for (int i = 0; i < 3; i++) {
+            uint8_t pub[32], sig[64];
+            char name[32];
+            sprintf(name, "ed25519-rfc%d", i + 1);
+            hex_to_bytes_self(tv[i].pub, pub, 32);
+            hex_to_bytes_self(tv[i].sig, sig, 64);
+            if (pkapp_ed25519_verify(pub, (const uint8_t *)tv[i].msg,
+                                     (size_t)tv[i].msglen, sig) != 0) {
+                printf("SELFTEST-FAIL %s (valid sig rejected)\n", name);
+                fail = -1;
+            } else {
+                printf("SELFTEST-OK %s\n", name);
+            }
+            sig[0] ^= 1; /* 篡改必须拒绝 */
+            if (pkapp_ed25519_verify(pub, (const uint8_t *)tv[i].msg,
+                                     (size_t)tv[i].msglen, sig) == 0) {
+                printf("SELFTEST-FAIL %s-tamper (accepted!)\n", name);
+                fail = -1;
+            } else {
+                printf("SELFTEST-OK %s-tamper\n", name);
+            }
+        }
+    }
+    /* 版本比较 */
+    if (manifest_version_cmp("1.4.2", "1.2.0") <= 0 ||
+        manifest_version_cmp("1.2", "1.2.0") != 0 ||
+        manifest_version_cmp("0.9.9", "1.0.0") >= 0 ||
+        manifest_version_cmp("1.10.0", "1.9.0") <= 0 ||
+        manifest_version_cmp("1.a", "1.0") != -2) {
+        printf("SELFTEST-FAIL ver-cmp\n");
+        fail = -1;
+    } else {
+        printf("SELFTEST-OK ver-cmp\n");
+    }
+    printf(fail ? "SELFTEST-RESULT FAIL\n" : "SELFTEST-RESULT OK\n");
+    return fail;
+}
+
+/* --selftest-spk <path>：真 spk 验签链差分入口（pytest 侧用 cryptography 对拍） */
+static int run_selftest_spk(const char *spk_path) {
+    spk_file sf;
+    const char *err = NULL;
+    if (spk_load(spk_path, &sf, &err) != 0) {
+        printf("SPK-VERIFY-FAIL stage=spk err=%s\n", err);
+        return -1;
+    }
+    const spk_entry *manifest_entry = NULL;
+    for (int i = 0; i < sf.count; i++)
+        if (strcmp(sf.entries[i].path, SPK_MANIFEST_ENTRY) == 0)
+            manifest_entry = &sf.entries[i];
+    if (!manifest_entry) {
+        printf("SPK-VERIFY-FAIL stage=keys err=spk 内无 manifest 条目\n");
+        spk_free(&sf);
+        return -1;
+    }
+    char *text = (char *)malloc(manifest_entry->size + 1);
+    memcpy(text, manifest_entry->data, manifest_entry->size);
+    text[manifest_entry->size] = 0;
+    manifest_doc doc;
+    manifest_parse(text, manifest_entry->size, &doc);
+    {
+        const char *stage = NULL;
+        char msg[512] = {0};
+        if (manifest_verify(&doc, text, manifest_entry->size, sf.entries, sf.count,
+                            &stage, msg, sizeof(msg)) != 0) {
+            printf("SPK-VERIFY-FAIL stage=%s err=%s\n", stage, msg);
+            free(text);
+            spk_free(&sf);
+            return -1;
+        }
+    }
+    {
+        /* 输出排除 manifest 后的重算 hash，pytest 与 packager 对拍 */
+        char actual_hash[65];
+        spk_entry *tmp = (spk_entry *)malloc(sizeof(spk_entry) * (size_t)sf.count);
+        int m = 0;
+        for (int i = 0; i < sf.count; i++)
+            if (strcmp(sf.entries[i].path, SPK_MANIFEST_ENTRY) != 0) tmp[m++] = sf.entries[i];
+        spk_hash_hex(tmp, m, actual_hash);
+        free(tmp);
+        printf("SPK-VERIFY-OK app_version=%s spk_hash=%s\n", doc.app_version, actual_hash);
+    }
+    free(text);
+    spk_free(&sf);
+    return 0;
+}
+
+/* ================= 主流程（九步顺序） ================= */
+
+/* 读已装展开区 manifest 并复验签名链（无 spk 启动路径） */
+static int load_installed_manifest(manifest_doc *doc, char **text_out, char *err,
+                                   size_t cap) {
+    std::wstring mf = join_path(g_runtime, L"manifest");
+    FILE *f = _wfopen(mf.c_str(), L"rb");
+    char buf[65536];
+    size_t n;
+    const char *stage = NULL;
+    *text_out = NULL;
+    if (!f) {
+        _snprintf(err, cap - 1, "展开区 manifest 缺失");
+        err[cap - 1] = 0;
+        return -1;
+    }
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    *text_out = (char *)malloc(n + 1);
+    memcpy(*text_out, buf, n + 1);
+    manifest_parse(*text_out, n, doc);
+    if (manifest_check_signature(doc, *text_out, n, &stage, err, cap) != 0) {
+        _snprintf(err, cap - 1, "已装 manifest 复验失败[%s]: %s", stage, err);
+        err[cap - 1] = 0;
+        free(*text_out);
+        *text_out = NULL;
+        return -1;
+    }
+    /* 指纹记账必须与 manifest 自洽（防"半状态被指纹洗白"） */
+    {
+        Fingerprint fp;
+        const char *expect = doc->spk_hash;
+        fingerprint_read(&fp);
+        if (strncmp(expect, "sha256:", 7) == 0) expect += 7;
+        if (!fp.present || strcmp(fp.hash, expect) != 0 ||
+            strcmp(fp.version, doc->app_version) != 0) {
+            _snprintf(err, cap - 1, "展开区指纹记账缺失/不一致（需重新放入 .spk 全量重建）");
+            err[cap - 1] = 0;
+            free(*text_out);
+            *text_out = NULL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int run_shell(void) {
+    char err[1024];
+    spk_file sf;
+    manifest_doc doc;
+    char *manifest_text = NULL;
+    BOOL doc_valid = FALSE;
+
+    if (!setup_paths()) {
+        MessageBoxW(NULL, L"路径初始化失败（LOCALAPPDATA 缺失）", g_appname.c_str(), MB_ICONERROR);
+        return 2;
+    }
+
+    /* 步骤 0：单实例互斥（覆盖验签→LoadLibrary 全程） */
+    if (!acquire_single_instance(err, sizeof(err))) return 0;
+
+    /* stdio 双保险提前到验签/解压之前：引导期任何卡点都必须可见于日志 */
+    stdio_redirect_to_log();
+    slog("single-instance ok, stdio->log");
+
+    if (!check_install_dir_clean(err, sizeof(err))) {
+        diag_write("verify", err, "", FALSE);
+        show_error_ui_at_startup(err, FALSE);
+        return 2;
+    }
+
+    /* 步骤 1+2：验签 → 指纹比对 / 全量解压 */
+    if (file_exists(g_spk)) {
+        const char *spk_err = NULL;
+        const spk_entry *manifest_entry = NULL;
+        const char *stage = NULL;
+        Fingerprint fp;
+        slog("load spk begin");
+        if (spk_load(wide_to_utf8(g_spk).c_str(), &sf, &spk_err) != 0) {
+            diag_write("verify", "spk 读取失败", spk_err, FALSE);
+            show_error_ui_at_startup(spk_err, FALSE);
+            return 2;
+        }
+        for (int i = 0; i < sf.count; i++)
+            if (strcmp(sf.entries[i].path, SPK_MANIFEST_ENTRY) == 0)
+                manifest_entry = &sf.entries[i];
+        if (!manifest_entry) {
+            diag_write("verify", "spk 内无 manifest 条目", "", FALSE);
+            show_error_ui_at_startup("spk 内无 manifest 条目", FALSE);
+            spk_free(&sf);
+            return 2;
+        }
+        manifest_text = (char *)malloc(manifest_entry->size + 1);
+        memcpy(manifest_text, manifest_entry->data, manifest_entry->size);
+        manifest_text[manifest_entry->size] = 0;
+        manifest_parse(manifest_text, manifest_entry->size, &doc);
+        slog("spk loaded, verifying manifest");
+        if (manifest_verify(&doc, manifest_text, manifest_entry->size, sf.entries,
+                            sf.count, &stage, err, sizeof(err)) != 0) {
+            diag_write("verify", err, "", FALSE);
+            show_error_ui_at_startup(err, FALSE);
+            free(manifest_text);
+            spk_free(&sf);
+            return 2;
+        }
+        /* 版本单调性：包内约束 + 双防线（floor）+ 本地记账 */
+        if (manifest_version_cmp(doc.app_version, doc.min_app_version) < 0) {
+            diag_write("verify", "包内 app_version < min_app_version", doc.app_version, FALSE);
+            show_error_ui_at_startup("应用版本低于最低要求（防回滚拦截）。", FALSE);
+            free(manifest_text);
+            spk_free(&sf);
+            return 2;
+        }
+        if (!version_floor_check_ge(doc.app_version, err, sizeof(err))) {
+            diag_write("verify", err, "", FALSE);
+            show_error_ui_at_startup(err, FALSE);
+            free(manifest_text);
+            spk_free(&sf);
+            return 2;
+        }
+        fingerprint_read(&fp);
+        slog("verify ok, fingerprint check");
+        {
+            const char *expect = doc.spk_hash;
+            if (strncmp(expect, "sha256:", 7) == 0) expect += 7;
+            if (!(fp.present && strcmp(fp.hash, expect) == 0 &&
+                  strcmp(fp.version, doc.app_version) == 0)) {
+                /* 步骤 2：指纹不命中 → 全量解压（staging → 原子让位） */
+                std::wstring staging = stage_dir_with(L"new");
+                if (dir_exists(staging)) rm_tree(staging);
+                if (extract_all(&sf, staging, err, sizeof(err)) != 0 ||
+                    promote_staging(staging, err, sizeof(err)) != 0) {
+                    diag_write("extract", err, "", TRUE);
+                    show_error_ui_at_startup(err, TRUE);
+                    free(manifest_text);
+                    spk_free(&sf);
+                    return 2;
+                }
+            }
+        }
+        doc_valid = TRUE;
+        spk_free(&sf);
+        slog("runtime staging ready");
+    } else {
+        /* 无 spk：信任已装展开区——但 manifest 签名链与指纹记账必须复验通过 */
+        if (load_installed_manifest(&doc, &manifest_text, err, sizeof(err)) != 0) {
+            diag_write("verify", err, "需将 .spk 放入安装目录以全量重建", FALSE);
+            show_error_ui_at_startup(err, FALSE);
+            return 2;
+        }
+        doc_valid = TRUE;
+    }
+
+    /* 步骤 3：预清理旧 ready 与旧握手码（避免存活假象 / 陈旧码） */
+    DeleteFileW(g_ready.c_str());
+    DeleteFileW(g_handshake.c_str());
+
+    /* 步骤 4：环境变量（含新 token；embedded 必须 STRICT_AUTH=1 防 loopback 裸奔） */
+    {
+        char token[65];
+        SetEnvironmentVariableW(L"MYAPP_PLATFORM", L"windows");
+        SetEnvironmentVariableW(L"MYAPP_DATA_DIR", g_data.c_str());
+        SetEnvironmentVariableW(L"MYAPP_CACHE_DIR", g_cache.c_str());
+        SetEnvironmentVariableW(L"MYAPP_LOG_DIR", g_logdir.c_str());
+        SetEnvironmentVariableW(L"MYAPP_READY_FILE", g_ready.c_str());
+        SetEnvironmentVariableW(L"MYAPP_DIAG_FILE", g_diag.c_str());
+        SetEnvironmentVariableW(L"MYAPP_STATIC_DIR", join_path(g_runtime, L"dist").c_str());
+        SetEnvironmentVariableW(L"MYAPP_PORT", L"0");
+        SetEnvironmentVariableW(L"MYAPP_VERSION", utf8_to_wide(doc.app_version).c_str());
+        SetEnvironmentVariableW(L"MYAPP_MANIFEST_PATH",
+                                join_path(g_runtime, L"manifest").c_str());
+        SetEnvironmentVariableW(L"MYAPP_NATIVE_LIB_DIR", L"");
+        SetEnvironmentVariableW(L"MYAPP_STRICT_AUTH", L"1");
+        SetEnvironmentVariableW(L"MYAPP_HANDSHAKE_FILE", g_handshake.c_str());
+        if (random_hex64(token))
+            SetEnvironmentVariableW(L"MYAPP_TOKEN", utf8_to_wide(token).c_str());
+    }
+
+    /* 窗口先立（温启动观感）。WebView2 环境创建必须在 boot_python 之后：
+     * pCreate 的完成回调只能由创建线程的 STA 消息泵派发，而 boot_python 阻塞
+     * 主线程数秒不泵消息——实测浏览器进程等待 ~4s 后整树干净退出（152/154 运
+     * 行时同），宿主留下僵尸代理：白屏 + 最小化 put_Bounds AV（0xC0000005）。
+     * 因此环境创建紧贴 run_message_loop，回调在首拍 GetMessage 即送达。 */
+    ensure_window();
+    slog("window up");
+
+    /* 步骤 6/7/8：LoadLibrary → 记账 → bootstrap → SaveThread */
+    g_boot_start = GetTickCount();
+    if (boot_python(doc.python_dll, doc.entry, doc.app_version,
+                    strncmp(doc.spk_hash, "sha256:", 7) == 0 ? doc.spk_hash + 7
+                                                             : doc.spk_hash,
+                    err, sizeof(err)) != 0) {
+        show_error_ui_at_startup(err, TRUE);
+        return 2;
+    }
+    slog("python boot ok");
+    free(manifest_text); /* manifest_text 已随 doc 使用完毕 */
+
+    webview_start();
+    slog("webview env requested");
+
+    /* 步骤 8.5/9：ready 轮询 + 心跳消费（主线程 WM_TIMER；禁独立线程） */
+    SetTimer(g_hwnd, IDT_TICK, TICK_MS, NULL);
+    run_message_loop();
+    ExitProcess(0);
+}
+
+/* ================= 入口 ================= */
+
+int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
+    (void)hInst;
+    (void)hPrev;
+    (void)nShow;
+    enable_dpi_awareness(); /* 先于一切窗口/COM：未声明 DPI 感知 → DWM 位图拉伸整窗发糊 */
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(lpCmdLine ? lpCmdLine : L"", &argc);
+    if (argv && argc >= 1 && wcscmp(argv[0], L"--selftest") == 0) {
+        LocalFree(argv);
+        return run_selftest() == 0 ? 0 : 1;
+    }
+    if (argv && argc >= 2 && wcscmp(argv[0], L"--selftest-spk") == 0) {
+        std::string p = wide_to_utf8(argv[1]);
+        LocalFree(argv);
+        return run_selftest_spk(p.c_str()) == 0 ? 0 : 1;
+    }
+    if (argv) LocalFree(argv);
+    return run_shell();
+}
