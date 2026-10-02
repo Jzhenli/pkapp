@@ -165,6 +165,13 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
     if not os.path.isfile(spk):
         print(f"[package] 未找到 spk: {spk}（先 pkapp build android）")
         return 2
+    icon = ""
+    if spec.android_icon:
+        icon = spec.android_icon if os.path.isabs(spec.android_icon) else os.path.join(
+            os.path.abspath(project), spec.android_icon)
+        if not os.path.isfile(icon):
+            print(f"[package] 图标文件不存在: {spec.android_icon}（[platforms.android].icon）")
+            return 2
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
     # keystore 链（★v1.2★）：PKAPP_KEYSTORE env > TOML [platforms.android].keystore
     #（相对项目根）；密码/别名只走 env（PKAPP_KEYSTORE_PASS / _ALIAS），永不入 AppSpec
@@ -180,7 +187,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
                              app_id=spec.android_package,
                              version=spec.version, abis=spec.android_abis,
                              keystore=keystore, keystore_pass=keystore_pass,
-                             keystore_alias=keystore_alias)
+                             keystore_alias=keystore_alias, icon=icon)
     except ApkError as e:
         print(f"[package] APK 组装失败: {e}")
         return 1

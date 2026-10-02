@@ -84,6 +84,7 @@ class AppSpec:
     android_package: str = ""
     android_abis: tuple[str, ...] = ("arm64-v8a",)
     android_keystore: str = ""           # [platforms.android].keystore（路径,非机密;密码走 PKAPP_KEYSTORE_PASS env）
+    android_icon: str = ""               # [platforms.android].icon（PNG → 启动器图标，覆盖壳默认矢量图）
     windows_python_version: str = ""     # [platforms.windows].python_version（运行时意图声明 → pkapp fetch）
     android_python_version: str = ""     # [platforms.android].python_version
     windows_runtime_dir: str = ""        # [platforms.windows].runtime_dir（逃生门：显式覆盖托管快照）
@@ -242,6 +243,7 @@ def load(path: str) -> AppSpec:
         android_package=str(android.get("package", "")),
         android_abis=tuple(android.get("abis", ("arm64-v8a",))),
         android_keystore=str(android.get("keystore", "")),
+        android_icon=str(android.get("icon", "")),
         windows_python_version=str(windows.get("python_version", "")),
         android_python_version=str(android.get("python_version", "")),
         windows_runtime_dir=str(windows.get("runtime_dir", "")),

@@ -10,7 +10,7 @@
 
     <application
         android:label="${pkappLabel}"
-        android:icon="@drawable/ic_app"
+        android:icon="${pkappIcon}"
         android:networkSecurityConfig="@xml/network_security_config"
         android:allowBackup="false"
         android:extractNativeLibs="true"

@@ -59,7 +59,7 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
               variant: str = "debug", app_id: str = "",
               version: str = "", abis: tuple[str, ...] = (),
               keystore: str = "", keystore_pass: str = "",
-              keystore_alias: str = "pkapp") -> str:
+              keystore_alias: str = "pkapp", icon: str = "") -> str:
     """spk → 壳 assets → gradle → <project>/release/<artifact_name>（如
     HiApp-0.1.0-android-arm64_v8a-x86_64.apk，★产物命名带版本/平台/架构★）。
 
@@ -68,6 +68,9 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     keystore 链（★v1.2★）：keystore = PKAPP_KEYSTORE env > TOML [platforms.android].keystore
     （路径非机密可进 TOML；密码/别名只走 env，永不入 AppSpec）——非空时 gradle 注入
     -PpkappKs/-PpkappKsPass/-PpkappKsAlias，release 变体即产出已签名 APK。
+    icon = [platforms.android].icon（PNG 路径）：经 _stage_icon_res 生成启动器图标组
+    （全密度 mipmap + anydpi-v26 自适应图标，icons.py）并注入 -PpkappIconRes +
+    -PpkappIcon（manifest android:icon → @mipmap/ic_app）。
     返回 APK 路径；任何一步失败抛 ApkError（gradle 输出尾部随异常给出）。
     """
     if not app_id:
@@ -95,7 +98,8 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     _run_gradle(shell, variant, app_id, app_name,
                 keystore if keystore else None,
                 keystore_pass if keystore else "",
-                keystore_alias if keystore else "")
+                keystore_alias if keystore else "",
+                _stage_icon_res(project, icon) if icon else None)
 
     apk_src = os.path.join(shell, "app", "build", "outputs", "apk", variant,
                            f"app-{variant}.apk")
@@ -114,13 +118,33 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     return dest
 
 
+def _stage_icon_res(project: str, icon: str) -> str:
+    """单源 PNG → 启动器图标组（icons.py，Briefcase 同式：全密度 mipmap 位图 +
+    anydpi-v26 自适应图标），暂存 <project>/build/platform-android/icon-res/。
+
+    gradle 经 -PpkappIconRes 挂 variant sourceSet、-PpkappIcon 把 manifest
+    android:icon 切到 @mipmap/ic_app（未配置时 placeholder 默认回退壳矢量图）。
+    """
+    from .icons import IconError, generate_android_icons
+
+    res_dir = os.path.join(os.path.abspath(project), "build", "platform-android",
+                           "icon-res")
+    try:
+        generate_android_icons(icon, res_dir)
+    except IconError as e:
+        raise ApkError(str(e)) from None
+    return res_dir
+
+
 def _run_gradle(shell: str, variant: str, app_id: str, label: str,
                 keystore: str | None = None, keystore_pass: str = "",
-                keystore_alias: str = "") -> None:
+                keystore_alias: str = "", icon_res: str | None = None) -> None:
     """转发 gradle assemble<Variant>；-PpkappAppId/-PpkappLabel 注入 applicationId/
-    应用显示名（★v1.2★）；keystore 非空时经 ORG_GRADLE_PROJECT_pkappKs/Pass/Alias
-    环境变量注入（gradle 映射为同名 project property，findProperty 原样可读）——
-    密码不进命令行，防同机进程列表（WMI/任务管理器）泄露；工具链路径 = env > 默认 toolchain 布局。"""
+    应用显示名（★v1.2★）；icon_res 非空时经 -PpkappIconRes 注入图标组资源目录 +
+    -PpkappIcon 把 manifest android:icon placeholder 切到 @mipmap/ic_app；keystore
+    非空时经 ORG_GRADLE_PROJECT_pkappKs/Pass/Alias 环境变量注入（gradle 映射为同名
+    project property，findProperty 原样可读）——密码不进命令行，防同机进程列表
+    （WMI/任务管理器）泄露；工具链路径 = env > 默认 toolchain 布局。"""
     import subprocess
 
     tp = _toolchain_paths()
@@ -136,9 +160,10 @@ def _run_gradle(shell: str, variant: str, app_id: str, label: str,
         env["ORG_GRADLE_PROJECT_pkappKs"] = keystore
         env["ORG_GRADLE_PROJECT_pkappKsPass"] = keystore_pass
         env["ORG_GRADLE_PROJECT_pkappKsAlias"] = keystore_alias
-    r = subprocess.run([gradle, "--no-daemon", "-p", shell,
-                        f"-PpkappAppId={app_id}",
-                        f"-PpkappLabel={label}",
+    props = [f"-PpkappAppId={app_id}", f"-PpkappLabel={label}"]
+    if icon_res:
+        props += [f"-PpkappIconRes={icon_res}", "-PpkappIcon=@mipmap/ic_app"]
+    r = subprocess.run([gradle, "--no-daemon", "-p", shell, *props,
                         f"assemble{variant.capitalize()}"],
                        env=env, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=900)

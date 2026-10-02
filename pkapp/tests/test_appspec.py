@@ -155,3 +155,12 @@ def test_android_keystore_parse(tmp_path):
     })
     assert load(os.path.join(root, "pkapp.toml")).android_keystore == \
         "signing/release.keystore"
+
+
+def test_android_icon_parse(tmp_path):
+    """[platforms.android].icon：PNG 路径透传（启动器图标，覆盖壳默认 ic_app）。"""
+    root = _make(tmp_path, "n14", **{
+        '# icon = "icons/android/xplay.png"': 'icon = "icons/android/xplay.png"',
+    })
+    assert load(os.path.join(root, "pkapp.toml")).android_icon == \
+        "icons/android/xplay.png"

@@ -66,9 +66,26 @@ def _add_android_package(proj):
         f.write(txt)
 
 
+def _add_android_icon(proj):
+    """android 图标前置：Pillow 生成 432×432 实图（生成器需可解码）+ 启用模板 icon 注释行。"""
+    from PIL import Image
+
+    png = os.path.join(proj, "icon.png")
+    Image.new("RGB", (432, 432), (180, 40, 40)).save(png)
+    path = os.path.join(proj, "pkapp.toml")
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    marker = '# icon = "icons/android/xplay.png"'
+    assert marker in txt, "create 模板 android icon 注释行已变，请同步本测试"
+    txt = txt.replace(marker, 'icon = "icon.png"', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    return png
+
+
 def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
-    """monkeypatch gradle：记录 -PpkappAppId 注入；在壳工程产物位放一个假 APK
-    （含/缺 assets/runtime.spk）。返回 captured 字典供断言。"""
+    """monkeypatch gradle：记录 -PpkappAppId/-PpkappIconRes 注入；在壳工程产物位放一个
+    假 APK（含/缺 assets/runtime.spk）。返回 captured 字典供断言。"""
     fake_apk = tmp_path / "fake.apk"
     with zipfile.ZipFile(fake_apk, "w") as zf:
         if with_asset:
@@ -77,9 +94,11 @@ def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
     captured = {}
 
     def fake_gradle(shell_dir, variant, app_id, label,
-                    keystore=None, keystore_pass="", keystore_alias=""):
+                    keystore=None, keystore_pass="", keystore_alias="",
+                    icon_res=None):
         captured.update(app_id=app_id, label=label, keystore=keystore,
-                        keystore_pass=keystore_pass, keystore_alias=keystore_alias)
+                        keystore_pass=keystore_pass, keystore_alias=keystore_alias,
+                        icon_res=icon_res)
         out_apk = os.path.join(shell_dir, "app", "build", "outputs", "apk", variant)
         os.makedirs(out_apk)
         name = f"app-{variant}.apk"
@@ -114,6 +133,67 @@ def test_package_android_builds_apk(tmp_path, monkeypatch):
     assert os.path.isfile(apk_path)
     with zipfile.ZipFile(apk_path) as zf:
         assert zf.read("assets/runtime.spk") == spk_bytes
+
+
+def test_package_android_icon_injected(tmp_path, monkeypatch):
+    """[platforms.android].icon → 相对路径解析 + 图标组生成 + -PpkappIconRes 注入链。"""
+    from PIL import Image
+
+    proj = _make_project(tmp_path)
+    _add_android_package(proj)
+    _add_android_icon(proj)
+    _write_spk(proj, "android")
+    with open(os.path.join(proj, "build", "platform-android", "runtime.spk"), "rb") as f:
+        spk_bytes = f.read()
+    captured = _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=spk_bytes)
+    assert main(["package", "android", "--project", proj,
+                 "--shell-dir", _fake_shell(tmp_path)]) == 0
+    res_dir = os.path.join(os.path.abspath(proj), "build", "platform-android", "icon-res")
+    assert os.path.normcase(captured["icon_res"]) == os.path.normcase(res_dir)
+    # 图标组：全密度传统位图 + 自适应前景层 + anydpi-v26 定义 + 背景色
+    for bucket, legacy, canvas in (("mdpi", 48, 108), ("hdpi", 72, 162),
+                                   ("xhdpi", 96, 216), ("xxhdpi", 144, 324),
+                                   ("xxxhdpi", 192, 432)):
+        assert Image.open(os.path.join(res_dir, f"mipmap-{bucket}", "ic_app.png")
+                          ).size == (legacy, legacy)
+        assert Image.open(os.path.join(
+            res_dir, f"mipmap-{bucket}", "ic_app_foreground.png")).size == (canvas, canvas)
+    xml = open(os.path.join(res_dir, "mipmap-anydpi-v26", "ic_app.xml"),
+               encoding="utf-8").read()
+    assert "@mipmap/ic_app_foreground" in xml and "@color/ic_app_background" in xml
+    assert "B42828" in open(os.path.join(res_dir, "values", "ic_app.xml"),
+                            encoding="utf-8").read()
+
+
+def test_package_android_icon_missing(tmp_path, monkeypatch, capsys):
+    """icon 指向不存在的文件 → fail-fast（exit 2，同 windows 图标前置检查语义）。"""
+    proj = _make_project(tmp_path)
+    _add_android_package(proj)
+    _write_spk(proj, "android")
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
+    path = os.path.join(proj, "pkapp.toml")
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    txt = txt.replace('# icon = "icons/android/xplay.png"', 'icon = "icons/nope.png"', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    assert main(["package", "android", "--project", proj,
+                 "--shell-dir", _fake_shell(tmp_path)]) == 2
+    assert "图标文件不存在" in capsys.readouterr().out
+
+
+def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys):
+    """icon 非位图（Pillow 无法识别）→ ApkError 拒绝组装。"""
+    proj = _make_project(tmp_path)
+    _add_android_package(proj)
+    png = _add_android_icon(proj)
+    with open(png, "wb") as f:
+        f.write(b"this is not an image at all")
+    _write_spk(proj, "android")
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
+    assert main(["package", "android", "--project", proj,
+                 "--shell-dir", _fake_shell(tmp_path)]) == 1
+    assert "图标" in capsys.readouterr().out
 
 
 def test_package_android_requires_app_id(tmp_path, monkeypatch, capsys):

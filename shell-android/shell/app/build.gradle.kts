@@ -8,6 +8,9 @@ plugins {
 val ksFile = project.findProperty("pkappKs") as String?
 val ksPass = project.findProperty("pkappKsPass") as String?
 val ksAlias = project.findProperty("pkappKsAlias") as String? ?: "pkapp"
+// 应用图标（★v1.2★）：pkapp 经 -PpkappIconRes 注入 PNG 资源目录——debug/release
+// sourceSet 优先级高于 main，同名 @drawable/ic_app 同配置整体覆盖壳默认矢量图标
+val pkappIconRes = project.findProperty("pkappIconRes") as String?
 
 android {
     namespace = "com.pkapp.shell"
@@ -34,6 +37,13 @@ android {
         }
     }
 
+    sourceSets {
+        if (pkappIconRes != null) {
+            getByName("debug") { res.srcDir(pkappIconRes) }
+            getByName("release") { res.srcDir(pkappIconRes) }
+        }
+    }
+
     defaultConfig {
         // applicationId 由 pkapp 按项目 [platforms.android].package 经 -PpkappAppId 注入
         //（无 property 时回退默认 = 直接用 gradle 构建壳工程）。namespace 保持不变：
@@ -42,6 +52,10 @@ android {
         // 应用显示名（★v1.2★）：项目 app.name 经 -PpkappLabel 注入；缺省 = 直接构建壳
         manifestPlaceholders["pkappLabel"] =
             project.findProperty("pkappLabel") as String? ?: "PKApp Shell"
+        // 应用图标引用（★v1.2★）：配置了 [platforms.android].icon 时 pkapp 注入
+        // @mipmap/ic_app（图标组经 -PpkappIconRes 预生成挂 sourceSets）；缺省 = 壳默认矢量图
+        manifestPlaceholders["pkappIcon"] =
+            project.findProperty("pkappIcon") as String? ?: "@drawable/ic_app"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
