@@ -43,13 +43,20 @@ def run(snapshot_dir: str, outdir: str | None = None,
     outdir = os.path.abspath(outdir) if outdir else tempfile.mkdtemp(prefix="pkapp-proto-")
     os.makedirs(outdir, exist_ok=True)
 
-    # 1) demo 项目 + runtime.lock + 密钥 + wheels
+    # 1) demo 项目 + runtime_dir 逃生门（逃生门 version 取 spec 声明）+ 密钥 + wheels
     project = os.path.join(outdir, "demo")
     if os.path.exists(project):
         shutil.rmtree(project)
     assert cmd_create("demo", project, no_venv=True) == 0
-    with open(os.path.join(project, "runtime.lock"), "w") as f:
-        f.write(f"[runtime.windows]\npython_version = \"3.12.14\"\ndir = '{snapshot_dir}'\n")
+    toml_path = os.path.join(project, "pkapp.toml")
+    with open(toml_path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    # 精准替换 [platforms.windows] 段内注释掉的 runtime_dir 行（追加会落进 android 段）
+    marker = '# runtime_dir = "D:/runtimes/pbs-cpython-3.12.14+20260929"'
+    assert marker in txt, "create 模板 runtime_dir 逃生门注释行已变，请同步本工具"
+    txt = txt.replace(marker, f'runtime_dir = "{snapshot_dir.replace(chr(92), "/")}"', 1)
+    with open(toml_path, "w", encoding="utf-8") as f:
+        f.write(txt)
     if key:
         # e2e 对拍形态：复用项目密钥（壳内置公钥与之配对），不再另造
         key_path, pub_hex = os.path.abspath(key), sign.public_key_hex(key)
@@ -69,8 +76,8 @@ def run(snapshot_dir: str, outdir: str | None = None,
     ensure("uvicorn", "0.30.0", {"uvicorn/__init__.py": ""})
 
     # 2) 真快照走完整构建管线
-    snap = resolve(project, "windows")
     spec = load(os.path.join(project, "pkapp.toml"))
+    snap = resolve(spec, "windows")
     spk_path = os.path.join(outdir, "runtime.spk")
     fields = assemble.build_spk(project, spec, "windows", spk_path,
                                 private_key=key_path, wheels_dir=wheels)

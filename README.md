@@ -42,15 +42,29 @@ pkapp create myapp
 cd myapp
 pkapp dev          :: 起开发服务，浏览器直连
 
-:: 打包（需在 runtime.lock 注册 CPython 快照，见下）
+:: 托管工具链（唯一网络入口；--from 目录可离线导入）
+pkapp fetch windows
 pkapp build windows
-pkapp package windows   :: 产物：release\myapp.zip
+pkapp package windows   :: 产物：release\myapp-0.1.0-windows-x86_64.zip
 ```
 
-**构建前提**：`build` 需要 python-build-standalone 3.12 CPython 快照；
-把快照解压目录填进项目 `runtime.lock` 的 `[runtime.windows] dir`（该文件属构建机环境，
-已默认进 .gitignore）。Android 打包另需本机 JDK17 + SDK 35 + NDK 27.3 工具链，
+**构建前提**：项目 `pkapp.toml` 的 `[platforms.windows].python_version` 声明运行时意图
+（create 模板已内置），`pkapp fetch windows` 把 PBS CPython 快照下载进托管缓存
+（PKAPP_CACHE / %LOCALAPPDATA%/pkapp；build 不隐式联网）。Android 打包另需
+`pkapp fetch android`（JDK17 + Gradle 8.9 + SDK 35 + NDK 27 + py-android 运行时），
+或设 `PKAPP_ANDROID_TOOLCHAIN` 指向手工布置的整体根，
 布局约定见 [shell-android/README.md](shell-android/README.md)。
+
+**GitHub 直连不稳时**用 `PKAPP_MIRROR_*` 前缀替换镜像（值为「镜像地址 + 原始前缀」
+拼接段，注意 gh-proxy 类要带完整 `https://github.com` 尾巴）：
+
+```bat
+set PKAPP_MIRROR_GITHUB=https://gh-proxy.com/https://github.com
+pkapp fetch windows
+```
+
+离线机兜底：`pkapp fetch android --from D:\dl`（目录内有对应压缩包就导入，
+缺的转真网络）。
 
 **最小示例**：[examples/helloworld](examples/helloworld/) —— 纯 ASGI + 一次性握手鉴权
 + 前端自检页的完整打包样例。

@@ -21,7 +21,7 @@ import subprocess
 import zipfile
 
 from ..appspec import SpecError, load
-from ..packager.apk import ApkError, build_apk
+from ..packager.apk import ApkError, artifact_name, build_apk
 
 
 def _find_shell(explicit: str | None) -> str | None:
@@ -145,7 +145,7 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
 
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
     os.makedirs(out_dir, exist_ok=True)
-    zip_path = os.path.join(out_dir, f"{name}.zip")
+    zip_path = os.path.join(out_dir, artifact_name(name, version, "windows"))
     zip_tmp = zip_path + ".tmp"
     with zipfile.ZipFile(zip_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in (f"{name}.exe", f"{name}.spk", "WebView2Loader.dll"):
@@ -178,6 +178,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
                              out_dir=out_dir, variant=variant,
                              app_id=spec.android_package,
+                             version=spec.version, abis=spec.android_abis,
                              keystore=keystore, keystore_pass=keystore_pass,
                              keystore_alias=keystore_alias)
     except ApkError as e:

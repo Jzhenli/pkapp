@@ -1,19 +1,24 @@
-"""运行时快照解析器（方案 §一 RT：CPython 来源 = python-build 产物，快照锁定，manifest 驱动）。
+"""运行时快照解析器（方案 §一 RT；runtime.lock 退役后 = pkapp.toml 声明意图 + 托管快照）。
 
-runtime.lock（项目根，TOML）：
-    [runtime.windows]
-    python_version = "3.12.14"
-    dir = "D:/runtimes/pbs-cpython-3.12.14"     # 解压后的安装目录
+解析序（2026-10-02 裁定）：
+1. [platforms.*].runtime_dir 显式覆盖（逃生门；version 仍取对应 spec.python_version）
+2. toolchain 托管缓存 `pkapp fetch <platform>` 产物（managed_runtime_dir）
+3. 全部落空 → RuntimeResolveError，文案指向 fetch 命令
 
-B.t① 断言：目录必须含 python3XX.dll（共享构建，Py_ENABLE_SHARED）——
+托管路径下核对 <dir>/snapshot.toml 的 python_version 与 spec 声明一致（fetch 写入的
+产物锁——"lock 从输入变产物"）；spec 未声明 python_version → 报错提示补声明。
+
+B.t① 断言保留：目录必须含 python3XX.dll（共享构建，Py_ENABLE_SHARED）——
 静态 libpython 时 getpath 的 library 为空，_pth 退回按 EXE 目录查找（V4）。
-Mock 先行：tests 生成同构假 runtime 驱动 golden test；真 PBS 接入后同一管线复验。
 """
 from __future__ import annotations
 
 import glob
 import os
+import re
 from dataclasses import dataclass
+
+from .. import toolchain
 
 try:
     import tomllib
@@ -21,8 +26,8 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
 
-class RuntimeLockError(ValueError):
-    """runtime.lock 缺失 / 指向无效快照。"""
+class RuntimeResolveError(ValueError):
+    """运行时快照缺失 / 指向无效 / 与 spec 声明不一致（fail fast，不得留到壳侧）。"""
 
 
 @dataclass(frozen=True)
@@ -34,78 +39,70 @@ class RuntimeSnapshot:
     abis: tuple = ()       # android：快照覆盖的 ABI 列表（dir 下按 <abi>/ 子目录布局）
 
 
-def load_lock(project_dir: str) -> dict:
-    path = os.path.join(project_dir, "runtime.lock")
+def _declared(spec, platform: str) -> tuple[str, str]:
+    """(python_version, runtime_dir 覆盖) —— 取自 pkapp.toml 对应平台段。"""
+    if platform == "windows":
+        return spec.windows_python_version, spec.windows_runtime_dir
+    if platform == "android":
+        return spec.android_python_version, spec.android_runtime_dir
+    raise RuntimeResolveError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
+
+
+def _snapshot_version(root: str) -> str:
+    path = os.path.join(root, "snapshot.toml")
     try:
         with open(path, "rb") as f:
-            return tomllib.load(f)
-    except FileNotFoundError as e:
-        raise RuntimeLockError(
-            f"未找到 {path}——build 前须注册运行时快照（见 runtime.lock 模板）") from e
+            return str((tomllib.load(f) or {}).get("python_version", ""))
+    except FileNotFoundError:
+        return ""
     except tomllib.TOMLDecodeError as e:
-        raise RuntimeLockError(f"{path} 不是合法 TOML: {e}") from e
+        raise RuntimeResolveError(f"{path} 不是合法 TOML: {e}") from e
 
 
-def _detect_windows_dll(root: str) -> str:
-    """B.t①：共享构建断言——根目录必须存在 python3NN.dll（版本号数字必现）。
+def resolve(spec, platform: str, abis: tuple = ("arm64-v8a",)) -> RuntimeSnapshot:
+    """解析 + 校验平台快照。任何缺失/非法 → RuntimeResolveError（fail fast）。"""
+    declared, override = _declared(spec, platform)
+    if not declared:
+        seg = "windows" if platform == "windows" else "android"
+        raise RuntimeResolveError(
+            f"pkapp.toml 缺 [platforms.{seg}].python_version——声明运行时意图"
+            f"（如 python_version = \"{toolchain.PYTHON_VERSION}\"），"
+            f"然后运行 pkapp fetch {platform}")
 
-    正则排除 python3.dll（稳定 ABI 转发器，非解释器本体）——实测教训：
-    字典序下 python3.dll < python312.dll，宽松 glob 会选错（M0 D2 回填）。
-    """
-    import re
-    hits = sorted(f for f in os.listdir(root)
-                  if re.match(r"^python3\d+\.dll$", f, re.IGNORECASE))
-    if not hits:
-        raise RuntimeLockError(
-            f"{root} 下未找到 python3NN.dll：不是含解释器 DLL 的共享构建（B.t①，Py_ENABLE_SHARED）")
-    return hits[0]
+    if override:
+        root = override
+        if not os.path.isdir(root):
+            raise RuntimeResolveError(
+                f"[platforms.{platform}].runtime_dir 不存在或未指向目录: {root!r}")
+        version = declared
+    else:
+        try:
+            root = toolchain.managed_runtime_dir(platform)
+        except toolchain.ToolchainError as e:
+            raise RuntimeResolveError(str(e)) from e
+        if not os.path.isdir(root):
+            raise RuntimeResolveError(
+                f"托管运行时快照缺失: {root}——运行 `pkapp fetch {platform}`"
+                f"（build/package 不隐式联网）")
+        version = _snapshot_version(root)
+        if not version:
+            raise RuntimeResolveError(
+                f"{root} 缺 snapshot.toml 或未记录 python_version——重跑 "
+                f"`pkapp fetch {platform}`（须由 fetch 产出，勿手工布置）")
+        if version != declared:
+            seg = "windows" if platform == "windows" else "android"
+            raise RuntimeResolveError(
+                f"快照 python_version ({version}) 与 [platforms.{seg}].python_version "
+                f"({declared}) 不一致——重跑 `pkapp fetch {platform}` 或核对声明")
 
-
-def _detect_linux_so(root: str) -> str:
-    hits = sorted(glob.glob(os.path.join(root, "libpython3*.so*")))
-    if not hits:
-        raise RuntimeLockError(f"{root} 下未找到 libpython3*.so*（Linux 快照布局）")
-    return os.path.basename(hits[0])
-
-
-def _detect_android_dir(root: str, abi: str) -> str:
-    """Android 快照 = flet python-build 产物：<dir>/<abi>/{libpython3NN.so, libpythonbundle.so}。
-
-    libpythonbundle.so 是 zip（stdlib/ + modules/ 扩展模块）——spk 的 runtime_hash
-    取其 sha256，标识应用构建所针对的运行时 bundle。
-    """
-    import re
-    d = os.path.join(root, abi)
-    if not os.path.isdir(d):
-        raise RuntimeLockError(f"[runtime.android] 缺 <abi> 子目录: {d}（布局 <dir>/<abi>/）")
-    hits = sorted(f for f in os.listdir(d) if re.match(r"^libpython3\.\d+\.so$", f))
-    if not hits:
-        raise RuntimeLockError(f"{d} 下未找到 libpython3NN.so（flet android 快照布局）")
-    if not os.path.isfile(os.path.join(d, "libpythonbundle.so")):
-        raise RuntimeLockError(f"{d} 缺 libpythonbundle.so（stdlib+扩展模块 bundle）")
-    return hits[0]
-
-
-def resolve(project_dir: str, platform: str, abis: tuple = ("arm64-v8a",)) -> RuntimeSnapshot:
-    """解析 + 校验平台快照。任何缺失/非法 → RuntimeLockError（fail fast，不得留到壳侧）。"""
-    table = load_lock(project_dir).get("runtime") or {}
-    entry = table.get(platform)
-    if not entry:
-        raise RuntimeLockError(f"runtime.lock 缺少 [runtime.{platform}] 段")
-    root = str(entry.get("dir", ""))
-    if not root or not os.path.isdir(root):
-        raise RuntimeLockError(f"[runtime.{platform}].dir 不存在或未指向目录: {root!r}")
-    version = str(entry.get("python_version", ""))
-    if not version:
-        raise RuntimeLockError(f"[runtime.{platform}].python_version 必填（快照锁定语义）")
     if platform == "windows":
         dll = _detect_windows_dll(root)
         for sub in ("Lib", "DLLs"):
             if not os.path.isdir(os.path.join(root, sub)):
-                raise RuntimeLockError(f"快照缺 {sub}/ 目录: {root}（PBS 安装目录形态）")
+                raise RuntimeResolveError(f"快照缺 {sub}/ 目录: {root}（PBS 安装目录形态）")
     elif platform == "android":
         if not abis:
-            raise RuntimeLockError("[runtime.android] abis 为空（AppSpec [platforms.android].abis）")
+            raise RuntimeResolveError("abis 为空（AppSpec [platforms.android].abis）")
         dll = ""
         for abi in abis:
             hit = _detect_android_dir(root, abi)
@@ -117,11 +114,44 @@ def resolve(project_dir: str, platform: str, abis: tuple = ("arm64-v8a",)) -> Ru
                            abis=tuple(abis) if platform == "android" else ())
 
 
+def _detect_windows_dll(root: str) -> str:
+    """B.t①：共享构建断言——根目录必须存在 python3NN.dll（版本号数字必现）。
+
+    正则排除 python3.dll（稳定 ABI 转发器，非解释器本体）——实测教训：
+    字典序下 python3.dll < python312.dll，宽松 glob 会选错（M0 D2 回填）。
+    """
+    hits = sorted(f for f in os.listdir(root)
+                  if re.match(r"^python3\d+\.dll$", f, re.IGNORECASE))
+    if not hits:
+        raise RuntimeResolveError(
+            f"{root} 下未找到 python3NN.dll：不是含解释器 DLL 的共享构建（B.t①，Py_ENABLE_SHARED）")
+    return hits[0]
+
+
+def _detect_linux_so(root: str) -> str:
+    hits = sorted(glob.glob(os.path.join(root, "libpython3*.so*")))
+    if not hits:
+        raise RuntimeResolveError(f"{root} 下未找到 libpython3*.so*（Linux 快照布局）")
+    return os.path.basename(hits[0])
+
+
+def _detect_android_dir(root: str, abi: str) -> str:
+    """Android 快照 = flet python-build 产物：<dir>/<abi>/{libpython3NN.so, libpythonbundle.so}。
+
+    libpythonbundle.so 是 zip（stdlib/ + modules/ 扩展模块）——spk 的 runtime_hash
+    取其 sha256，标识应用构建所针对的运行时 bundle。
+    """
+    d = os.path.join(root, abi)
+    if not os.path.isdir(d):
+        raise RuntimeResolveError(f"运行时快照缺 <abi> 子目录: {d}（布局 <dir>/<abi>/）")
+    hits = sorted(f for f in os.listdir(d) if re.match(r"^libpython3\.\d+\.so$", f))
+    if not hits:
+        raise RuntimeResolveError(f"{d} 下未找到 libpython3NN.so（flet android 快照布局）")
+    if not os.path.isfile(os.path.join(d, "libpythonbundle.so")):
+        raise RuntimeResolveError(f"{d} 缺 libpythonbundle.so（stdlib+扩展模块 bundle）")
+    return hits[0]
+
+
 def dll_stem(python_dll: str) -> str:
-    """B.x：python_dll 去扩展名 → python312（zip / _pth 文件名派生自它，V13）。"""
-    base = os.path.basename(python_dll)
-    for ext in (".dll",):
-        if base.lower().endswith(ext):
-            return base[:-len(ext)]
-    # POSIX：libpython3.12.so.1.0 → 取首段
-    return base.split(".so")[0].removeprefix("lib")
+    """python312.dll → python312（_pth/stdlib zip 命名派生，B.x）。"""
+    return os.path.splitext(python_dll)[0]

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pkapp"
 version = "0.1.0"
-description = "pkapp — 跨平台 Python 应用打包 CLI（五命令：create/dev/build/check/doctor）"
+description = "pkapp — 跨平台 Python 应用打包 CLI（七命令：create/dev/build/check/doctor/package/fetch）"
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=42",

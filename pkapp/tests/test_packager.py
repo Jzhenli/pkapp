@@ -85,21 +85,17 @@ def _build_android(project, wheels_dir, out, **kw):
                               wheels_dir=wheels_dir, **kw)
 
 
-def test_android_build(project, wheels_dir, tmp_path):    # M2 android 管线
+def test_android_build(project, mock_android_runtime, wheels_dir, tmp_path):    # M2 android 管线
     from hashlib import sha256 as _sha
 
-    from pkapp.tools.mockkit import make_mock_android_runtime
-
     abi = "arm64-v8a"
-    android_rt = make_mock_android_runtime(str(tmp_path / "mock-flet"), abis=(abi,))
-    with open(os.path.join(project, "runtime.lock"), "a") as f:
-        f.write(f"\n[runtime.android]\npython_version = \"3.12.14\"\ndir = '{android_rt}'\n")
     out = str(tmp_path / "demo-android.spk")
     fields = _build_android(project, wheels_dir, out)
 
     assert fields["python_dll"] == "libpython3.12.so"
     assert fields["applocal_version"] == "0.1.0"
-    bundle_hash = _sha(open(os.path.join(android_rt, abi, "libpythonbundle.so"), "rb").read()).hexdigest()
+    bundle = os.path.join(mock_android_runtime, abi, "libpythonbundle.so")
+    bundle_hash = _sha(open(bundle, "rb").read()).hexdigest()
     assert fields["runtime_hash"] == f"sha256:{bundle_hash}"
     # 验签链（G4 正向）
     pub = sign.public_key_hex(os.path.join(project, ".pkapp", "sign.key"))
@@ -118,21 +114,23 @@ def test_android_build(project, wheels_dir, tmp_path):    # M2 android 管线
     assert open(out, "rb").read() == open(out2, "rb").read()
 
 
-def test_android_runtime_lock_negative(project, tmp_path):  # fail fast：缺 bundle / 缺 abi 目录
-    from pkapp.packager.runtime import RuntimeLockError, resolve
-
+def test_android_runtime_resolve_negative(project, tmp_path):
+    """fail fast：缺 bundle / 缺 abi 目录（托管快照路径，managed_runtime_dir 同源）。"""
+    from pkapp.packager.runtime import RuntimeResolveError, resolve
     from pkapp.tools.mockkit import make_mock_android_runtime
 
-    with open(os.path.join(project, "runtime.lock"), "a") as f:
-        f.write("\n[runtime.android]\npython_version = \"3.12.14\"\n"
-                f"dir = '{tmp_path / 'bad-rt'}'\n")
-    make_mock_android_runtime(str(tmp_path / "bad-rt"), abis=("arm64-v8a",))
-    os.remove(os.path.join(tmp_path / "bad-rt", "arm64-v8a", "libpythonbundle.so"))
-    with pytest.raises(RuntimeLockError, match="libpythonbundle"):
-        resolve(project, "android")
-    make_mock_android_runtime(str(tmp_path / "bad-rt"), abis=("arm64-v8a",))
-    with pytest.raises(RuntimeLockError, match="子目录"):
-        resolve(project, "android", abis=("x86_64",))
+    spec = load(os.path.join(project, "pkapp.toml"))
+    bad = str(tmp_path / "bad-rt")
+    make_mock_android_runtime(bad, abis=("arm64-v8a",))
+    os.remove(os.path.join(bad, "arm64-v8a", "libpythonbundle.so"))
+    # 逃生门路径只断言布局（version 取 spec 声明），不依赖托管缓存
+    from dataclasses import replace
+    spec_bad = replace(spec, android_runtime_dir=bad)
+    with pytest.raises(RuntimeResolveError, match="libpythonbundle"):
+        resolve(spec_bad, "android")
+    make_mock_android_runtime(bad, abis=("arm64-v8a",))
+    with pytest.raises(RuntimeResolveError, match="子目录"):
+        resolve(spec_bad, "android", abis=("x86_64",))
 
 
 def test_min_app_version_selfcheck(tmp_path):             # G5

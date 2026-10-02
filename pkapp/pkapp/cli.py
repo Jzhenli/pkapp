@@ -1,8 +1,9 @@
-"""pkapp CLI 主入口：六命令（create/dev/build/check/doctor/package）。
+"""pkapp CLI 主入口：七命令（create/dev/build/check/doctor/package/fetch）。
 
 ★v8.4★ 命令面定稿：平台一律作位置参数（`pkapp build android`）；package 取代
 ship 成为统一终产物命令（windows→zip / android→apk / linux→tar.gz，M3 预留）。
 ★v1.2★ 裁定：打包工具不做用户管理（认证门内置初始 admin/123456，用户管理归应用后端）。
+★fetch★ 工具链托管：唯一网络入口；build/package 缺失即 fail-fast 指向 fetch。
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from .commands import check as cmd_check_mod
 from .commands import create as cmd_create_mod
 from .commands import dev as cmd_dev_mod
 from .commands import doctor as cmd_doctor_mod
+from .commands import fetch as cmd_fetch_mod
 from .commands import package as cmd_package_mod
 
 
@@ -54,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="环境诊断（runtime 快照 B.t 断言 / WebView2 / JDK / SDK）")
     _add_project(p)
 
+    p = sub.add_parser("fetch", help="工具链托管（唯一网络入口）：下载/离线导入运行时与构建工具链")
+    p.add_argument("platform", choices=["windows", "android", "all"],
+                   help="目标平台（位置参数，如 pkapp fetch android）")
+    p.add_argument("--from", dest="from_dir", default=None,
+                   help="离线导入：从本地目录按文件名+sha256 导入压缩包（不联网）")
+    p.add_argument("--list", action="store_true", help="仅列出 pin 清单（不下载）")
+
     p = sub.add_parser("package", help="平台终产物：windows→zip / android→apk / linux→tar.gz（M3）；spk 缺失时报错先 build")
     _add_project(p)
     p.add_argument("platform", choices=["windows", "android", "linux"],
@@ -85,6 +94,16 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_check_mod.cmd_check(args.project)
         if args.cmd == "doctor":
             return cmd_doctor_mod.cmd_doctor(args.project)
+        if args.cmd == "fetch":
+            platforms = (["windows", "android"] if args.platform == "all"
+                         else [args.platform])
+            rc = 0
+            for plat in platforms:
+                rc = cmd_fetch_mod.cmd_fetch(plat, from_dir=args.from_dir,
+                                             list_only=args.list) or rc
+                if rc:
+                    break
+            return rc
         if args.cmd == "package":
             return cmd_package_mod.cmd_package(args.project, args.platform,
                                                shell=args.shell, shell_dir=args.shell_dir,

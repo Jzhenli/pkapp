@@ -45,15 +45,43 @@ def test_bad_name(tmp_path):
 
 
 def test_platform_deps_merge(tmp_path):
-    """平台段依赖追加合并（公共在前）；icon 读取。"""
+    """平台段依赖追加合并（公共在前）；icon 读取（模板平台段已实体化 → 注释行激活）。"""
     root = _make(tmp_path, "n4", **{
-        '[dist]': '[platforms.windows]\ndependencies = ["pywin32>=306"]\nicon = "assets/app.ico"\n[dist]',
+        '# dependencies = [ "pywin32>=306", ]': 'dependencies = ["pywin32>=306"]',
+        '# icon = "assets/icon.ico"': 'icon = "assets/app.ico"',
     })
     spec = load(os.path.join(root, "pkapp.toml"))
     assert spec.deps_for("windows") == ("applocal>=0.1.0", "uvicorn>=0.30", "pywin32>=306")
     assert spec.deps_for("linux") == ("applocal>=0.1.0", "uvicorn>=0.30")  # 平台隔离
     assert spec.all_platform_deps() == ("applocal>=0.1.0", "uvicorn>=0.30", "pywin32>=306")
     assert spec.platform_icon == "assets/app.ico"
+
+
+def test_platform_python_version_parse(tmp_path):
+    """[platforms.*].python_version 解析（★fetch★ 运行时意图声明）。"""
+    root = _make(tmp_path, "n4b")
+    spec = load(os.path.join(root, "pkapp.toml"))
+    assert spec.windows_python_version == "3.12.14"
+    assert spec.android_python_version == "3.12.14"
+
+
+def test_platform_python_version_bad_format(tmp_path):
+    root = _make(tmp_path, "n4c", **{
+        'python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）':
+        'python_version = "3.12"',
+    })
+    with pytest.raises(SpecError, match="3.X.Y"):
+        load(os.path.join(root, "pkapp.toml"))
+
+
+def test_platform_unknown_key(tmp_path):
+    """平台段未知键报错（同 [network] 精神：拼写错误静默丢弃 = 配置悄悄失效）。"""
+    root = _make(tmp_path, "n4d", **{
+        'python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）':
+        'python_versoin = "3.12.14"',
+    })
+    with pytest.raises(SpecError, match="未知配置键"):
+        load(os.path.join(root, "pkapp.toml"))
 
 
 def test_unknown_platform_section(tmp_path):
@@ -66,7 +94,7 @@ def test_unknown_platform_section(tmp_path):
 def test_platform_dep_bad_format(tmp_path):
     """平台段依赖格式校验与公共段同规。"""
     root = _make(tmp_path, "n6", **{
-        '[dist]': '[platforms.windows]\ndependencies = ["bad dep!!"]\n[dist]',
+        '# dependencies = [ "pywin32>=306", ]': 'dependencies = ["bad dep!!"]',
     })
     with pytest.raises(SpecError, match="依赖声明格式非法"):
         load(os.path.join(root, "pkapp.toml"))
@@ -110,11 +138,11 @@ def test_network_port_bad_int(tmp_path):
 def test_android_package_parse_and_format(tmp_path):
     """[platforms.android].package：解析 + 反向域名格式校验（★v1.2★ applicationId 注入）。"""
     root = _make(tmp_path, "n11", **{
-        '[dist]': '[platforms.android]\npackage = "com.example.myapp"\n[dist]',
+        '# package = "com.example.helloworld"': 'package = "com.example.myapp"',
     })
     assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.myapp"
     root2 = _make(tmp_path, "n12", **{
-        '[dist]': '[platforms.android]\npackage = "bad..id"\n[dist]',
+        '# package = "com.example.helloworld"': 'package = "bad..id"',
     })
     with pytest.raises(SpecError, match="反向域名"):
         load(os.path.join(root2, "pkapp.toml"))
@@ -123,7 +151,7 @@ def test_android_package_parse_and_format(tmp_path):
 def test_android_keystore_parse(tmp_path):
     """[platforms.android].keystore：路径透传（非机密;密码走 env,永不入 AppSpec）。"""
     root = _make(tmp_path, "n13", **{
-        '[dist]': '[platforms.android]\nkeystore = "signing/release.keystore"\n[dist]',
+        '# keystore = "signing/release.keystore"': 'keystore = "signing/release.keystore"',
     })
     assert load(os.path.join(root, "pkapp.toml")).android_keystore == \
         "signing/release.keystore"

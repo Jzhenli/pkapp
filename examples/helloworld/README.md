@@ -9,7 +9,9 @@
 ```bat
 :: 前置（仓库根）：pip install -e applocal && pip install -e pkapp
 
-:: 1) 注册 CPython 快照：把 PBS 3.12 解压目录填进 runtime.lock 的 [runtime.windows] dir
+:: 1) 托管运行时：声明在 pkapp.toml [platforms.windows].python_version（模板已内置），
+::    fetch 下载进托管缓存（唯一网络入口；也可 --from <目录> 离线导入）
+pkapp fetch windows
 
 :: 2) 构建 + 打包（本目录内）
 pip install -e ..\..\applocal          :: applocal 不在 PyPI，dev 模式也需要

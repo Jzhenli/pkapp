@@ -12,6 +12,8 @@ val ksAlias = project.findProperty("pkappKsAlias") as String? ?: "pkapp"
 android {
     namespace = "com.pkapp.shell"
     compileSdk = 35
+    // 显式锁定 NDK（消除 AGP 默认值漂移；pkapp fetch android 的 ndk-27 pin 锁定同一版本）
+    ndkVersion = "27.0.12077973"
 
     signingConfigs {
         if (ksFile != null && ksPass != null) {

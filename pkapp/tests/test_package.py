@@ -54,9 +54,16 @@ def test_package_android_requires_spk(tmp_path, capsys):
 
 
 def _add_android_package(proj):
-    """android 组装前置：[platforms.android].package（★v1.2★ 起必填 = applicationId）。"""
-    with open(os.path.join(proj, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.android]\npackage = "com.example.myapp"\n')
+    """android 组装前置：[platforms.android].package（★v1.2★ 起必填 = applicationId）。
+    新模板平台段已实体化 → 精准替换注释行（追加会产生重复 TOML 表）。"""
+    path = os.path.join(proj, "pkapp.toml")
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    marker = '# package = "com.example.helloworld"'
+    assert marker in txt, "create 模板 android package 注释行已变，请同步本测试"
+    txt = txt.replace(marker, 'package = "com.example.myapp"', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
 
 
 def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
@@ -103,7 +110,7 @@ def test_package_android_builds_apk(tmp_path, monkeypatch):
                  "--shell-dir", _fake_shell(tmp_path)]) == 0
     assert captured["app_id"] == "com.example.myapp"      # -PpkappAppId 注入链（★v1.2★）
     assert captured["label"] == "myapp"                   # -PpkappLabel = app.name（★v1.2★）
-    apk_path = os.path.join(proj, "release", "myapp.apk")
+    apk_path = os.path.join(proj, "release", "myapp-0.1.0-android-arm64_v8a.apk")
     assert os.path.isfile(apk_path)
     with zipfile.ZipFile(apk_path) as zf:
         assert zf.read("assets/runtime.spk") == spk_bytes
@@ -137,7 +144,8 @@ def test_package_android_release_signed(tmp_path, monkeypatch):
     assert captured["keystore"] == str(ks)
     assert captured["keystore_pass"] == "s3cret"
     assert captured["keystore_alias"] == "mykey"
-    assert os.path.isfile(os.path.join(proj, "release", "myapp.apk"))
+    assert os.path.isfile(os.path.join(
+        proj, "release", "myapp-0.1.0-android-arm64_v8a.apk"))
 
 
 def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys):

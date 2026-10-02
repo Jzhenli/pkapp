@@ -13,24 +13,55 @@ import os
 import shutil
 import zipfile
 
-DEFAULT_TOOLCHAIN = r"D:\code\pack\toolchain"
-
 # 壳工程随仓库分发，默认取仓库内 shell-android/shell（apk.py 位于 <repo>/pkapp/pkapp/packager/）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 DEFAULT_SHELL_DIR = os.path.join(_REPO_ROOT, "shell-android", "shell")
 
 
+def _toolchain_paths() -> dict:
+    """gradle 构建工具链路径：PKAPP_ANDROID_TOOLCHAIN（旧整体根语义，手工布置）
+    > toolchain 托管布局（pkapp fetch android 产物）。缺 gradle 时文案指向 fetch。"""
+    from .. import toolchain
+
+    tc = os.environ.get("PKAPP_ANDROID_TOOLCHAIN")
+    if tc:
+        root = os.path.join(tc, "jdk", "jdk-17.0.20.1+1")
+        return {"java_home": root,
+                "android_home": os.path.join(tc, "android-sdk"),
+                "gradle": os.path.join(tc, "gradle-8.9", "bin",
+                                       "gradle.bat" if os.name == "nt" else "gradle"),
+                "gradle_home": os.path.join(tc, "gradle-home")}
+    return toolchain.android_paths()
+
+
 class ApkError(RuntimeError):
     """APK 组装失败（壳工程缺失 / gradle 失败 / 资产未入包）。"""
+
+
+def artifact_name(name: str, version: str, platform: str,
+                  abis: tuple[str, ...] = ()) -> str:
+    """终产物命名：{name}-{version}-{platform}-{arch}.{ext}——平台/架构一目了然。
+
+    android arch = abi 列表拼接（abi 内 '-' 转 '_'，如 arm64_v8a-x86_64）；
+    windows 固定 x86_64（PBS pin 当前仅 x86_64-pc-windows-msvc）。
+    """
+    if platform == "android":
+        arch = "-".join(a.replace("-", "_") for a in abis) or "universal"
+        ext = "apk"
+    else:
+        arch, ext = "x86_64", "zip"
+    return f"{name}-{version}-{platform}-{arch}.{ext}"
 
 
 def build_apk(project: str, app_name: str, spk_path: str, *,
               shell_dir: str | None = None, out_dir: str | None = None,
               variant: str = "debug", app_id: str = "",
+              version: str = "", abis: tuple[str, ...] = (),
               keystore: str = "", keystore_pass: str = "",
               keystore_alias: str = "pkapp") -> str:
-    """spk → 壳 assets → gradle → <project>/release/<app_name>.apk。
+    """spk → 壳 assets → gradle → <project>/release/<artifact_name>（如
+    HiApp-0.1.0-android-arm64_v8a-x86_64.apk，★产物命名带版本/平台/架构★）。
 
     app_id = [platforms.android].package（必填；经 -PpkappAppId 注入 gradle
     applicationId，★v1.2★ 解决多应用同机共存——固定 com.pkapp.shell 会互相顶替）。
@@ -78,7 +109,7 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
 
     dest_dir = out_dir or os.path.join(project, "release")
     os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, f"{app_name}.apk")
+    dest = os.path.join(dest_dir, artifact_name(app_name, version, "android", abis))
     shutil.copyfile(apk_src, dest)
     return dest
 
@@ -92,15 +123,15 @@ def _run_gradle(shell: str, variant: str, app_id: str, label: str,
     密码不进命令行，防同机进程列表（WMI/任务管理器）泄露；工具链路径 = env > 默认 toolchain 布局。"""
     import subprocess
 
-    tc = os.environ.get("PKAPP_ANDROID_TOOLCHAIN") or DEFAULT_TOOLCHAIN
+    tp = _toolchain_paths()
     env = dict(os.environ)
-    env.setdefault("JAVA_HOME", os.path.join(tc, "jdk", "jdk-17.0.20.1+1"))
-    env.setdefault("ANDROID_HOME", os.path.join(tc, "android-sdk"))
-    env.setdefault("GRADLE_USER_HOME", os.path.join(tc, "gradle-home"))
-    gradle = os.path.join(tc, "gradle-8.9", "bin",
-                          "gradle.bat" if os.name == "nt" else "gradle")
+    env.setdefault("JAVA_HOME", tp["java_home"])
+    env.setdefault("ANDROID_HOME", tp["android_home"])
+    env.setdefault("GRADLE_USER_HOME", tp["gradle_home"])
+    gradle = tp["gradle"]
     if not os.path.isfile(gradle):
-        raise ApkError(f"gradle 不存在: {gradle}（设 PKAPP_ANDROID_TOOLCHAIN 或 PATH）")
+        raise ApkError(f"gradle 不存在: {gradle}——先 `pkapp fetch android`"
+                       "（或设 PKAPP_ANDROID_TOOLCHAIN 指向手工布置的整体根）")
     if keystore:
         env["ORG_GRADLE_PROJECT_pkappKs"] = keystore
         env["ORG_GRADLE_PROJECT_pkappKsPass"] = keystore_pass

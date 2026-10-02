@@ -19,6 +19,11 @@ except ModuleNotFoundError:  # Python < 3.11
 
 _ENTRY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):([A-Za-z_][A-Za-z0-9_]*)$")
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+_PYVER_RE = re.compile(r"^3\.\d+\.\d+$")
+
+# 平台段白名单：未知键报错（同 [network] 精神——拼写错误静默丢弃 = 配置悄悄失效，B.w 兜住）
+_PLAT_KEYS = {"dependencies", "icon", "setproctitle", "package", "abis",
+              "keystore", "python_version", "runtime_dir"}
 
 
 class SpecError(ValueError):
@@ -79,6 +84,10 @@ class AppSpec:
     android_package: str = ""
     android_abis: tuple[str, ...] = ("arm64-v8a",)
     android_keystore: str = ""           # [platforms.android].keystore（路径,非机密;密码走 PKAPP_KEYSTORE_PASS env）
+    windows_python_version: str = ""     # [platforms.windows].python_version（运行时意图声明 → pkapp fetch）
+    android_python_version: str = ""     # [platforms.android].python_version
+    windows_runtime_dir: str = ""        # [platforms.windows].runtime_dir（逃生门：显式覆盖托管快照）
+    android_runtime_dir: str = ""        # [platforms.android].runtime_dir
     platform_deps: dict = field(default_factory=dict)   # [platforms.*].dependencies（追加式，不含公共）
     platform_icon: str = ""              # [platforms.windows].icon → ship 图标默认值
     network: NetworkSpec = field(default_factory=NetworkSpec)  # [network] 段（§5）
@@ -132,6 +141,9 @@ def validate(spec: AppSpec) -> list[str]:
             spec.android_package):
         problems.append(f"[platforms.android].package 须为反向域名"
                         f"（如 com.example.hiapp）: {spec.android_package!r}")
+    for pv in (spec.windows_python_version, spec.android_python_version):
+        if pv and not _PYVER_RE.match(pv):
+            problems.append(f"[platforms.*].python_version 须为 3.X.Y 格式（如 3.12.14）: {pv!r}")
     net = spec.network
     if net.present:
         bad = [m for m in net.auth if m not in ("login", "provision", "none")]
@@ -173,6 +185,9 @@ def load(path: str) -> AppSpec:
     # 平台段白名单：未知段名报错（拼写错误静默丢弃 = 依赖悄悄漏装，B.w 校验兜住）
     known = ("windows", "android", "linux")
     unknown = sorted(set(plat) - set(known))
+    # 未知键（段内）：按 net_unknown 模式收集进 problems
+    plat_unknown = sorted((f"[platforms.{p}].{k}" for p in known
+                           for k in set(plat.get(p) or {}) - _PLAT_KEYS))
 
     def _str_list(v) -> list:
         if v is None:
@@ -227,6 +242,10 @@ def load(path: str) -> AppSpec:
         android_package=str(android.get("package", "")),
         android_abis=tuple(android.get("abis", ("arm64-v8a",))),
         android_keystore=str(android.get("keystore", "")),
+        windows_python_version=str(windows.get("python_version", "")),
+        android_python_version=str(android.get("python_version", "")),
+        windows_runtime_dir=str(windows.get("runtime_dir", "")),
+        android_runtime_dir=str(android.get("runtime_dir", "")),
         platform_deps=platform_deps,
         platform_icon=str(windows.get("icon", "")),
         network=network,
@@ -235,6 +254,8 @@ def load(path: str) -> AppSpec:
     problems = validate(spec)
     for p in unknown:
         problems.append(f"[platforms.{p}] 未知平台段（目标仅 {', '.join(known)}；检查拼写）")
+    for k in plat_unknown:
+        problems.append(f"{k} 未知配置键（检查拼写）")
     for p in net_unknown:
         problems.append(f"[network].{p} 未知配置键（检查拼写）")
     if problems:

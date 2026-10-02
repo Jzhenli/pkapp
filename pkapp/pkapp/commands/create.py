@@ -31,24 +31,19 @@ cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap �
 [dist]
 dir = "dist"                   # 前端产物目录（恒存在；空缺时 build 生成占位页）
 
-# 平台段（参考 XAgent pyproject 设计）：依赖追加式合并（公共 + 平台），未知段名报错。
-# [platforms.windows]
+# 平台段（参考 XAgent pyproject 设计）：依赖追加式合并（公共 + 平台），未知段名/未知键报错。
+[platforms.windows]
+python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）
+# runtime_dir = "D:/runtimes/pbs-cpython-3.12.14+20260929"   # 逃生门：显式覆盖托管快照
 # dependencies = [ "pywin32>=306", ]   # 仅 Windows 装的依赖
 # icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
-# [platforms.linux]                    # M2 预留；dependencies 同样追加
-# setproctitle = true
-# [platforms.android]                  # M2：package = applicationId（★v1.2★ 必填，同机多应用共存）
-# package = "com.example.helloworld"
+[platforms.android]
+python_version = "3.12.14"     # → pkapp fetch android（py-android 运行时同版本锁定）
+# package = "com.example.helloworld"   # applicationId（同机多应用共存，build android 必填）
 # keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
 # abis = ["arm64-v8a"]
-"""
-
-_RuntimeLock = """\
-# 运行时快照注册（CPython 来源：python-build 产物，快照锁定）。
-# build 前把 dir 指向解压后的 PBS 安装目录（须含 python3XX.dll / Lib/ / DLLs/，B.t①）。
-# [runtime.windows]
-# python_version = "3.12.14"
-# dir = "D:/runtimes/pbs-cpython-3.12.14"
+# [platforms.linux]                    # M3 预留；dependencies 同样追加
+# setproctitle = true
 """
 
 _MainPy = '''\
@@ -91,7 +86,6 @@ _Gitignore = """\
 .dev/
 build/
 release/
-runtime.lock
 .pkapp/
 __pycache__/
 *.pyc
@@ -111,7 +105,6 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
     os.makedirs(os.path.join(root, "app"), exist_ok=True)
     os.makedirs(os.path.join(root, "dist"), exist_ok=True)
     atomic_write(os.path.join(root, "pkapp.toml"), _PkappToml.format(name=name).encode())
-    atomic_write(os.path.join(root, "runtime.lock"), _RuntimeLock.encode())
     atomic_write(os.path.join(root, ".gitignore"), _Gitignore.encode())
     atomic_write(os.path.join(root, "app", "__init__.py"), _InitPy.encode())
     atomic_write(os.path.join(root, "app", "main.py"), _MainPy.encode())
@@ -134,7 +127,7 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
             print("[create] 依赖安装失败——检查网络/私有索引后重试")
             return 1
     print("[create] 完成。下一步：\n"
-          "  1. 在 runtime.lock 注册运行时快照\n"
-          "  2. pkapp dev     # 起 dev 服务\n"
-          "  3. pkapp doctor  # 环境诊断")
+          "  1. pkapp fetch windows  # 托管运行时（唯一网络入口；--from 目录可离线导入）\n"
+          "  2. pkapp dev            # 起 dev 服务\n"
+          "  3. pkapp doctor         # 环境诊断")
     return 0

@@ -44,8 +44,10 @@ shell-android/
 
 ## 构建（★v8.4★ 两条命令版）
 
-前置：toolchain 就位（JDK17 + SDK 35 + NDK 27.3，布局约定 `%TOOLCHAIN%\{jdk,android-sdk,gradle-8.9,gradle-home}`，
-可由 `TOOLCHAIN` 环境变量覆盖，见 `shell/build.bat`；首次需 `prepare_runtime.py` 铺解释器件）。
+前置：toolchain 就位（JDK17 + SDK 35 + NDK 27）——推荐 `pkapp fetch android` 托管缓存
+（JDK/Gradle/SDK 五组件/py-android 运行时一次到位，licenses 自动落盘）；或手工布置
+`%PKAPP_ANDROID_TOOLCHAIN%\{jdk\jdk-17.0.20.1+1,android-sdk,gradle-8.9,gradle-home}` 整体根
+（见 `shell/build.bat`；首次需 `prepare_runtime.py` 铺解释器件）。
 
 ```bat
 :: 1) 首次/换快照：准备解释器件（从 flet python-build 快照铺设 jniLibs/assets）

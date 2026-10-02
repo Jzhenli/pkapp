@@ -8,7 +8,7 @@ from ..packager import assemble
 from ..packager import golden as golden_mod
 from ..packager import manifest as mf
 from ..packager import sign
-from ..packager.runtime import RuntimeLockError
+from ..packager.runtime import RuntimeResolveError
 
 
 def cmd_build(project: str, *, platform: str = "windows", key: str | None = None,
@@ -44,7 +44,10 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
     try:
         fields = assemble.build_spk(project, spec, platform, out_path,
                                     private_key=private_key, wheels_dir=wheels_dir)
-    except (RuntimeLockError, assemble.BuildError, sign.SignError) as e:
+    except RuntimeResolveError as e:
+        print(f"[build] 失败: {e}")
+        return 1
+    except (assemble.BuildError, sign.SignError) as e:
         print(f"[build] 失败: {e}")
         return 1
 

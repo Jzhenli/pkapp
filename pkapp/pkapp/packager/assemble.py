@@ -22,7 +22,7 @@ from ..appspec import AppSpec
 from ..util import SPK_DATE, atomic_write, copy_tree, tree_hash
 from . import manifest as mf
 from . import pe, runtime, sign, spk
-from .runtime import RuntimeSnapshot
+from .runtime import RuntimeResolveError, RuntimeSnapshot
 
 FORMAT_VERSION = "1"
 
@@ -219,7 +219,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
     if platform != "windows":
         raise BuildError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
 
-    snapshot = runtime.resolve(project_dir, platform)
+    snapshot = runtime.resolve(spec, platform)
     stem = runtime.dll_stem(snapshot.python_dll)
 
     stage = tempfile.mkdtemp(prefix="pkapp-build-")
@@ -331,7 +331,7 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     必须进 spk（APK 里只放与解释器版本绑定的件）。
     runtime_hash = libpythonbundle.so 的 sha256（标识所针对的运行时 bundle）。
     """
-    snapshot = runtime.resolve(project_dir, "android", abis=spec.android_abis)
+    snapshot = runtime.resolve(spec, "android", abis=spec.android_abis)
 
     stage = tempfile.mkdtemp(prefix="pkapp-build-android-")
     try:
@@ -354,9 +354,9 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         #   项目未注册 windows 快照时回退打包机解释器（pyc 版本标签可能与运行时不符）。
         pyc_exe = None
         try:
-            win = runtime.resolve(project_dir, "windows")
+            win = runtime.resolve(spec, "windows")
             pyc_exe = os.path.join(win.dir, "python.exe")
-        except RuntimeLockError:
+        except RuntimeResolveError:
             pass
         _compile_checked_hash(os.path.join(stage, "app"), pyc_exe, snapshot.python_dll)
         _compile_checked_hash(sp_dir, pyc_exe, snapshot.python_dll)
