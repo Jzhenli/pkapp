@@ -31,6 +31,7 @@ except KeyboardInterrupt:
 def build_dev_env(project_dir: str, spec: AppSpec, *, strict: bool,
                   port: int = DEV_PORT) -> tuple[dict[str, str], str | None]:
     """计算 MYAPP_* 环境注入表；返回 (env增量, strict 模式的握手码)。"""
+    project_dir = os.path.abspath(project_dir)   # MYAPP_* 路径必须绝对（_env._abs 校验）
     dev_dir = os.path.join(project_dir, ".dev")
     data_dir = os.path.join(dev_dir, "data")
     cache_dir = os.path.join(dev_dir, "cache")
