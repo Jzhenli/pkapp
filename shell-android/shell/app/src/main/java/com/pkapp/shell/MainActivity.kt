@@ -23,6 +23,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
 
 /** M2 Android 壳（SHELL_PROTOCOL §10.2 九步投影）：
@@ -38,6 +39,13 @@ class MainActivity : Activity() {
         private const val TICK_MS = 500L
         private const val BOOT_TIMEOUT_MS = 120_000L      // §5 冷启动独立档
         private const val HEARTBEAT_DEAD_MS = 30_000L     // §5 seq 判死窗口
+        private const val FREEZE_JUMP_MS = 10_000L        // 相邻拍间隔远超节拍 ⇒ 进程曾被冻结
+        // 进程级防重入：MagicOS 息屏会销毁 Activity 但保留进程（FGS 托底），解锁后在同进程
+        // 重建 Activity → 第二次 onCreate → 二次 engineBoot 对活解释器再初始化 → libpython
+        // SIGSEGV（实测 PyUnicode_New ← PyRun_SimpleString ← engineBoot，Magic6 Pro）。
+        @Volatile private var runtimeLive = false
+        private val bootGate = AtomicBoolean(false)       // 冷启引导锁：engineBoot 全程独占
+        private const val REATTACH_LIVENESS_MS = 15_000L  // re-attach 等 ready 复现上限（≈3×默认心跳）
         private const val PH_COLD = 0
         private const val PH_RUNTIME = 1
         private const val PH_DEAD = 2
@@ -56,6 +64,7 @@ class MainActivity : Activity() {
     private var bootStart = 0L
     private var lastSeq = -1L
     private var lastSeqChange = 0L
+    private var lastTickAt = -1L
     private var port = 0L
 
     private lateinit var dataDir: File
@@ -174,11 +183,26 @@ class MainActivity : Activity() {
     private fun boot() {
         try {
             slog("shell boot begin (platform=android, identity=$packageName)")
+            if (reattachIfLive()) return
+            // 冷启引导锁：同进程重建可能撞上仍在执行的首次 engineBoot——并发二次初始化
+            // 解释器是未定义行为（engine.c 无重入防护）。等首次引导出结果：成功转
+            // re-attach 复用，失败/超时则随其报错，绝不并发 engineBoot。
+            if (!bootGate.compareAndSet(false, true)) {
+                slog("boot in progress, wait for first boot to settle")
+                val deadline = SystemClock.uptimeMillis() + BOOT_TIMEOUT_MS
+                while (bootGate.get() && !runtimeLive && SystemClock.uptimeMillis() < deadline)
+                    Thread.sleep(200)
+                if (reattachIfLive()) return
+                val d = readDiagError()
+                main.post { showError("解释器初始化失败或超时（详见 diag.json）。$d", true) }
+                return
+            }
             // 步骤 3′（★v1.2★ 竞态修复）：等安装器铺完 nativeLibraryDir。pm install 返回
             // ≠ 原生库抽取完成——首启秒启时 _struct/_hashlib 可能尚未落盘，import applocal
             // 即崩（实测 Honor Magic6 复现，二次启动自愈）。PYTHONPATH 含该目录（见下），
             // 铺完即可导入，故启动前轮询三件套；15s 超时 fail-fast 而非挂起。
             if (!waitForNativeLibs()) {
+                bootGate.set(false)
                 slog("native libs not ready after 15s")
                 main.post { showError("原生库就绪超时（安装器未完成抽取）——请重装应用或重启设备后重试", true) }
                 return
@@ -218,17 +242,55 @@ class MainActivity : Activity() {
             lastSeqChange = bootStart
             val rc = engineBoot(pairs, mf.entry, logFile.absolutePath)
             if (rc != 0) {
+                bootGate.set(false)
                 val d = readDiagError()
                 main.post { showError(
                     if (rc == -2) "应用引导失败（详见 diag.json）。$d" else "解释器初始化失败。", true) }
                 return
             }
             booted = true
+            runtimeLive = true
             main.post { onBootOk() }
         } catch (e: Exception) {
+            bootGate.set(false)
             slog("boot exception: $e")
             main.post { showError("启动异常：${e.message}", true) }
         }
+    }
+
+    /** 同进程 Activity 重建的活运行时复用（防二次 engineBoot 崩溃）：跳过 engineBoot 与
+     *  ready/握手码预清理——那是活心跳的文件，删了就是存活假象。ready 在场即导航（零延迟）；
+     *  缺失则给一拍活性宽限（默认 5s 心跳 ≤7s 必复现），停滞快速报错而非等满 120s。
+     *  返回是否接管了本次引导。 */
+    private fun reattachIfLive(): Boolean {
+        if (!runtimeLive) return false
+        val base = readReady()
+        if (base != null && base.ready && base.port > 0) {
+            slog("re-attach: runtime live in this process, seq=${base.seq}")
+            attachLiveRuntime()
+            return true
+        }
+        slog("re-attach: runtime live but ready absent, wait for liveness")
+        val deadline = SystemClock.uptimeMillis() + REATTACH_LIVENESS_MS
+        while (SystemClock.uptimeMillis() < deadline) {
+            val ri = readReady()
+            if (ri != null && ri.ready && ri.port > 0) {
+                slog("re-attach: ready lit seq=${ri.seq}")
+                attachLiveRuntime()
+                return true
+            }
+            Thread.sleep(500)
+        }
+        val d = readDiagError()
+        main.post { showError("运行时已死（进程存活但 ready 未复现）。$d", true) }
+        return true
+    }
+
+    private fun attachLiveRuntime() {
+        booted = true
+        bootStart = SystemClock.uptimeMillis()
+        lastSeqChange = bootStart
+        main.post { onBootOk() }   // PH_COLD 首拍即见活 ready → navigate → PH_RUNTIME
     }
 
     private fun onBootOk() {
@@ -384,6 +446,21 @@ class MainActivity : Activity() {
         override fun run() {
             if (phase == PH_DEAD) return
             val now = SystemClock.uptimeMillis()
+            // 冻结跳跃检测：相邻两拍正常 ≈TICK_MS；间隔远超节拍 ⇒ 进程曾被整段冻结
+            //（息屏 MagicOS 冻结，uptimeMillis 照走）。心跳与壳同进程——冻结同样停住了
+            // 心跳，故把冻结时长从判死/启动窗口中剔除；否则解冻后首个积压 tick 会拿
+            // "整个冻结时长"当 30s 无响应误判死（onResume 重置晚于解冻首拍，锁屏
+            // >30s 必现假错误页）。真死不漏判：冻结中已死者解冻后仍按 30s 窗判死
+            //（至多延迟一个宽限窗）。
+            val gap = if (lastTickAt < 0) 0L else now - lastTickAt
+            lastTickAt = now
+            if (gap > FREEZE_JUMP_MS) {
+                slog("tick gap ${gap}ms > freeze threshold, shift grace windows")
+                bootStart += gap
+                // onResume 先于本拍时已把 lastSeqChange 提到 resume 时刻（resume-first
+                // 顺序），平移后钳到 now——防判死窗被推出未来而额外拖延真死判罚。
+                lastSeqChange = minOf(lastSeqChange + gap, now)
+            }
             val ri = readReady()
             if (phase == PH_COLD) {
                 if (ri != null && ri.ready && ri.port > 0) {

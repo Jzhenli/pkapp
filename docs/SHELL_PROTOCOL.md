@@ -205,9 +205,11 @@ dev：MYAPP_STRICT_AUTH=0 默认旁路（免打扰）；
      Py_NoSiteFlag=1 无 site 处理，缺它必报 "No module named 'app'"
 ② 扩展模块 W^X 形态：bundle modules/*.so 平铺进 jniLibs/<abi>（→ nativeLibraryDir，
    走系统 dlopen，绝不从可写目录加载）；_inject_native 仍做 RTLD_GLOBAL 预载
-③ 后台冻结（MagicOS 实测）：切后台约 1s 整进程冻结（FGS 不能免），心跳/线程暂停，
-   回前台立即恢复。壳必须 onResume 重置判死宽限窗——冻结期间 uptimeMillis 照走，
-   >30s 后台回前台首拍会误判死出假错误页
+③ 后台冻结（MagicOS 实测）：切后台/息屏约 1s 整进程冻结（FGS 不能免），心跳/线程暂停，
+   回前台立即恢复。冻结期间 uptimeMillis 照走 → 解冻后首个积压 tick 先于 onResume，
+   拿整个冻结时长当 30s 无响应误判死（锁屏 >30s 回来必现假错误页）。壳双重防护：
+   onResume 重置宽限窗 + tick 冻结跳跃检测（相邻拍间隔 >10s 视为冻结，剔除出判死/
+   启动窗口；真死时 tick 节拍正常，不受影响）
 ④ 握手镜像 ★v1.2★ 语义在 shouldOverrideUrlLoading：URL 带码→镜像入文件；无码→新随机码
 ```
 ### 10.3 Linux（部署目录 + 符号链接）

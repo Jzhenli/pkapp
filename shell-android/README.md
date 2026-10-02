@@ -127,10 +127,11 @@ adb shell run-as com.pkapp.shell sh -c "printf %s <64位hex> > files/cache/hands
 
 ## 实测注记（真机踩坑沉淀，Magic6 Pro / MagicOS）
 
-- **后台冻结**：切后台约 1s 整进程被冻结（FGS 不能免），心跳/线程全部暂停，回前台立即恢复。壳已 onResume 重置判死宽限窗——否则 >30s 后台回前台首拍会误判死出假错误页（uptimeMillis 冻结期间照走）。
+- **后台冻结**：切后台/息屏约 1s 整进程被冻结（FGS 不能免），心跳/线程全部暂停，回前台立即恢复。冻结期间 uptimeMillis 照走——解冻后首个积压 tick（500ms 节拍、冻结期间早已到期）会**先于 onResume 执行**，`now-lastSeqChange`＝整个冻结时长 ≫30s → 误判死出假错误页（★锁屏 >30s 回来必现，单靠 onResume 重置救不了这个竞态★）。壳双重防护：① onResume 重置宽限窗（先到时生效）；② tick 内冻结跳跃检测——相邻拍间隔 >10s 视为进程被冻结过，把跳跃时长从 lastSeqChange/bootStart 中剔除。不掩盖真死：真死时 tick 节拍正常，gap 逐拍爬过 30s，重置后 30s 仍判死。
 - **sys.path 两条隐性契约**：① `import applocal` 自身的 import 链（urllib→base64→struct）在 bootstrap 前就需要 `_struct` 等扩展模块 → nativeLibraryDir 必须进 PYTHONPATH（_inject_native 在 bootstrap 内来不及）；② Windows 的 `import app.main` 靠 _pth `import site` 行的 site.getsitepackages() 把 sys.prefix 隐性入 path，Android `Py_NoSiteFlag=1` 无此福利 → runtime 根必须显式在列。
 - **资产增量陷阱**：Copy-Item 保留源文件 mtime，构建后拷入的 assets 可能被增量 mergeDebugAssets 漏掉——每次拷 spk 后用 `aapt list ... | findstr assets` 验证在包。
 - **adb 语义**：PC→设备端口是 `adb forward`（reverse 方向相反）；mdns 会自动注册一个 `<serial>._adb-tls-connect._tcp` 设备项，手动 connect 后 devices 列表会双条目 → 先 disconnect。
+- **同进程 Activity 重建（★二次 boot 崩溃坑★）**：MagicOS 息屏会销毁 Activity 但保留进程（FGS 托底），解锁后同进程重建 Activity → 第二次 `onCreate` → 二次 `engineBoot` 对活解释器再初始化 → libpython SIGSEGV（实测 `PyUnicode_New ← PyRun_SimpleString ← engineBoot`，Magic6 Pro，崩溃后整进程重启）。壳以 companion `runtimeLive` 防重入：活进程重建直接走 re-attach（跳过 engineBoot 与 ready/握手码预清理——那是活心跳的文件），复用既有 uvicorn 重挂 WebView 进轮询，ready seq 连续不归零。验证手法：`wm size` 改分辨率强制同进程重建（与系统销毁重建同一 onCreate 路径）。
 - **/auth 码用后作废**：页面加载完成后 handshake 文件被 applocal 消费删除属正确行为；curl 复验需先补写新码。
 
 ## 文档映射
