@@ -1093,7 +1093,16 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
     script[sizeof(script) - 1] = 0;
     slog("applocal bootstrap begin");
     if (pRun(script) != 0) {
-        /* applocal 已写 detail diag；壳补 stage 级记录 */
+        /* applocal 已写 detail diag；diag_write 是覆盖写（★v1.2★）：先用迷你解析器读出
+           applocal 明细（如"固定端口被占"）作为错误页摘要，避免明细被 stage 级通用文案抹掉 */
+        {
+            char sub[1024];
+            diag_read_summary(sub, sizeof(sub));
+            if (sub[0]) {
+                diag_write("bootstrap", sub, "", TRUE);
+                return -1;
+            }
+        }
         _snprintf(err, cap - 1, "applocal.bootstrap 异常退出（详见 diag.json）");
         err[cap - 1] = 0;
         diag_write("bootstrap", err, "", TRUE);
@@ -1487,7 +1496,8 @@ static int run_shell(void) {
         SetEnvironmentVariableW(L"MYAPP_READY_FILE", g_ready.c_str());
         SetEnvironmentVariableW(L"MYAPP_DIAG_FILE", g_diag.c_str());
         SetEnvironmentVariableW(L"MYAPP_STATIC_DIR", join_path(g_runtime, L"dist").c_str());
-        SetEnvironmentVariableW(L"MYAPP_PORT", L"0");
+        /* MYAPP_PORT 不注入（★v1.2★）：端口偏好走 manifest network_port（打包期 [network].port）；
+           父进程 env 里的 MYAPP_PORT = 运维显式覆盖层，保留继承。 */
         SetEnvironmentVariableW(L"MYAPP_VERSION", utf8_to_wide(doc.app_version).c_str());
         SetEnvironmentVariableW(L"MYAPP_MANIFEST_PATH",
                                 join_path(g_runtime, L"manifest").c_str());

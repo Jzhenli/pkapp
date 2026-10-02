@@ -2,6 +2,7 @@
 
 ★v8.4★ 命令面定稿：平台一律作位置参数（`pkapp build android`）；package 取代
 ship 成为统一终产物命令（windows→zip / android→apk / linux→tar.gz，M3 预留）。
+★v1.2★ 裁定：打包工具不做用户管理（认证门内置初始 admin/123456，用户管理归应用后端）。
 """
 from __future__ import annotations
 

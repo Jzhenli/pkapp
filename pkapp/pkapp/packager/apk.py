@@ -27,11 +27,25 @@ class ApkError(RuntimeError):
 
 def build_apk(project: str, app_name: str, spk_path: str, *,
               shell_dir: str | None = None, out_dir: str | None = None,
-              variant: str = "debug") -> str:
+              variant: str = "debug", app_id: str = "",
+              keystore: str = "", keystore_pass: str = "",
+              keystore_alias: str = "pkapp") -> str:
     """spk → 壳 assets → gradle → <project>/release/<app_name>.apk。
 
+    app_id = [platforms.android].package（必填；经 -PpkappAppId 注入 gradle
+    applicationId，★v1.2★ 解决多应用同机共存——固定 com.pkapp.shell 会互相顶替）。
+    keystore 链（★v1.2★）：keystore = PKAPP_KEYSTORE env > TOML [platforms.android].keystore
+    （路径非机密可进 TOML；密码/别名只走 env，永不入 AppSpec）——非空时 gradle 注入
+    -PpkappKs/-PpkappKsPass/-PpkappKsAlias，release 变体即产出已签名 APK。
     返回 APK 路径；任何一步失败抛 ApkError（gradle 输出尾部随异常给出）。
     """
+    if not app_id:
+        raise ApkError("[platforms.android].package 必填（applicationId，反向域名，"
+                       "如 com.example.hiapp）——固定共享 applicationId 会让同机"
+                       "多应用互相覆盖安装")
+    if keystore and not keystore_pass:
+        raise ApkError("提供 keystore 时必须同时提供密码"
+                       "（env PKAPP_KEYSTORE_PASS；密码永不写入 AppSpec）")
     shell = shell_dir or os.environ.get("PKAPP_SHELL_DIR") or DEFAULT_SHELL_DIR
     assets = os.path.join(shell, "app", "src", "main", "assets")
     gradle_py = os.path.join(shell, "build.gradle.kts")
@@ -47,11 +61,18 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
         f.write(spk_bytes)
     os.utime(assets, None)
 
-    _run_gradle(shell, variant)
+    _run_gradle(shell, variant, app_id, app_name,
+                keystore if keystore else None,
+                keystore_pass if keystore else "",
+                keystore_alias if keystore else "")
 
     apk_src = os.path.join(shell, "app", "build", "outputs", "apk", variant,
                            f"app-{variant}.apk")
     if not os.path.isfile(apk_src):
+        unsigned = os.path.join(shell, "app", "build", "outputs", "apk", variant,
+                                f"app-{variant}-unsigned.apk")
+        if os.path.isfile(unsigned):
+            raise ApkError(f"检测到未签名产物 {unsigned}——keystore 未注入 gradle？")
         raise ApkError(f"gradle 未产出 {apk_src}")
     _verify_asset_in_apk(apk_src, spk_bytes)
 
@@ -62,8 +83,13 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     return dest
 
 
-def _run_gradle(shell: str, variant: str) -> None:
-    """转发 gradle assemble<Variant>；工具链路径 = env > 默认 toolchain 布局。"""
+def _run_gradle(shell: str, variant: str, app_id: str, label: str,
+                keystore: str | None = None, keystore_pass: str = "",
+                keystore_alias: str = "") -> None:
+    """转发 gradle assemble<Variant>；-PpkappAppId/-PpkappLabel 注入 applicationId/
+    应用显示名（★v1.2★）；keystore 非空时经 ORG_GRADLE_PROJECT_pkappKs/Pass/Alias
+    环境变量注入（gradle 映射为同名 project property，findProperty 原样可读）——
+    密码不进命令行，防同机进程列表（WMI/任务管理器）泄露；工具链路径 = env > 默认 toolchain 布局。"""
     import subprocess
 
     tc = os.environ.get("PKAPP_ANDROID_TOOLCHAIN") or DEFAULT_TOOLCHAIN
@@ -75,7 +101,13 @@ def _run_gradle(shell: str, variant: str) -> None:
                           "gradle.bat" if os.name == "nt" else "gradle")
     if not os.path.isfile(gradle):
         raise ApkError(f"gradle 不存在: {gradle}（设 PKAPP_ANDROID_TOOLCHAIN 或 PATH）")
+    if keystore:
+        env["ORG_GRADLE_PROJECT_pkappKs"] = keystore
+        env["ORG_GRADLE_PROJECT_pkappKsPass"] = keystore_pass
+        env["ORG_GRADLE_PROJECT_pkappKsAlias"] = keystore_alias
     r = subprocess.run([gradle, "--no-daemon", "-p", shell,
+                        f"-PpkappAppId={app_id}",
+                        f"-PpkappLabel={label}",
                         f"assemble{variant.capitalize()}"],
                        env=env, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=900)

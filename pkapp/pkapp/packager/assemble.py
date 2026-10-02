@@ -276,7 +276,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
 
 def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
                      applocal_version: str, app_dir: str, dist_dir: str) -> dict:
-    return {
+    fields = {
         "format_version": FORMAT_VERSION,
         "app_version": spec.version,
         "min_app_version": spec.min_app_version,
@@ -287,6 +287,8 @@ def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
         "app_hash": f"sha256:{tree_hash(app_dir)}",
         "dist_hash": f"sha256:{tree_hash(dist_dir)}",
     }
+    fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
+    return fields
 
 
 def _emit_spk(stage: str, fields: dict, out_path: str,

@@ -36,7 +36,7 @@
 | `MYAPP_READY_FILE` | ready 文件绝对路径 | `…\cache\ready` | 见 §5 |
 | `MYAPP_DIAG_FILE` | diag 文件绝对路径 | `…\cache\diag.json` | 见 §9 |
 | `MYAPP_STATIC_DIR` | Vue 产物目录（dist） | `…\runtime\dist\` | **恒存在** |
-| `MYAPP_PORT` | **端口偏好**，非最终值 | `8765` 或 `0`（＝自选） | **optional**，缺省 `0`＝自选。⚠ 壳**禁止**假设实际端口＝此值（实际端口以 ready 为准） |
+| `MYAPP_PORT` | **端口偏好**，非最终值 | `8765` 或 `0`（＝自选） | **optional**，缺省 `0`＝自选。⚠ 壳**禁止**假设实际端口＝此值（实际端口以 ready 为准）。★v1.2★ 壳**不再注入**（原注入 `0` 会压过 manifest `network_port`）：打包端口经 manifest，父进程 env `MYAPP_PORT` = 运维覆盖层 |
 | `MYAPP_VERSION` | 版本号 | `1.4.2` / dev 下 `0.0.0-dev` | |
 | `MYAPP_MANIFEST_PATH` | 展开区 manifest 路径 | `…\runtime\manifest` | applocal 只读；**禁止用其做安全决策**（信任源是壳的验签） |
 | `MYAPP_TOKEN` | 每次启动重新生成的 bearer token | 32 字节随机 | **optional**（dev 非严格旁路可缺省；embedded／strict 下必须）。禁止进 URL / 日志 |
@@ -242,7 +242,7 @@ L2：接受 hang 不可检测（显式取舍，登记）
 ---
 ## 12. 测试形态
 ### 12.1 契约测试（env 模拟，无真机）
-applocal 侧注入不同 `MYAPP_*` 组合，断言：路径解析、**缺失必填变量即抛出 ContractError**（optional 变量按缺省值解析，★v1.1★）、`dev` 与 `embedded` 同一契约、ready schema 字段齐全与 seq 单调递增、端口偏好被占时回落 OS 分配且**实际端口写回 ready**（★v1.1 措辞修正★）。
+applocal 侧注入不同 `MYAPP_*` 组合，断言：路径解析、**缺失必填变量即抛出 ContractError**（optional 变量按缺省值解析，★v1.1★）、`dev` 与 `embedded` 同一契约、ready schema 字段齐全与 seq 单调递增、端口偏好被占时回落 OS 分配且**实际端口写回 ready**（★v1.1 措辞修正★；★v1.2★ 收窄：仅 `port = 0` 缺省态回落——env/manifest **显式配置**端口被占即 bootstrap fail-fast，见 NETWORK_AUTH_DESIGN §5）。
 ### 12.2 三壳一致性测试（同一份断言跑三个壳）
 ```
 ① 九个步骤齐全且顺序正确（含互斥与 ③′ 记账时机）

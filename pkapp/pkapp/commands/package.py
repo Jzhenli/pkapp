@@ -166,13 +166,25 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
         print(f"[package] 未找到 spk: {spk}（先 pkapp build android）")
         return 2
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
+    # keystore 链（★v1.2★）：PKAPP_KEYSTORE env > TOML [platforms.android].keystore
+    #（相对项目根）；密码/别名只走 env（PKAPP_KEYSTORE_PASS / _ALIAS），永不入 AppSpec
+    keystore = os.environ.get("PKAPP_KEYSTORE") or ""
+    if not keystore and spec.android_keystore:
+        keystore = os.path.normpath(os.path.join(
+            os.path.abspath(project), spec.android_keystore))
+    keystore_pass = os.environ.get("PKAPP_KEYSTORE_PASS") or ""
+    keystore_alias = os.environ.get("PKAPP_KEYSTORE_ALIAS") or "pkapp"
     try:
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
-                             out_dir=out_dir, variant=variant)
+                             out_dir=out_dir, variant=variant,
+                             app_id=spec.android_package,
+                             keystore=keystore, keystore_pass=keystore_pass,
+                             keystore_alias=keystore_alias)
     except ApkError as e:
         print(f"[package] APK 组装失败: {e}")
         return 1
     print(f"[package] {apk_path}  ({os.path.getsize(apk_path):,} B)")
-    print(f"[package] 变体={variant}（release 需壳工程 keystore，登记后续项）；"
+    print(f"[package] 变体={variant}"
+          f"{'（已用 keystore 签名）' if keystore else '（debug 自动签名；release 需 keystore：TOML [platforms.android].keystore + env PKAPP_KEYSTORE_PASS）'}；"
           "android 壳不做 spk 验签——APK 签名承担（协议 §10.2）")
     return 0

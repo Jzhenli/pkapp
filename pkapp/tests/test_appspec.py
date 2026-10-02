@@ -70,3 +70,60 @@ def test_platform_dep_bad_format(tmp_path):
     })
     with pytest.raises(SpecError, match="依赖声明格式非法"):
         load(os.path.join(root, "pkapp.toml"))
+
+
+def test_network_port_config(tmp_path):
+    """[network].port：解析 + manifest 透传（★v1.2★ 固定端口）。"""
+    root = _make(tmp_path, "n7", **{
+        '[dist]': '[network]\nlan = true\nport = 48765\n[dist]',
+    })
+    net = load(os.path.join(root, "pkapp.toml")).network
+    assert net.lan and net.port == 48765
+    assert net.manifest_keys()["network_port"] == "48765"
+
+
+def test_network_port_zero_omits_manifest_key(tmp_path):
+    root = _make(tmp_path, "n8", **{
+        '[dist]': '[network]\nlan = true\n[dist]',
+    })
+    net = load(os.path.join(root, "pkapp.toml")).network
+    assert net.port == 0 and "network_port" not in net.manifest_keys()
+
+
+def test_network_port_out_of_range(tmp_path):
+    """<1024 特权端口跨平台不可用 → 校验报错。"""
+    root = _make(tmp_path, "n9", **{
+        '[dist]': '[network]\nlan = true\nport = 80\n[dist]',
+    })
+    with pytest.raises(SpecError, match=r"1024–65535"):
+        load(os.path.join(root, "pkapp.toml"))
+
+
+def test_network_port_bad_int(tmp_path):
+    root = _make(tmp_path, "n10", **{
+        '[dist]': '[network]\nlan = true\nport = "eighty"\n[dist]',
+    })
+    with pytest.raises(SpecError, match="port 必须是整数"):
+        load(os.path.join(root, "pkapp.toml"))
+
+
+def test_android_package_parse_and_format(tmp_path):
+    """[platforms.android].package：解析 + 反向域名格式校验（★v1.2★ applicationId 注入）。"""
+    root = _make(tmp_path, "n11", **{
+        '[dist]': '[platforms.android]\npackage = "com.example.myapp"\n[dist]',
+    })
+    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.myapp"
+    root2 = _make(tmp_path, "n12", **{
+        '[dist]': '[platforms.android]\npackage = "bad..id"\n[dist]',
+    })
+    with pytest.raises(SpecError, match="反向域名"):
+        load(os.path.join(root2, "pkapp.toml"))
+
+
+def test_android_keystore_parse(tmp_path):
+    """[platforms.android].keystore：路径透传（非机密;密码走 env,永不入 AppSpec）。"""
+    root = _make(tmp_path, "n13", **{
+        '[dist]': '[platforms.android]\nkeystore = "signing/release.keystore"\n[dist]',
+    })
+    assert load(os.path.join(root, "pkapp.toml")).android_keystore == \
+        "signing/release.keystore"

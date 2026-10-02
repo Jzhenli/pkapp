@@ -37,8 +37,9 @@ dir = "dist"                   # 前端产物目录（恒存在；空缺时 buil
 # icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
 # [platforms.linux]                    # M2 预留；dependencies 同样追加
 # setproctitle = true
-# [platforms.android]                  # M3 预留；package/abis 字段
+# [platforms.android]                  # M2：package = applicationId（★v1.2★ 必填，同机多应用共存）
 # package = "com.example.helloworld"
+# keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
 # abis = ["arm64-v8a"]
 """
 

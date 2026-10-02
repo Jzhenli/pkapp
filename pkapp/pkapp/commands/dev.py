@@ -2,7 +2,8 @@
 
 dev 契约：platform=宿主平台、data/cache/static=项目 .dev/（static 用项目 dist）、
 port=8765、version=0.0.0-dev、manifest={}（空文件，非缺失）。
---strict-auth：注入 token + 生产同款中间件 + 一次性握手码（暴露"忘带 X-MYAPP-Token"的 401 bug）。
+--strict-auth：embedded 模式静态 token 链（暴露"忘带 X-MYAPP-Token"的 401 bug）；
+仅无 [network] 的项目可走（有 [network] 时 dev 直接起 lan 门 Cookie 会话，不经此路径）。
 子进程内 applocal.bootstrap(entry)——dev 与 embedded 同一契约（协议 A §12.1）。
 """
 from __future__ import annotations
@@ -47,6 +48,7 @@ def build_dev_env(project_dir: str, spec: AppSpec, *, strict: bool,
         "MYAPP_MANIFEST_PATH": manifest_path,   # {} 非缺失：写空文件
         "MYAPP_VERSION": "0.0.0-dev",
         "MYAPP_PORT": str(port),
+        "MYAPP_DEV": "1",                       # dev 权限覆盖报告（§9.3）等 dev 专属行为的开关
     }
     handshake_code = None
     if strict:
@@ -73,11 +75,15 @@ def cmd_dev(project: str, *, strict_auth: bool = False, port: int = DEV_PORT,
         return 2
 
     env, handshake_code = build_dev_env(project, spec, strict=strict_auth, port=port)
-    # manifest={}（非缺失）+ 目录自愈
+    # manifest：默认空文件（dev 契约 {} 非缺失）；[network] 配置 → network_* 键透传（§5）
     os.makedirs(env["MYAPP_DATA_DIR"], exist_ok=True)
     os.makedirs(env["MYAPP_CACHE_DIR"], exist_ok=True)
     os.makedirs(env["MYAPP_STATIC_DIR"], exist_ok=True)
-    if not os.path.exists(env["MYAPP_MANIFEST_PATH"]):
+    net_keys = spec.network.manifest_keys()
+    if net_keys:
+        atomic_write(env["MYAPP_MANIFEST_PATH"],
+                     ("\n".join(f"{k} = {v}" for k, v in net_keys.items()) + "\n").encode())
+    elif not os.path.exists(env["MYAPP_MANIFEST_PATH"]):
         atomic_write(env["MYAPP_MANIFEST_PATH"], b"")
 
     py = python or _venv_python(project)

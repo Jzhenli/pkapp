@@ -9,6 +9,14 @@
 
 事实源：docs/SHELL_PROTOCOL.md（协议 A）。
 """
+import os as _os
+
+if _os.environ.get("MYAPP_NATIVE_LIB_DIR"):
+    # ★v1.2★ Android W^X：finder 必须在 `from ._core import` 之前注册——
+    # _core → urllib → base64 → struct → _struct 的导入链先于 bootstrap() 触发
+    from ._ndk import register as _ndk_register
+    _ndk_register(_os.environ["MYAPP_NATIVE_LIB_DIR"])
+
 from ._core import (bootstrap, build_asgi_app, diag, migrate, on_background,
                     pick_port, read_diag, set_process_title, start_heartbeat,
                     write_ready)

@@ -26,6 +26,42 @@ class SpecError(ValueError):
 
 
 @dataclass(frozen=True)
+class NetworkSpec:
+    """[network] 段（NETWORK_AUTH_DESIGN.md ★v1.1★ §5）。
+
+    lan=false 视同未配置（总开关语义，§5）；lan=true 时经 manifest network_* 扩展键
+    透传（Ed25519 签名覆盖正文；壳 C 解析器按未知键忽略，三平台壳零改动）。
+    """
+    present: bool = False
+    lan: bool = False
+    bind: str = ""                    # 空 = applocal 缺省（lan 开启 → 0.0.0.0，§12）
+    port: int = 0                     # 0 = OS 自选；1024–65535 = 固定端口（被占 fail-fast）
+    auth: tuple = ("login",)          # login/provision/none 可多选；none 独占
+    local_auth: bool = True           # 本机壳是否强制登录（§5：lan 开启缺省 true）
+    session_days: int = 7
+    local_roles: tuple = ("*",)       # 缺省全权限（§7）；显式 [] 视为校验错误（歧义禁配）
+    provision_roles: tuple = ("*",)   # 预留配置位（§15#3：P0 全权限）
+
+    def manifest_keys(self) -> dict:
+        """lan 开启时产出 manifest 扩展键；未开启返回 {}（逐位现状，零回归红线）。"""
+        if not (self.present and self.lan):
+            return {}
+        out = {"network_lan": "1",
+               "network_auth": ",".join(self.auth),
+               "network_local_auth": "1" if self.local_auth else "0",
+               "network_session_days": str(self.session_days)}
+        if self.bind:
+            out["network_bind"] = self.bind
+        if self.port:
+            out["network_port"] = str(self.port)
+        if self.local_roles and self.local_roles != ("*",):
+            out["network_local_roles"] = ",".join(self.local_roles)
+        if self.provision_roles and self.provision_roles != ("*",):
+            out["network_provision_roles"] = ",".join(self.provision_roles)
+        return out
+
+
+@dataclass(frozen=True)
 class AppSpec:
     name: str
     version: str
@@ -42,8 +78,10 @@ class AppSpec:
     linux_setproctitle: bool = True      # B.y：Linux 目标默认装入 setproctitle 探测项
     android_package: str = ""
     android_abis: tuple[str, ...] = ("arm64-v8a",)
+    android_keystore: str = ""           # [platforms.android].keystore（路径,非机密;密码走 PKAPP_KEYSTORE_PASS env）
     platform_deps: dict = field(default_factory=dict)   # [platforms.*].dependencies（追加式，不含公共）
     platform_icon: str = ""              # [platforms.windows].icon → ship 图标默认值
+    network: NetworkSpec = field(default_factory=NetworkSpec)  # [network] 段（§5）
     raw: dict = field(default_factory=dict, repr=False, compare=False)
 
     def deps_for(self, platform: str) -> tuple[str, ...]:
@@ -89,6 +127,26 @@ def validate(spec: AppSpec) -> list[str]:
     for dep in spec.all_platform_deps():
         if not re.match(r"^[A-Za-z0-9_.\-]+(\[[^\]]*\])?\s*([<>=!~].*)?$", dep):
             problems.append(f"依赖声明格式非法: {dep!r}")
+    if spec.android_package and not re.match(
+            r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$",
+            spec.android_package):
+        problems.append(f"[platforms.android].package 须为反向域名"
+                        f"（如 com.example.hiapp）: {spec.android_package!r}")
+    net = spec.network
+    if net.present:
+        bad = [m for m in net.auth if m not in ("login", "provision", "none")]
+        if bad:
+            problems.append(f"[network].auth 非法模式: {bad}（允许 login/provision/none）")
+        if "none" in net.auth and len(net.auth) > 1:
+            problems.append("[network].auth: none 不可与其他模式共存（显式裸奔即独占）")
+        if net.session_days < 1:
+            problems.append("[network].session_days 必须 >= 1")
+        if net.port != 0 and not (1024 <= net.port <= 65535):
+            problems.append("[network].port 须为 0（OS 自选）或 1024–65535"
+                            "（<1024 特权端口跨平台不可用）")
+        if net.local_roles == () or net.provision_roles == ():
+            problems.append("[network].local_roles/provision_roles 不可为空列表"
+                            "（缺省全权限 = 不配置；显式限定请列出角色）")
     return problems
 
 
@@ -110,10 +168,44 @@ def load(path: str) -> AppSpec:
     windows = plat.get("windows") or {}
     heart = data.get("heartbeat") or {}
     dist = data.get("dist") or {}
+    net_toml = data.get("network") or {}
 
     # 平台段白名单：未知段名报错（拼写错误静默丢弃 = 依赖悄悄漏装，B.w 校验兜住）
     known = ("windows", "android", "linux")
     unknown = sorted(set(plat) - set(known))
+
+    def _str_list(v) -> list:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v.strip()] if v.strip() else []
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    # [network] 段（§5）：未知键报错（同平台段白名单精神，防拼写静默丢配置）
+    net_unknown = sorted(set(net_toml) - {"lan", "bind", "port", "auth", "local_auth",
+                                          "session_days", "local_roles", "provision_roles"})
+    lr, pr = net_toml.get("local_roles"), net_toml.get("provision_roles")
+    try:
+        session_days = int(net_toml.get("session_days", 7))
+    except (TypeError, ValueError) as e:
+        raise SpecError(f"[network].session_days 必须是整数: "
+                        f"{net_toml.get('session_days')!r}") from e
+    try:
+        port = int(net_toml.get("port", 0))
+    except (TypeError, ValueError) as e:
+        raise SpecError(f"[network].port 必须是整数: "
+                        f"{net_toml.get('port')!r}") from e
+    network = NetworkSpec(
+        present=True,
+        lan=bool(net_toml.get("lan", False)),
+        bind=str(net_toml.get("bind", "")),
+        port=port,
+        auth=tuple(_str_list(net_toml.get("auth", "login"))) or ("login",),
+        local_auth=bool(net_toml.get("local_auth", True)),
+        session_days=session_days,
+        local_roles=("*",) if lr is None else tuple(_str_list(lr)),
+        provision_roles=("*",) if pr is None else tuple(_str_list(pr)),
+    )
 
     platform_deps = {p: tuple(str(d) for d in (plat.get(p) or {}).get("dependencies", ()))
                      for p in known}
@@ -134,13 +226,17 @@ def load(path: str) -> AppSpec:
         linux_setproctitle=bool(linux.get("setproctitle", True)),
         android_package=str(android.get("package", "")),
         android_abis=tuple(android.get("abis", ("arm64-v8a",))),
+        android_keystore=str(android.get("keystore", "")),
         platform_deps=platform_deps,
         platform_icon=str(windows.get("icon", "")),
+        network=network,
         raw=data,
     )
     problems = validate(spec)
     for p in unknown:
         problems.append(f"[platforms.{p}] 未知平台段（目标仅 {', '.join(known)}；检查拼写）")
+    for p in net_unknown:
+        problems.append(f"[network].{p} 未知配置键（检查拼写）")
     if problems:
         raise SpecError("AppSpec 校验失败:\n  " + "\n  ".join(problems))
     return spec

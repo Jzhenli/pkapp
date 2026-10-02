@@ -108,21 +108,36 @@ def _clear_healthz_diag(cfg: Cfg) -> None:
 
 
 # ---------------------------------------------------------------- 端口
-def _bind_socket(pref: int = 0):
-    """绑定 127.0.0.1 并**持有** socket（pref 被占 → 让 OS 分配）；调用方负责 close。
+def _bind_socket(pref: int = 0, host: str = "127.0.0.1", *, strict: bool = False):
+    """绑定并**持有** socket；调用方负责 close。
 
-    与 pick_port 的区别：返回的 socket 不关闭，可直接交给 uvicorn，消除"探测关闭后再 bind"的
-    TOCTOU 窗口（§12.1）。注意：不设 SO_REUSEADDR——Windows 上它会允许他进程抢占同一端口。
+    strict=True 且 pref 被占 → ContractError（固定端口 = 硬要求：防火墙/反代/客户端
+    钉死了端口，静默漂移比启动失败危害大，§5）；strict=False 保持 v1.1 契约
+    （偏好被占 → 让 OS 分配，实际端口写 ready）。
+
+    与 pick_port 的区别：返回的 socket 不关闭，可直接交给 uvicorn，消除"探测关闭后再
+    bind"的 TOCTOU 窗口（§12.1）。SO_REUSEADDR 仅 POSIX 设置：上一实例的 loopback
+    连接死后残留 TIME_WAIT（≤60s），期间重绑同端口会 EADDRINUSE（实测安卓覆盖安装/
+    快速重启必现）；它只豁免 TIME_WAIT，不改变对**活**监听者的互斥。Windows 不设——
+    其语义会允许他进程抢占同一端口，维持排他（fail-fast 语义两平台一致，§5）。
+    lan 模式传 host="0.0.0.0"（NETWORK_AUTH_DESIGN §12）。
     """
     import socket
     s = socket.socket()
+    if hasattr(socket, "SO_REUSEADDR") and sys.platform != "win32":
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        s.bind(("127.0.0.1", pref))      # pref=0 → OS 自选端口
+        s.bind((host, pref))             # pref=0 → OS 自选端口
         return s
-    except OSError:
+    except OSError as e:
         s.close()
+        if strict and pref:
+            raise ContractError(f"configured port {pref} on {host} is occupied"
+                                "（固定端口被占：换端口或释放后重试）") from e
     s = socket.socket()
-    s.bind(("127.0.0.1", 0))             # 偏好被占 → 回退自选
+    if hasattr(socket, "SO_REUSEADDR") and sys.platform != "win32":
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, 0))                    # 偏好被占 → 回退自选（非 strict）
     return s
 
 
@@ -184,9 +199,23 @@ def _read_static(path: str) -> bytes | None:
         return None
 
 
-def build_asgi_app(user_app, cfg: Cfg | None = None):
-    """组装最终 ASGI：/healthz 豁免 → /auth 握手 → 静态豁免（含 SPA 兜底）→ token 中间件 → 用户 app。"""
+def build_asgi_app(user_app, cfg: Cfg | None = None, *,
+                   roles_table: dict | None = None, route_perms: list | None = None):
+    """组装最终 ASGI（§14 链序，NETWORK_AUTH_DESIGN ★v1.1★）。
+
+    lan 模式（[network] 段）：/healthz → 认证门（会话三入口 → 静态门后 → rbac）→ 用户应用；
+    非 lan 模式保持原链序逐位不变（个人桌面零回归红线）。
+    roles_table / route_perms：应用入口模块的 ROLES / ROUTE_PERMS（bootstrap 自动拾取；
+    FastAPI 姿势 A 应用可不声明 route_perms——授权走应用内 require 依赖）。
+    """
     cfg = cfg or _env.load_env()
+    if cfg.network.enabled:
+        if not cfg.network.local_auth and not cfg.paths.handshake_file:
+            # local_auth=false 依赖壳握手换会话；无握手文件则壳永远进不了门（同 §5.1 strict 逻辑）
+            raise ContractError("lan + local_auth=false requires MYAPP_HANDSHAKE_FILE")
+        from ._gate import build_lan_app     # 惰性导入：避免 _core ⇄ _gate 模块环
+        return build_lan_app(user_app, cfg, roles_table=roles_table,
+                             route_perms=route_perms)
     rt, static = cfg.runtime, cfg.paths.static_dir
     if rt.strict_auth and not cfg.token:  # 空 token 会使比较恒真（实证）→ strict 下必须显式拒绝
         raise ContractError("strict_auth requires a non-empty MYAPP_TOKEN")
@@ -425,18 +454,15 @@ def set_process_title(name: str = "myapp") -> bool:
 
 
 def _inject_native(lib_dir: str | None) -> None:
-    """Android so 注入（§4.2 步骤 2 简版）：RTLD_GLOBAL 预载 + sys.path 前插；
-    完整 meta-path finder 以 serious_python 蓝本在 M2 落地。"""
-    if not lib_dir or not os.path.isdir(lib_dir):
-        return
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
-    import ctypes
-    for so in sorted(glob.glob(os.path.join(lib_dir, "*.so"))):
-        try:
-            ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-        except OSError:
-            pass
+    """Android so 注入（§4.2 步骤 2）——实现与 finder 在 _ndk。
+
+    ★v1.2★ 注册点已前移到 __init__（`import applocal` 自身即触发扩展导入链：
+    _core → urllib → base64 → struct → _struct，先于 bootstrap()）；此处保留
+    幂等再注册（bootstrap 步骤 2 语义不变，重复调用无害）。
+    """
+    if lib_dir:
+        from ._ndk import register
+        register(lib_dir)
 
 
 # ---------------------------------------------------------------- bootstrap
@@ -454,15 +480,24 @@ def bootstrap(entry: str = "app.main:app") -> int:
     diag("bootstrap", f"starting version={rt.version} platform={rt.platform}")
     try:
         mod_name, _, attr = entry.partition(":")
-        user_app = getattr(importlib.import_module(mod_name), attr or "app")
+        mod = importlib.import_module(mod_name)
+        user_app = getattr(mod, attr or "app")
+        roles_table = getattr(mod, "ROLES", None) or {}          # 姿势 B 约定（§9.2）：
+        route_perms = getattr(mod, "ROUTE_PERMS", None) or []    # 缺省 = 应用自管授权
     except Exception as e:                         # import 失败 → diag → 向壳上抛（非零退出）
         diag("bootstrap", f"import {entry} failed: {e}",
              detail=traceback.format_exc(), recoverable=True)
         raise
-    sock = _bind_socket(rt.port_pref)              # 步骤 3′：先绑定并持有，消除 bind 前的 TOCTOU 窗口
+    try:
+        sock = _bind_socket(rt.port_pref, cfg.network.bind,    # 步骤 3′：先绑定并持有，消除 bind 前的
+                            strict=rt.port_pref != 0)          # TOCTOU 窗口；配置了端口即硬要求（§5）
+    except ContractError as e:                     # 固定端口被占 → diag → 向壳上抛（错误页有因可查）
+        diag("bootstrap", str(e), recoverable=True)
+        raise
     port = sock.getsockname()[1]
     try:
-        asgi_app = build_asgi_app(user_app, cfg)
+        asgi_app = build_asgi_app(user_app, cfg, roles_table=roles_table,
+                                  route_perms=route_perms)
         try:
             import uvicorn                         # 惰性：由用户应用自带，applocal 零强制依赖
         except Exception as e:                     # 缺依赖 → diag → 向壳上抛（否则错误页无因可查）
@@ -473,7 +508,7 @@ def bootstrap(entry: str = "app.main:app") -> int:
         sock.close()                               # 起不来就别占着端口
         raise
     server = uvicorn.Server(uvicorn.Config(
-        asgi_app, host="127.0.0.1", port=port, access_log=False, log_config=None))
+        asgi_app, host=cfg.network.bind, port=port, access_log=False, log_config=None))
     threading.Thread(target=_run_server, args=(server, sock),
                      name="applocal-uvicorn", daemon=True).start()
     start_heartbeat(port, cfg)                     # 步骤 5′：ready 由首跳成功点亮

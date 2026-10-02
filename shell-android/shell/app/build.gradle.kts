@@ -3,12 +3,43 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// release 签名（★v1.2★）：pkapp 经 -PpkappKs/-PpkappKsPass/-PpkappKsAlias 注入
+//（密码只走 env→-P 链，不落文件）；无 property = 直接构建壳工程，release 不挂签名
+val ksFile = project.findProperty("pkappKs") as String?
+val ksPass = project.findProperty("pkappKsPass") as String?
+val ksAlias = project.findProperty("pkappKsAlias") as String? ?: "pkapp"
+
 android {
     namespace = "com.pkapp.shell"
     compileSdk = 35
 
+    signingConfigs {
+        if (ksFile != null && ksPass != null) {
+            create("pkapp") {
+                storeFile = file(ksFile)
+                storePassword = ksPass
+                keyAlias = ksAlias
+                keyPassword = ksPass
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            if (ksFile != null && ksPass != null) {
+                signingConfig = signingConfigs.getByName("pkapp")
+            }
+        }
+    }
+
     defaultConfig {
-        applicationId = "com.pkapp.shell"
+        // applicationId 由 pkapp 按项目 [platforms.android].package 经 -PpkappAppId 注入
+        //（无 property 时回退默认 = 直接用 gradle 构建壳工程）。namespace 保持不变：
+        // R 类/Activity 类路径与安装身份（applicationId）分离是 Android 常规形态
+        applicationId = project.findProperty("pkappAppId") as String? ?: "com.pkapp.shell"
+        // 应用显示名（★v1.2★）：项目 app.name 经 -PpkappLabel 注入；缺省 = 直接构建壳
+        manifestPlaceholders["pkappLabel"] =
+            project.findProperty("pkappLabel") as String? ?: "PKApp Shell"
         minSdk = 24
         targetSdk = 35
         versionCode = 1

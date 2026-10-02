@@ -174,6 +174,15 @@ class MainActivity : Activity() {
     private fun boot() {
         try {
             slog("shell boot begin (platform=android, identity=$packageName)")
+            // 步骤 3′（★v1.2★ 竞态修复）：等安装器铺完 nativeLibraryDir。pm install 返回
+            // ≠ 原生库抽取完成——首启秒启时 _struct/_hashlib 可能尚未落盘，import applocal
+            // 即崩（实测 Honor Magic6 复现，二次启动自愈）。PYTHONPATH 含该目录（见下），
+            // 铺完即可导入，故启动前轮询三件套；15s 超时 fail-fast 而非挂起。
+            if (!waitForNativeLibs()) {
+                slog("native libs not ready after 15s")
+                main.post { showError("原生库就绪超时（安装器未完成抽取）——请重装应用或重启设备后重试", true) }
+                return
+            }
             // 步骤 1-2：spk 读取 + 指纹比对 / 全量解压（验签由 APK 签名承担）
             val mf = ensureRuntimeExtracted()
             ensureStdlib()
@@ -188,7 +197,7 @@ class MainActivity : Activity() {
                 "MYAPP_READY_FILE=$readyFile",
                 "MYAPP_DIAG_FILE=$diagFile",
                 "MYAPP_STATIC_DIR=${File(runtimeDir, "dist")}",
-                "MYAPP_PORT=0",
+                // MYAPP_PORT 不注入（★v1.2★）：端口偏好走 manifest network_port（打包期 [network].port）
                 "MYAPP_VERSION=${mf.version}",
                 "MYAPP_MANIFEST_PATH=${File(runtimeDir, "manifest")}",
                 "MYAPP_NATIVE_LIB_DIR=${applicationInfo.nativeLibraryDir}",
@@ -225,6 +234,23 @@ class MainActivity : Activity() {
     private fun onBootOk() {
         setupWebView()
         main.postDelayed(tick, TICK_MS) // 步骤 8.5/9：主 looper 轮询（协议禁独立轮询线程）
+    }
+
+    /** 步骤 3′：nativeLibraryDir 就绪轮询（libpython + 关键扩展三件套；正常态零等待）。 */
+    private fun waitForNativeLibs(): Boolean {
+        val dir = File(applicationInfo.nativeLibraryDir)
+        // ★v1.2★ 扩展模块以 lib 前缀落盘（release 安装器只抽 lib*.so，见 _NdkExtFinder）
+        val need = listOf("libpython3.12.so", "lib_struct.cpython-312.so",
+                          "lib_hashlib.cpython-312.so")
+        val deadline = SystemClock.uptimeMillis() + 15_000
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (need.all { File(dir, it).isFile }) {
+                slog("native libs ready (${dir.list()?.size ?: 0} so)")
+                return true
+            }
+            Thread.sleep(200)
+        }
+        return false
     }
 
     /** 步骤 1-2：指纹命中跳过解压；否则 staging 全量解压 → 旧区让位 → 原子 rename → 记账（铁律①）。 */

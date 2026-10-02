@@ -14,8 +14,15 @@ REQUIRED_NONEMPTY = KEYS + ("signature",)  # G2：全键非空
 
 
 def render(fields: dict, signature: str | None = None) -> str:
-    """ini 风格 manifest 文本：`key = value` 行；signature 缺省 None（先渲染待签正文）。"""
+    """ini 风格 manifest 文本：`key = value` 行；signature 缺省 None（先渲染待签正文）。
+
+    network_* 扩展键（NETWORK_AUTH_DESIGN §5 透传链）追加在基础键之后、signature 之前：
+    不进 KEYS/REQUIRED_NONEMPTY（可选键，G2 不约束），但 canonical_bytes 原样保留
+    → 同样被 Ed25519 签名覆盖；壳 C 解析器按键名抓取，未知键忽略。
+    """
     lines = [f"{k} = {fields[k]}" for k in KEYS if k in fields]
+    lines += [f"{k} = {fields[k]}" for k in fields
+              if k.startswith("network_") and k not in KEYS]
     if signature is not None:
         lines.append(f"signature = {signature}")
     return "\n".join(lines) + "\n"

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import applocal
 from applocal import ContractError, load_env
-from applocal import _core, _env
+from applocal import _core, _env, _ndk
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
@@ -42,7 +42,8 @@ def env(tmp_path, monkeypatch):
     for k, v in vals.items():
         monkeypatch.setenv(k, v)
     for k in ("MYAPP_LOG_DIR", "MYAPP_PORT", "MYAPP_HANDSHAKE_FILE",
-              "MYAPP_NATIVE_LIB_DIR", "MYAPP_STRICT_AUTH"):
+              "MYAPP_NATIVE_LIB_DIR", "MYAPP_STRICT_AUTH", "MYAPP_DEV",
+              "MYAPP_LAN", "MYAPP_AUTH"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(_env, "_cfg", None)
     return d
@@ -111,6 +112,81 @@ def test_pick_port_retry_when_busy(env):
         got = _core.pick_port(busy)                                 # 偏好被占 → 换口
         assert got != busy and got > 0
     assert _core.pick_port(busy) == busy                            # 空闲 → 用偏好
+
+
+def test_bind_socket_strict_raises_when_busy(env):
+    with socket.socket() as blocker:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        busy = blocker.getsockname()[1]
+        with pytest.raises(ContractError, match="occupied"):
+            _core._bind_socket(busy, "127.0.0.1", strict=True)      # 显式端口被占 → fail-fast
+        s = _core._bind_socket(busy, "127.0.0.1")                   # 非 strict 保持回落
+        assert s.getsockname()[1] != busy
+        s.close()
+    s = _core._bind_socket(busy, "127.0.0.1", strict=True)          # 空闲 → 用偏好
+    assert s.getsockname()[1] == busy
+    s.close()
+
+
+def test_bind_socket_reuseaddr_posix_only(env):
+    """★v1.2★ SO_REUSEADDR 仅 POSIX：TIME_WAIT 残留卡重绑（安卓实测必现）；
+    Windows 语义排他故不设。活监听者互斥不受影响（strict 用例覆盖）。"""
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only semantics")
+    s = _core._bind_socket(0, "127.0.0.1")
+    assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 1
+    s.close()
+    # TIME_WAIT 模拟：绑定→监听→主动连接→关闭后立即重绑同端口
+    port = s.getsockname()[1]
+    c = socket.socket(); c.connect(("127.0.0.1", port)); c.close()  # 死连接 → TIME_WAIT
+    s.close()
+    time.sleep(0.3)
+    s2 = _core._bind_socket(port, "127.0.0.1", strict=True)         # 无 REUSEADDR 会 EADDRINUSE
+    s2.close()
+
+
+def test_ndk_ext_finder_maps_lib_prefixed_names(env, tmp_path):
+    """★v1.2★ _ndk.NdkExtFinder：lib<name>{EXT_SUFFIX} → 原名导入（Android release
+    安装器只抽 lib*.so；debuggable 豁免不可依赖）。find_spec 只定位不加载。"""
+    so = tmp_path / "lib_struct.cpython-312.so"
+    so.write_bytes(b"stub")
+    finder = _ndk.NdkExtFinder(str(tmp_path))
+    spec = finder.find_spec("_struct")
+    assert spec is not None and spec.origin == str(so)
+    assert finder.find_spec("_nope") is None
+    assert finder.find_spec("_struct", path=["x"]) is None   # 仅顶层扩展模块
+
+
+def test_ndk_register_idempotent_and_early(env, monkeypatch):
+    """★v1.2★ register：目录不存在 → 跳过；存在（即使暂无文件）→ 注册一次（幂等）。"""
+    monkeypatch.setattr(sys, "meta_path", sys.meta_path[:])
+    _ndk.register(str(env / "nope"))                         # 目录不存在 → 不注册
+    assert not any(isinstance(f, _ndk.NdkExtFinder) for f in sys.meta_path)
+    _ndk.register(str(env))
+    _ndk.register(str(env))                                  # 幂等
+    finders = [f for f in sys.meta_path if isinstance(f, _ndk.NdkExtFinder)]
+    assert len(finders) == 1
+
+
+# ---------------------------------------- 端口偏好来源（env > manifest，★v1.2★ network_port）
+def test_port_from_manifest(env):
+    (env / "runtime" / "manifest").write_text(
+        "app_version = 1.4.2\nnetwork_port = 48765\n", encoding="utf-8")
+    assert load_env(refresh=True).runtime.port_pref == 48765
+
+
+def test_port_env_overrides_manifest(env, monkeypatch):
+    (env / "runtime" / "manifest").write_text(
+        "app_version = 1.4.2\nnetwork_port = 48765\n", encoding="utf-8")
+    monkeypatch.setenv("MYAPP_PORT", "48766")                       # env 优先（运维覆盖层）
+    assert load_env(refresh=True).runtime.port_pref == 48766
+
+
+def test_port_bad_value_raises(env, monkeypatch):
+    monkeypatch.setenv("MYAPP_PORT", "eighty")
+    with pytest.raises(ContractError, match="integer"):
+        load_env(refresh=True)
 
 
 # ---------------------------------------------------------------- ASGI（鉴权/握手/静态）

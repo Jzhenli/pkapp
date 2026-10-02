@@ -13,4 +13,4 @@ dependencies = [] # 零强制依赖：uvicorn 仅在 bootstrap 内惰性导入�
 dev = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["applocal"]
+packages = ["applocal", "applocal.rbac"]

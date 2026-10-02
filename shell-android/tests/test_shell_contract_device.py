@@ -118,25 +118,30 @@ def launch_fresh() -> None:
     pytest.fail("READY_TIMEOUT：启动后 90s 内未见有效 ready")
 
 
-def http(method: str, path: str, token: str | None = None,
-         body: dict | None = None) -> tuple[int, str]:
-    """经 adb forward 打设备侧 127.0.0.1 服务；返回 (status, body)。"""
+def http(method: str, path: str, cookie: str | None = None,
+         body: dict | None = None) -> tuple[int, str, str | None]:
+    """经 adb forward 打设备侧 127.0.0.1 服务；返回 (status, body, set-cookie 首段)。"""
     port = read_ready()["port"]
     _adb_ok("-s", SERIAL, "forward", "tcp:0", f"tcp:{port}")
     rev = _adb_ok("-s", SERIAL, "forward", "--list").strip().splitlines()[-1]
     local = int(rev.split()[1].split(":")[1])
     req = urllib.request.Request(f"http://127.0.0.1:{local}{path}", method=method)
-    if token:
-        req.add_header("x-myapp-token", token)
+    if cookie:
+        req.add_header("Cookie", cookie)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
         req.add_header("Content-Type", "application/json")
+
+    def _sc(headers) -> str | None:
+        sc = headers.get("Set-Cookie")
+        return sc.split(";")[0] if sc else None
+
     try:
         with urllib.request.urlopen(req, data=data, timeout=10) as resp:
-            return resp.status, resp.read().decode()
+            return resp.status, resp.read().decode(), _sc(resp.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+        return e.code, e.read().decode(), _sc(e.headers)
 
 
 CODE = "b" * 64
@@ -170,27 +175,27 @@ def test_heartbeat_seq_monotonic():
     assert s2 > s1, f"心跳未增长: {s1} -> {s2}"
 
 
-def test_api_unauthorized_without_token():
-    """strict_auth=1：无 token 调 /api/hello → 401。"""
-    status, _ = http("GET", "/api/hello")
+def test_api_unauthorized_without_credentials():
+    """strict_auth=1：无任何凭证（无 Cookie/头）调 /api/hello → 401。"""
+    status, _, _ = http("GET", "/api/hello")
     assert status == 401
 
 
 def test_auth_rejects_mismatched_code():
     """SHELL_PROTOCOL §7：文件码与提交码不一致（未武装该码）→ 403。"""
     write_handshake(OTHER)
-    status, _ = http("POST", "/auth", body={"handshake": CODE})
+    status, _, _ = http("POST", "/auth", body={"handshake": CODE})
     assert status == 403
 
 
-def test_auth_ok_then_token_api_then_consumed():
-    """§7 正链：新码 → /auth 发 token → /api/hello 200 → 码用后作废。"""
+def test_auth_ok_then_cookie_api_then_consumed():
+    """§7 正链（★收敛★）：新码 → /auth 种 Cookie（响应体无 token）→ 带 Cookie 调 /api/hello → 码用后作废。"""
     write_handshake(CODE)
-    status, text = http("POST", "/auth", body={"handshake": CODE})
+    status, text, cookie = http("POST", "/auth", body={"handshake": CODE})
     assert status == 200, text
-    token = json.loads(text).get("token")
-    assert token and len(token) == 64
-    status, body = http("GET", "/api/hello", token=token)
+    assert json.loads(text) == {"ok": True}             # 收敛：响应体无 token
+    assert cookie and cookie.startswith("sid=")
+    status, body, _ = http("GET", "/api/hello", cookie=cookie)
     assert status == 200, body
     data = json.loads(body)
     assert data["hello"] == "world"
