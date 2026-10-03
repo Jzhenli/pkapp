@@ -106,7 +106,24 @@ _pth 查找顺序 = [library(python3XX.dll 全路径, 去扩展名+._pth),
 ### B.u（★v8.1 V12★）pyc 可复现性
 统一使用 `--invalidation-mode checked-hash` + 固化 `SOURCE_DATE_EPOCH`；否则源 mtime 被烧进 pyc → spk hash 每次不同 → golden test 随机红。
 
-**★v0.5★ 标准库 zip 必须预编译 pyc 一并打入（★启动优化★）**：`<STEM>.zip` 打包时由快照解释器对全部 `.py` 预编译 checked-hash pyc，以**扁平 `<dir>/<mod>.pyc` 布局**写入（zipimport 在 zip 内只查扁平 `.pyc` 条目、不认 `__pycache__/` 目录；`.pyc` 优先于同名 `.py`）。缺 pyc 时每次启动都从源码重编译整个被引标准库——Windows 实测每次启动多花 ~2s（`import applocal` 2.7s → 0.2s）。compileall 走独立暂存副本，不改快照本体。
+**★v0.5★ 标准库 zip 必须预编译 pyc 一并打入（★启动优化★）**：`<STEM>.zip` 打包时由快照解释器对全部 `.py` 预编译 pyc（★v0.7★ 起失效模式为 UNCHECKED_HASH，见下），以**扁平 `<dir>/<mod>.pyc` 布局**写入（zipimport 在 zip 内只查扁平 `.pyc` 条目、不认 `__pycache__/` 目录；`.pyc` 优先于同名 `.py`）。缺 pyc 时每次启动都从源码重编译整个被引标准库——Windows 实测每次启动多花 ~2s（`import applocal` 2.7s → 0.2s）。compileall 走独立暂存副本，不改快照本体。
+
+**★v0.7★ 打包布局固化（★v0.6 pyc_only 开关废除★，默认行为零配置）**：
+```
+① stdlib zip 恒纯 pyc：已有 pyc 的 .py 不写入（纯扁平 .pyc）；无 pyc 的 .py 恒兜底写入
+   （可导入性优先）；pyc 用 UNCHECKED_HASH 头（PEP 552"无源可信"语义）。
+   硬约束：Python 无法向 zip 写编译 side-cache——zip 内只带 .py = 每次启动重编译整个
+   被引标准库（实测 ~2s/次、不可回退），故 zip 内必须预编译 pyc（快照解释器编译）；
+② site-packages 恒只带 .py：pip --no-compile，不预编译、不无源化。目录树可写 →
+   首启 import 自动生成 __pycache__（一次性 ~85 小文件，估 0.3-0.7s），后续命中缓存。
+   源码在 → inspect.getsource / RECORD 一致性 / 调试断点全部零副作用（v0.6 无源化
+   方案的内省风险不复存在）；
+③ app/ 恒保留 .py 源码并打入 CHECKED_HASH pyc（__pycache__ 布局，traceback 可读）；
+④ G1 可复现性不受影响（hash 头不含 mtime；实测同输入两次构建字节一致）。
+实测 HiApp spk 34.03MB → 33.86MB（-0.17MB：节省仅来自 site-packages .py 直存 vs pyc——
+stdlib zip 在 v0.6 已纯 pyc，无额外空间）；暖态启动与 v0.6 持平。
+AppSpec [build] 段废除：残留即 SpecError（防配置静默失效）。
+```
 
 ### B.v（★v8.1 V10★）出网信任链
 默认装入 `certifi` wheel；出网统一 `ssl.create_default_context(cafile=certifi.where())`（在 applocal 内部使用，**不新增冻结 API**）。缺失则 HTTPS 更新链必然失败。
@@ -183,3 +200,5 @@ G11 Windows 目标实跑断言（M0 D2 起的 CI 门槛）：
 | v0.3 | ★pkapp 0.1.0 实现对账（零机制变更）★：§6 补 spk_hash 精确定义（原空洞条款——manifest 含 spk_hash 而 manifest 在 spk 内，定义为"除 manifest 外全部条目的拼接 sha256"）+ pyc 相对 co_filename 实现注记；B.z 补 ⑥ certifi（v8.2 已定，本文档此前漏抄）；B.v 补"packager 恒装入 certifi"。工具侧落地：Ed25519 签名（M0 D1 决策的 minisign 轻量替代——manifest 正文 Ed25519 签名，壳内置公钥 hex 验签） |
 | v0.4 | ★M0 D2 补齐实测回填（PBS cpython-3.12.14+20260929 x64 msvc install_only_stripped）★：① B.t① 探测须用 `python3\d+\.dll` 正则——字典序 python3.dll（稳定 ABI 转发器）排在 python312.dll 前，宽松 glob 选错；② 闭包解析域 = DLLs/ ∪ 根目录（pyd 依赖解释器本体，只扫 DLLs/ 全误报）；③ 系统白名单实测新增：Cabinet/msi（_msi.pyd）、PROPSYS（_wmi.pyd）、IMM32（_tkinter.pyd）；④ python312.dll 动态依赖 VCRUNTIME140.dll（非静态 CRT）→ 根目录伴生 DLL（vcruntime140\*/python3.dll）须随包拷贝（PyInstaller 同款）；⑤ stdlib 排除 test/idlelib/tkinter/turtledemo/site-packages/\_\_pycache\_\_ 后 611 文件 / 12.6MB → python312.zip；DLLs 31×.pyd；runtime.spk ≈ 30.5MB；⑥ G11 实跑通过：解包安装目录形态 + 快照 python.exe 读 python312._pth 启动，sys.path 含 zip 与 site-packages，ssl/sqlite3/asyncio/bz2/lzma 真 pyd 加载成功。证据：pkapp/tools/runtime_probe.py、pkapp/tools/make_runtime_proto.py、pkapp/tests/test_real_runtime.py |
 | v0.5 | ★启动优化★：B.u 增补 stdlib zip 预编译 pyc（扁平布局，实测省 ~2s/次启动）——Windows 实测首帧 8.9s → 2.6s（配合 applocal 心跳首拍立即 §6 与 uvicorn 子模块直导） |
+| v0.6 | ★[build].pyc_only pyc-only 打包★：stdlib zip 去 .py（纯扁平 .pyc）+ site-packages 无源化（__pycache__ pyc 提升至源位置；UNCHECKED_HASH 头）；app/ 恒保留源码；缺省关闭；实测 HiApp spk -10.8%（38.16→34.03MB），启动耗时持平 |
+| v0.7 | ★打包布局固化（v0.6 开关废除，零配置）★：stdlib zip 恒纯 pyc（UNCHECKED_HASH；zip 内无编译 side-cache，只带 .py = 每次启动永久重编译 ~2s，硬约束）+ site-packages 恒只带 .py（pip --no-compile；目录树首启自动建 __pycache__，源码内省/RECORD/调试零副作用——v0.6 无源化风险不复存在）；app/ 现状不变；[build] 段残留即 SpecError；实测 HiApp spk 34.03→33.86MB（节省仅 site-packages 段，stdlib v0.6 已纯 pyc） |

@@ -160,3 +160,41 @@ def test_install_dir_clean(tmp_path):                     # G6/G10
 def test_dll_stem_derivation():                           # B.x 派生（V13）
     assert dll_stem("python312.dll") == "python312"
     assert dll_stem("python313.dll") == "python313"
+
+
+def test_zip_lib_pure_pyc(tmp_path):
+    """_zip_lib（★v0.7★ zip 内恒纯 pyc）：有 pyc 的 .py 不进 zip（扁平 .pyc）；
+    无 pyc 的 .py 兜底写入；无 pyc_tag 时不查 pyc，全部按 .py 写入。"""
+    lib = tmp_path / "lib"
+    (lib / "pkg" / "__pycache__").mkdir(parents=True)
+    (lib / "pkg" / "__init__.py").write_text("X = 1\n", encoding="utf-8")
+    (lib / "pkg" / "__pycache__" / "__init__.cpython-312.pyc").write_bytes(b"fake")
+    (lib / "lone.py").write_text("Y = 2\n", encoding="utf-8")   # 无 pyc → 兜底
+    out = str(tmp_path / "lib.zip")
+    assemble._zip_lib(str(lib), out, pyc_tag="cpython-312")
+    assert set(zipfile.ZipFile(out).namelist()) == {"pkg/__init__.pyc", "lone.py"}
+    out2 = str(tmp_path / "lib2.zip")
+    assemble._zip_lib(str(lib), out2)
+    assert set(zipfile.ZipFile(out2).namelist()) == {"pkg/__init__.py", "lone.py"}
+
+
+def test_default_layout_py_sources(project, wheels_dir, tmp_path):
+    """★v0.7★ 默认布局：site-packages 恒只带 .py（无 pyc/__pycache__——目录树
+    首启自动建缓存，源码内省/RECORD 零副作用）；app/ 恒保留源码；golden B.z 仍过。
+    （stdlib zip 纯 pyc 断言在 test_zip_lib_pure_pyc——mock 快照 python.exe 为占位、
+    回退打包机 3.10 编译，集成里 pyc tag 与 cpython-312 不匹配走兜底写 .py。）"""
+    out = str(tmp_path / "v7.spk")
+    fields = _build(project, wheels_dir, out)
+    assert fields["format_version"] == "1"
+    with zipfile.ZipFile(out) as zf:
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    sp = os.path.join(stage, "site-packages")
+    assert os.path.isfile(os.path.join(sp, "applocal", "__init__.py"))
+    assert os.path.isfile(os.path.join(sp, "certifi", "cacert.pem"))  # 数据文件不动
+    sp_files = [os.path.join(dp, f) for dp, _dn, fs in os.walk(sp) for f in fs]
+    assert sp_files
+    assert not any(f.endswith(".pyc") for f in sp_files)
+    assert not any("__pycache__" in f for f in sp_files)
+    assert os.path.isfile(os.path.join(stage, "app", "main.py"))      # app 源码恒保留
+    golden_mod.assert_bz(stage, "python312.dll")

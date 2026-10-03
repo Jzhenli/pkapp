@@ -164,3 +164,12 @@ def test_android_icon_parse(tmp_path):
     })
     assert load(os.path.join(root, "pkapp.toml")).android_icon == \
         "icons/android/xplay.png"
+
+
+def test_build_section_abolished(tmp_path):
+    """★v0.7★ [build] 段废除（打包布局固化默认行为）：残留即报错（防配置静默失效）。"""
+    root = _make(tmp_path, "b1")
+    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write("\n[build]\npyc_only = true\n")
+    with pytest.raises(SpecError, match="已废除"):
+        load(os.path.join(root, "pkapp.toml"))

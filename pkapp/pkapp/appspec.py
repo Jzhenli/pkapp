@@ -223,6 +223,11 @@ def load(path: str) -> AppSpec:
         provision_roles=("*",) if pr is None else tuple(_str_list(pr)),
     )
 
+    # [build] 段已废除（★v0.7★ 打包布局固化为默认行为）——残留报错（防配置静默失效）
+    if "build" in data:
+        raise SpecError('[build] 段已废除（v0.7 起打包布局固化：stdlib zip 纯 pyc、'
+                        'site-packages 恒只带 .py、app/ 恒保留源码），请从 pkapp.toml 删除该段')
+
     platform_deps = {p: tuple(str(d) for d in (plat.get(p) or {}).get("dependencies", ()))
                      for p in known}
 
