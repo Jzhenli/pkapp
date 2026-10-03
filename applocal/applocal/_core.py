@@ -65,11 +65,15 @@ def write_ready(ready_file: str, port: int, seq: int, pid: int | None = None) ->
     return payload
 
 
-def diag(stage: str, error: str, detail: str = "", recoverable: bool = True) -> dict:
-    """写 diag.json（§9）。调用方须保证 error/detail 不含 token。"""
+def diag(stage: str, error: str, detail: str = "", recoverable: bool = True,
+         cfg: Cfg | None = None) -> dict:
+    """写 diag.json（§9）。调用方须保证 error/detail 不含 token。
+
+    cfg 缺省走全局 load_env()；长生命周期线程（心跳等）必须传入启动时捕获的 cfg——
+    进程 env 事后可能被改写（测试串扰 / 宿主重设 MYAPP_*），diag 会落到别人的 cacheDir。"""
     payload = {"stage": stage, "error": str(error), "detail": str(detail)[:8000],
                "recoverable": bool(recoverable), "ts": int(time.time())}
-    p = _env.load_env().paths.diag_file
+    p = (cfg or _env.load_env()).paths.diag_file
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     tmp = f"{p}.tmp{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -331,7 +335,7 @@ def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
                     try:
                         diag("runtime", f"healthz probe failed {fails}x (port {port})",
                              detail="uvicorn startup failed or hung; server thread may be dead",
-                             recoverable=True)
+                             recoverable=True, cfg=cfg)  # 捕获的 cfg：env 事后被改也不串目录
                     except Exception:
                         pass  # diag 不可写（cacheDir 被清等）不得反过来杀死心跳线程
                 continue

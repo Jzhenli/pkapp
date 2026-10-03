@@ -364,6 +364,29 @@ def test_heartbeat_writes_diag_on_failure(env):
     assert not ready.exists()                                        # 失败不 touch ready
 
 
+def test_heartbeat_diag_uses_captured_cfg(env, monkeypatch):
+    """★泄漏线程 diag 归属★：daemon 心跳写 diag 必须用启动时捕获的 cfg，不得重解析
+    进程 env（CI 实测：前序用例泄漏的心跳线程把 diag 落进当前用例 cacheDir → flake）。"""
+    def dead(url, timeout=None):
+        raise OSError("conn refused")
+
+    monkeypatch.setattr(_core, "_OPENER", _FakeOpener(fn=dead))
+    cfg_a = _cfg(env, strict=False)
+    b_dir = env / "cache-b"                    # 模拟"env 事后被改"：全局缓存指向目录 B
+    monkeypatch.setenv("MYAPP_CACHE_DIR", str(b_dir))
+    monkeypatch.setenv("MYAPP_READY_FILE", str(b_dir / "ready"))
+    monkeypatch.setenv("MYAPP_DIAG_FILE", str(b_dir / "diag.json"))
+    load_env(refresh=True)
+
+    applocal.start_heartbeat(1, cfg_a, interval=0.05, timeout=0.05, ramp=0)
+    deadline = time.time() + 3
+    while not (env / "cache" / "diag.json").exists() and time.time() < deadline:
+        time.sleep(0.02)
+    assert (env / "cache" / "diag.json").exists()    # diag 落回捕获的 cfg（目录 A）
+    time.sleep(0.15)                                 # 再给若干拍
+    assert not (b_dir / "diag.json").exists()        # 全局 env（目录 B）恒不被写入
+
+
 def test_heartbeat_opener_bypasses_system_proxy(env, monkeypatch):
     """系统代理（http_proxy 指向死端口）不得影响心跳直连探测（§6）。"""
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")           # 死代理：走代理必失败
