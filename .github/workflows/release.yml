@@ -13,6 +13,8 @@ permissions:
 jobs:
   pkapp-wheel:
     runs-on: windows-latest      # 壳是 MSVC /MT 产物，构建机须带 VS2022 C++ 工具链
+    env:
+      PYTHONUTF8: "1"            # runner 默认 cp1252，中文输出/构建日志统一 UTF-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -18,6 +18,10 @@ build/
 *.tar.gz
 *.tar.zst
 
+# pkapp 内置制品（scripts/vendor.py 组装，不入库）
+pkapp/pkapp/_vendor/
+pkapp/dist/
+
 # 签名私钥（绝不入库）
 .pkapp/
 
@@ -45,3 +49,4 @@ local.properties
 .vscode/
 .idea/
 .trae/
+.venv312

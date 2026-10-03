@@ -18,6 +18,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def main() -> int:
+    # CI/英区 Windows 控制台常为 cp1252——中文输出统一转 UTF-8（UnicodeEncodeError 实测踩坑）
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     shell_build = os.path.join(ROOT, "shell-windows", "build")
     exe = os.path.join(shell_build, "MyApp.exe")
     dll = os.path.join(shell_build, "WebView2Loader.dll")

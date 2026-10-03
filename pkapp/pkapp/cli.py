@@ -79,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 非 CJK Windows（cp1252 等）控制台编不了中文输出——入口统一转 UTF-8，
+    # wheel 分发面向任意 locale 用户（GitHub Actions cp1252 实测踩坑）
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
     try:
         if args.cmd == "create":
