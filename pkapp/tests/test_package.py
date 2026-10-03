@@ -74,15 +74,13 @@ def test_find_rcedit_fallback_chain(tmp_path, monkeypatch):
     assert _find_rcedit(None) == (shutil.which("rcedit") or shutil.which("rcedit-x64"))
 
 
-def _add_android_package(proj):
-    """android 组装前置：[platforms.android].package（★v1.2★ 起必填 = applicationId）。
-    新模板平台段已实体化 → 精准替换注释行（追加会产生重复 TOML 表）。"""
+def _strip_android_package(proj):
+    """模板已预填 package（com.example.myapp）→ 注释还原缺省态，供缺失分支测试。"""
     path = os.path.join(proj, "pkapp.toml")
     with open(path, encoding="utf-8") as f:
         txt = f.read()
-    marker = '# package = "com.example.helloworld"'
-    assert marker in txt, "create 模板 android package 注释行已变，请同步本测试"
-    txt = txt.replace(marker, 'package = "com.example.myapp"', 1)
+    txt = txt.replace('package = "com.example.myapp"',
+                      '# package = "com.example.myapp"', 1)
     with open(path, "w", encoding="utf-8") as f:
         f.write(txt)
 
@@ -140,7 +138,7 @@ def _fake_shell(tmp_path):
 
 def test_package_android_builds_apk(tmp_path, monkeypatch):
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _write_spk(proj, "android")
     # spk 字节读回用于假 APK 内嵌（保持与源字节一致，过硬校验）
     with open(os.path.join(proj, "build", "platform-android", "runtime.spk"), "rb") as f:
@@ -161,7 +159,7 @@ def test_package_android_icon_injected(tmp_path, monkeypatch):
     from PIL import Image
 
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _add_android_icon(proj)
     _write_spk(proj, "android")
     with open(os.path.join(proj, "build", "platform-android", "runtime.spk"), "rb") as f:
@@ -189,7 +187,7 @@ def test_package_android_icon_injected(tmp_path, monkeypatch):
 def test_package_android_icon_missing(tmp_path, monkeypatch, capsys):
     """icon 指向不存在的文件 → fail-fast（exit 2，同 windows 图标前置检查语义）。"""
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
     path = os.path.join(proj, "pkapp.toml")
@@ -206,7 +204,7 @@ def test_package_android_icon_missing(tmp_path, monkeypatch, capsys):
 def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys):
     """icon 非位图（Pillow 无法识别）→ ApkError 拒绝组装。"""
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     png = _add_android_icon(proj)
     with open(png, "wb") as f:
         f.write(b"this is not an image at all")
@@ -220,6 +218,7 @@ def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys):
 def test_package_android_requires_app_id(tmp_path, monkeypatch, capsys):
     """未配 [platforms.android].package → 拒绝组装（固定共享 id 会同机互相顶替）。"""
     proj = _make_project(tmp_path)
+    _strip_android_package(proj)          # 模板已预填 → 还原缺省态以覆盖缺失分支
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
     assert main(["package", "android", "--project", proj,
@@ -232,7 +231,7 @@ def test_package_android_release_signed(tmp_path, monkeypatch):
     ks = tmp_path / "release.keystore"
     ks.write_bytes(b"ks-stub")
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _write_spk(proj, "android")
     with open(os.path.join(proj, "build", "platform-android", "runtime.spk"), "rb") as f:
         spk_bytes = f.read()
@@ -252,7 +251,7 @@ def test_package_android_release_signed(tmp_path, monkeypatch):
 def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys):
     """★v1.2★ keystore 有路径无密码 → 拒绝（密码永不落文件,只走 env）。"""
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
     monkeypatch.setenv("PKAPP_KEYSTORE", str(tmp_path / "ks"))
@@ -264,7 +263,7 @@ def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys):
 
 def test_package_android_rejects_missing_asset(tmp_path, monkeypatch, capsys):
     proj = _make_project(tmp_path)
-    _add_android_package(proj)
+
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=False, spk_bytes=b"")
     assert main(["package", "android", "--project", proj,

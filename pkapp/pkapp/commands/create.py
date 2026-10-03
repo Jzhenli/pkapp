@@ -39,7 +39,7 @@ python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows�
 # icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
 [platforms.android]
 python_version = "3.12.14"     # → pkapp fetch android（py-android 运行时同版本锁定）
-# package = "com.example.helloworld"   # applicationId（同机多应用共存，build android 必填）
+package = "com.example.{pkg}"   # applicationId（同机多应用共存，build android 必填；name 中 - 已转 _）
 # keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
 # abis = ["arm64-v8a"]
 # icon = "icons/android/xplay.png"     # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；
@@ -109,7 +109,9 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
 
     os.makedirs(os.path.join(root, "app"), exist_ok=True)
     os.makedirs(os.path.join(root, "ui"), exist_ok=True)
-    atomic_write(os.path.join(root, "pkapp.toml"), _PkappToml.format(name=name).encode())
+    # 预填 applicationId 前净化：- 转 _（首字符已校验为字母，转后必过反向域名校验）
+    atomic_write(os.path.join(root, "pkapp.toml"),
+                 _PkappToml.format(name=name, pkg=name.replace("-", "_")).encode())
     atomic_write(os.path.join(root, ".gitignore"), _Gitignore.encode())
     atomic_write(os.path.join(root, "app", "__init__.py"), _InitPy.encode())
     atomic_write(os.path.join(root, "app", "main.py"), _MainPy.encode())

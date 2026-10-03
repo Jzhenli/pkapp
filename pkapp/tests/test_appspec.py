@@ -136,16 +136,20 @@ def test_network_port_bad_int(tmp_path):
 
 
 def test_android_package_parse_and_format(tmp_path):
-    """[platforms.android].package：解析 + 反向域名格式校验（★v1.2★ applicationId 注入）。"""
-    root = _make(tmp_path, "n11", **{
-        '# package = "com.example.helloworld"': 'package = "com.example.myapp"',
-    })
-    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.myapp"
+    """[platforms.android].package：create 预填 com.example.<name>；解析 + 反向域名格式校验。"""
+    root = _make(tmp_path, "n11")     # 模板已预填，零配置即合法
+    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.n11"
     root2 = _make(tmp_path, "n12", **{
-        '# package = "com.example.helloworld"': 'package = "bad..id"',
+        'package = "com.example.n12"': 'package = "bad..id"',
     })
     with pytest.raises(SpecError, match="反向域名"):
         load(os.path.join(root2, "pkapp.toml"))
+
+
+def test_android_package_prefill_sanitized(tmp_path):
+    """create 预填净化：项目名含 - → package 段转 _，仍满足反向域名（零手工修正）。"""
+    root = _make(tmp_path, "my-app")
+    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.my_app"
 
 
 def test_android_keystore_parse(tmp_path):
