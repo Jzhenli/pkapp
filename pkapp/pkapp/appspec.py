@@ -12,10 +12,7 @@ from dataclasses import dataclass, field
 
 from . import __version__ as PKAPP_VERSION
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 _ENTRY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):([A-Za-z_][A-Za-z0-9_]*)$")
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")

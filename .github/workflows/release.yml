@@ -20,6 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Verify tag == pyproject version (tag-only，防版本漂移)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          PKG_VER=$(python -c "import tomllib; print(tomllib.load(open('pkapp/pyproject.toml','rb'))['project']['version'])")
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VER" != "$TAG_VER" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 pkapp/pyproject.toml version ${PKG_VER} 不一致，拒绝发布"
+            exit 1
+          fi
+          echo "version check ok: v${PKG_VER}"
       - name: Build Windows shell (build.bat)
         working-directory: shell-windows
         run: .\build.bat

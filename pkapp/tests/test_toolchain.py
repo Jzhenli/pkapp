@@ -14,10 +14,7 @@ import pytest
 from pkapp import toolchain
 from pkapp.toolchain import Pin, ToolchainError
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 
 # ---------------------------------------------------------------- 压缩包构造器

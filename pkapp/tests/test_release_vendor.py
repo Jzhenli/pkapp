@@ -134,3 +134,20 @@ def test_seed_vendored_wheel_absent_quiet(pkapp_cache):
     """源码/测试形态无 _vendor：播种为静默 no-op（零配置主线的优雅降级）。"""
     from pkapp.commands.build import _seed_vendored_wheel
     assert _seed_vendored_wheel("windows") is None
+
+
+def test_version_metadata_matches_pyproject():
+    """★版本单源守卫★：安装元数据必须与 pyproject version 同步。
+
+    __init__ 直读元数据、无兜底分支（源码使用必须 pip install -e）；
+    元数据是装包时刻从 pyproject 烤出的快照，本测试守住
+    "bump pyproject 忘重装 editable"的漂移（v0.1.1 验收实测的双源漂移教训）。"""
+    import tomllib
+
+    import pkapp
+
+    root = os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))                       # pkapp/（pyproject 所在）
+    pyver = tomllib.loads(open(os.path.join(root, "pyproject.toml"),
+                               encoding="utf-8").read())["project"]["version"]
+    assert pkapp.__version__ == pyver

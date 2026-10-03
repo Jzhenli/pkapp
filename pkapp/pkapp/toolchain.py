@@ -24,10 +24,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    import tomli as tomllib
+import tomllib
 
 PYTHON_VERSION = "3.12.14"   # PINS 全族锁定的 CPython 版本（snapshot.toml 记录）
 _GRADLE_BIN = "gradle.bat" if os.name == "nt" else "gradle"
