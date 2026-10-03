@@ -52,18 +52,48 @@ def test_reproducible(project, wheels_dir, tmp_path):   # G1
 
 
 def test_managed_wheels_cache(project, wheels_dir, tmp_path, mock_runtime):
-    """★v1.2★ wheel 缓存托管：缺省构建（不带 --wheels-dir）落到
-    build/platform-windows/wheels 并离线命中；二跑 G1 字节级一致。"""
+    """★v1.4★ wheel 托管缓存全局化：缺省构建（不带 --wheels-dir）落到
+    <PKAPP_CACHE>/wheels/<platform> 并离线命中；二跑 G1 字节级一致。"""
     import shutil
 
-    cache = os.path.join(project, "build", "platform-windows", "wheels")
-    shutil.copytree(wheels_dir, cache)                      # 预置热缓存（fixture 同源）
+    cache = assemble._wheels_cache("windows")
+    assert cache.startswith(os.environ["PKAPP_CACHE"])   # 全局托管根内，不入项目 build/
+    os.makedirs(cache)
+    for fn in os.listdir(wheels_dir):                    # 预置热缓存（fixture 同源）
+        shutil.copy2(os.path.join(wheels_dir, fn), cache)
     out = str(tmp_path / "managed.spk")
     fields = _build(project, None, out)
     assert fields["applocal_version"] == "0.1.0"
     out2 = str(tmp_path / "managed2.spk")
     _build(project, None, out2)
     assert open(out, "rb").read() == open(out2, "rb").read()
+
+
+def test_uncached_deps_version_aware(tmp_path):
+    """★v1.4★ 全局缓存跨项目共享 → 名字+精确版本匹配：同名旧版本不得误判已缓存。"""
+    wd = str(tmp_path / "w")
+    os.makedirs(wd)
+    for fn in ("fastapi-0.110.0-py3-none-any.whl", "uvicorn-0.30.0-py3-none-any.whl"):
+        open(os.path.join(wd, fn), "wb").close()
+    uncached = assemble._uncached_deps
+    # 精确 pin：版本不命中 → 补齐；版本命中 → 剔除
+    assert uncached(["fastapi==0.115.0"], wd) == ["fastapi==0.115.0"]
+    assert uncached(["fastapi==0.110.0"], wd) == []
+    # extras 段 + 精确 pin：版本感知必须生效（不退化为按名字）
+    assert uncached(["fastapi[std]==0.115.0"], wd) == ["fastapi[std]==0.115.0"]
+    assert uncached(["fastapi[std]==0.110.0"], wd) == []
+    # 范围 / 无 pin：按名字（文件名无法表达区间，退化语义）
+    assert uncached(["fastapi>=0.110"], wd) == []
+    assert uncached(["uvicorn"], wd) == []
+    assert uncached(["applocal==0.1.0"], wd) == ["applocal==0.1.0"]
+    # PEP 440 轻量等价：1.0 == 1.0.0 补零对齐；通配 .* 前缀
+    assert uncached(["fastapi==0.110"], wd) == []
+    assert uncached(["fastapi==0.110.*"], wd) == []
+    assert uncached(["uvicorn==0.29.*"], wd) == ["uvicorn==0.29.*"]
+    # 冷启动：缓存目录不存在不裸崩（先建目录，全部需求进补齐）
+    absent = str(tmp_path / "absent")
+    assert uncached(["applocal==0.1.0"], absent) == ["applocal==0.1.0"]
+    assert os.path.isdir(absent)
 
 
 def test_tamper_detected(project, wheels_dir, tmp_path):  # G4 负向

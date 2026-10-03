@@ -19,6 +19,7 @@ import tempfile
 import zipfile
 
 from ..appspec import AppSpec
+from ..toolchain import cache_root
 from ..util import SPK_DATE, atomic_write, copy_tree, tree_hash
 from . import manifest as mf
 from . import pe, runtime, sign, spk
@@ -132,10 +133,12 @@ def _zip_lib(lib_dir: str, out_path: str, pyc_tag: str | None = None) -> int:
     return n
 
 
-def _wheels_cache(project_dir: str, platform: str) -> str:
-    """★v1.2★ wheel 缓存托管目录：build/platform-<plat>/wheels——构建中间产物归 build/，
-    跨次构建复用（离线优先）；显式 --wheels-dir 仍为纯离线供应商目录语义。"""
-    return os.path.join(project_dir, "build", f"platform-{platform}", "wheels")
+def _wheels_cache(platform: str) -> str:
+    """★v1.4★ wheel 托管缓存全局化：<PKAPP_CACHE|默认托管根>/wheels/<platform>——
+    与工具链同源（toolchain.cache_root），跨项目复用免重复下载；platform 子目录
+    隔离标签集（windows 与 android 交叉 wheel 混判会让离线优先误命中）。平台内
+    多版本 wheel 共存无害（pip 按需求挑）；显式 --wheels-dir 仍为纯离线供应商目录语义。"""
+    return os.path.join(cache_root(), "wheels", platform)
 
 
 def _dep_name(req: str) -> str:
@@ -148,12 +151,62 @@ def _wheel_name(fn: str) -> str:
     return re.sub(r"[-_.]+", "-", fn.split("-", 1)[0]).lower()
 
 
+def _dep_version(req: str) -> str:
+    """需求内联精确版本 pin（applocal==0.1.0 → 0.1.0；extras 语法 foo[x]==1.0 同样
+    识别）；范围（>=/~=/!=）或无 pin 一律返回 ""（文件名无法可靠表达版本区间，
+    退化为按名字判缓存）。"""
+    m = re.match(r"[^=!<>~;[\s]*(?:\[[^\]]*\])?==\s*([^;,\s]+)", req.strip())
+    return m.group(1) if m else ""
+
+
+def _ver_hit(pin: str, cached: set[str]) -> bool:
+    """pin 版本是否命中缓存 wheel 版本集（PEP 440 轻量等价，仅文件名比对用）：
+    大小写/前导 v/分隔符归一；纯数字段版本补零对齐（1.0 == 1.0.0）；含非数字段
+    （预发布/本地段）退化为严格串等；通配 .* 走归一化前缀匹配。"""
+    def norm(v: str) -> str:
+        return v.strip().lower().lstrip("v").replace("-", ".").replace("_", ".")
+
+    if pin.endswith(".*"):
+        pre = norm(pin[:-2])
+        return any(k == pre or k.startswith(pre + ".") for k in map(norm, cached))
+    p = norm(pin)
+    for k in map(norm, cached):
+        sp, sk = p.split("."), k.split(".")
+        if all(x.isdigit() for x in sp + sk):
+            n = max(len(sp), len(sk))
+            if ([int(x) for x in sp + ["0"] * (n - len(sp))]
+                    == [int(x) for x in sk + ["0"] * (n - len(sk))]):
+                return True
+        elif sp == sk:
+            return True
+    return False
+
+
 def _uncached_deps(dep_list: list[str], wheels_dir: str) -> list[str]:
     """download 需求过滤：缓存已有发行版不进补齐（applocal 等私有件不在任何公共
     索引——留在列表里只会让 download 炸掉；先入缓存是它们的唯一入口）。
+    ★v1.4★ 全局共享缓存后升级为“名字+精确版本”匹配：fastapi==0.115.0 须命中
+    fastapi-0.115.0-*.whl 才算已缓存（他项目缓存的 0.110.0 不得误判，否则
+    --no-index 离线安装必炸且无补齐机会）；无精确 pin 的需求按名字。
+    目录不存在时先建（冷启动首跑 <cache_root>/wheels/<plat> 必然缺失——
+    pip 对缺失 --find-links 仅告警，此处裸 listdir 会 FileNotFoundError 绕过补齐）。
     只过滤顶层需求；传递依赖恒在公共索引，不受影响。"""
-    have = {_wheel_name(fn) for fn in os.listdir(wheels_dir) if fn.endswith(".whl")}
-    return [d for d in dep_list if _dep_name(d) not in have]
+    os.makedirs(wheels_dir, exist_ok=True)
+    vers: dict[str, set[str]] = {}
+    for fn in os.listdir(wheels_dir):
+        if fn.endswith(".whl"):
+            name = _wheel_name(fn)
+            parts = fn.split("-")
+            if len(parts) >= 2:
+                vers.setdefault(name, set()).add(parts[1])
+    out = []
+    for d in dep_list:
+        name = _dep_name(d)
+        ver = _dep_version(d)
+        if name in vers and (not ver or _ver_hit(ver, vers[name])):
+            continue
+        out.append(d)
+    return out
 
 
 def _install_site_packages(stage: str, deps: tuple[str, ...],
@@ -212,7 +265,10 @@ def _install_site_packages(stage: str, deps: tuple[str, ...],
                 raise BuildError(
                     "pip install 失败（缓存已含全部顶层需求，无法在线补齐）。"
                     "常见成因：① 缓存缺传递依赖 wheel；② 缓存内有损坏 wheel"
-                    "（文件名在缓存中但解析失败）——删除该 wheel 后重跑触发补齐"
+                    "（文件名在缓存中但解析失败）——删除该 wheel 后重跑触发补齐；"
+                    "③ 缓存内同名包无满足需求的版本（全局缓存他项目所留：范围/无 pin"
+                    " 需求按名字判定）——删除该包全部同名 wheel 或改精确 pin（==x.y.z）"
+                    "后重跑触发补齐"
                     f":\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
         # 可复现性：direct_url.json 含本地 wheel 绝对路径 → 必删（INSTALLER 内容恒定可留）
         for du in glob.glob(os.path.join(sp_dir, "*.dist-info", "direct_url.json")):
@@ -368,10 +424,10 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         pth = "\n".join([f"{stem}.zip", "DLLs", "site-packages", "import site"]) + "\n"
         atomic_write(os.path.join(stage, f"{stem}._pth"), pth.encode("utf-8"))
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）
-        #    wheels_dir 缺省 → 托管缓存（build/platform-windows/wheels，跨次构建离线复用）
+        #    wheels_dir 缺省 → 全局托管缓存（<cache_root>/wheels/windows，跨项目/跨次构建复用）
         index_url, extra_index = spec.wheels_index(platform)
         sp_dir = _install_site_packages(stage, spec.deps_for(platform),
-                                        wheels_dir or _wheels_cache(project_dir, platform),
+                                        wheels_dir or _wheels_cache(platform),
                                         allow_download=wheels_dir is None,
                                         index_url=index_url, extra_index_url=extra_index)
         if not os.path.isdir(os.path.join(sp_dir, "certifi")):
@@ -471,11 +527,11 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     stage = tempfile.mkdtemp(prefix="pkapp-build-android-")
     try:
         # 1) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.android] 追加）
-        #    wheels_dir 缺省 → 托管缓存（build/platform-android/wheels）；交叉安装 +
+        #    wheels_dir 缺省 → 全局托管缓存（<cache_root>/wheels/android）；交叉安装 +
         #    平台 wheel 源（AppSpec [platforms.android].extra_index_url，如 flet 索引）
         index_url, extra_index = spec.wheels_index("android")
         sp_dir = _install_site_packages(stage, spec.deps_for("android"),
-                                        wheels_dir or _wheels_cache(project_dir, "android"),
+                                        wheels_dir or _wheels_cache("android"),
                                         allow_download=wheels_dir is None,
                                         pip_tags=_android_pip_tags(spec),
                                         index_url=index_url, extra_index_url=extra_index)
