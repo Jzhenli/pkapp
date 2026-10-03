@@ -17,3 +17,8 @@ pkapp = "pkapp.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pkapp*"]
+
+# 内置制品（scripts/vendor.py 组装，源缺失时构建照常——代码侧全部容忍缺失）：
+# _vendor/shell/MyApp.exe + WebView2Loader.dll（零编译壳）、_vendor/wheels/*.whl（applocal）
+[tool.setuptools.package-data]
+pkapp = ["_vendor/**/*"]

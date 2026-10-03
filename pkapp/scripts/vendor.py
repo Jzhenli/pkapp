@@ -1,0 +1,50 @@
+"""组装 pkapp 内置制品目录 _vendor/（CI release 与本地同一条命令）。
+
+输入：仓库根 shell-windows/build/MyApp.exe + WebView2Loader.dll（build.bat 产物）
+输出：pkapp/pkapp/_vendor/{shell,wheels}——包内置壳 + applocal 离线 wheel
+（applocal 不在 PyPI，build/create 的零配置入口全靠它）。
+
+用法（仓库根）：先在 shell-windows 跑 build.bat，然后 `python pkapp/scripts/vendor.py`；
+pyproject 的 package-data 已收录 _vendor/**，直接 `python -m build --wheel pkapp` 出制品。
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def main() -> int:
+    shell_build = os.path.join(ROOT, "shell-windows", "build")
+    exe = os.path.join(shell_build, "MyApp.exe")
+    dll = os.path.join(shell_build, "WebView2Loader.dll")
+    for p in (exe, dll):
+        if not os.path.isfile(p):
+            print(f"[vendor] 缺 {p}——先在 shell-windows 跑 build.bat")
+            return 2
+
+    vroot = os.path.join(ROOT, "pkapp", "pkapp", "_vendor")
+    shell_dir = os.path.join(vroot, "shell")
+    wheels_dir = os.path.join(vroot, "wheels")
+    shutil.rmtree(wheels_dir, ignore_errors=True)   # 防旧版本 wheel 滞留
+    os.makedirs(shell_dir, exist_ok=True)
+    os.makedirs(wheels_dir, exist_ok=True)
+    shutil.copyfile(exe, os.path.join(shell_dir, "MyApp.exe"))
+    shutil.copyfile(dll, os.path.join(shell_dir, "WebView2Loader.dll"))
+
+    r = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
+                        "-w", wheels_dir, os.path.join(ROOT, "applocal")])
+    if r.returncode != 0:
+        print("[vendor] applocal wheel 构建失败")
+        return 1
+    n = len([f for f in os.listdir(wheels_dir) if f.endswith(".whl")])
+    print(f"[vendor] OK: _vendor/shell（MyApp.exe + WebView2Loader.dll）"
+          f"+ _vendor/wheels（{n} wheel）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

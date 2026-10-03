@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from ..appspec import SpecError, load
 from ..packager import assemble
@@ -9,6 +10,26 @@ from ..packager import golden as golden_mod
 from ..packager import manifest as mf
 from ..packager import sign
 from ..packager.runtime import RuntimeResolveError
+
+
+def _seed_vendored_wheel(platform: str) -> None:
+    """包内置 applocal wheel 播种托管缓存（wheel 安装形态的零配置入口）。
+
+    applocal 不在 PyPI——托管缓存 allow_download 在线补齐永远装不到它，
+    "先入缓存"是唯一入口（assemble._uncached_deps 剔除语义）。缓存已有
+    applocal 则不覆盖（平台内多版本共存无害，pip 按需求挑）。
+    """
+    from ..vendor import wheels_dir as vendored_wheels
+    src = vendored_wheels()
+    if not src:
+        return
+    cache = assemble._wheels_cache(platform)
+    os.makedirs(cache, exist_ok=True)
+    have = {fn.split("-")[0].lower() for fn in os.listdir(cache) if fn.endswith(".whl")}
+    for fn in os.listdir(src):
+        if fn.endswith(".whl") and fn.split("-")[0].lower() not in have:
+            shutil.copyfile(os.path.join(src, fn), os.path.join(cache, fn))
+            print(f"[build] 内置 wheel 已入托管缓存: {fn}")
 
 
 def cmd_build(project: str, *, platform: str = "windows", key: str | None = None,
@@ -35,9 +56,14 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
             print(f"[build] {e}（dev/test 可 --unsigned 旁路）")
             return 2
         if private_key is None:
-            print("[build] 未找到签名私钥：设 PKAPP_SIGN_KEY / 放置 .pkapp/sign.key / "
-                  "pkapp build --keygen 生成（自用 --unsigned 旁路仅限本机验证）")
-            return 2
+            # 零配置签名：首建自动 keygen 到项目 .pkapp/sign.key（package 公钥补丁
+            # 把分发壳配对到该密钥；配对自检闸门兜底，绝不带病出货）
+            key_dir = os.path.join(os.path.abspath(project), ".pkapp")
+            private_key, pub = sign.generate_keypair(key_dir)
+            print(f"[build] 未找到签名私钥——已自动生成: {private_key}")
+            print(f"[build] 公钥(hex) {pub}")
+
+    _seed_vendored_wheel(platform)
 
     out_dir = os.path.join(project, "build", f"platform-{platform}")
     out_path = os.path.join(out_dir, "runtime.spk")

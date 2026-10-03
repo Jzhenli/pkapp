@@ -126,10 +126,17 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
             return 1
         py = os.path.join(venv_dir, "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
         print("[create] 安装依赖（applocal + uvicorn）…")
-        r = subprocess.run([py, "-m", "pip", "install", "-q",
-                            "applocal>=0.1.0", "uvicorn>=0.30"])
+        cmd = [py, "-m", "pip", "install", "-q", "applocal>=0.1.0", "uvicorn>=0.30"]
+        from ..vendor import wheels_dir as vendored_wheels
+        vw = vendored_wheels()
+        if vw:
+            # applocal 不在 PyPI：wheel 安装形态经内置离线 wheel 命中（其余件照常走索引）
+            cmd += ["--find-links", vw]
+        r = subprocess.run(cmd)
         if r.returncode != 0:
-            print("[create] 依赖安装失败——检查网络/私有索引后重试")
+            print("[create] 依赖安装失败——检查网络/私有索引后重试"
+                  "（applocal 为非 PyPI 私有件：wheel 形态由内置 wheel 命中，"
+                  "源码形态先 pip install -e <仓库>/applocal）")
             return 1
     print("[create] 完成。下一步：\n"
           "  1. pkapp fetch windows  # 托管运行时（唯一网络入口；--from 目录可离线导入）\n"

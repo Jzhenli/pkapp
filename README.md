@@ -33,27 +33,32 @@ pkapp package ─► 交付容器落 <项目>/release/（zip / apk）
 ## 快速上手
 
 ```bat
-:: 安装（仓库根）
-pip install -e applocal
-pip install -e pkapp
+:: 安装（零编译：wheel 已内置 Windows 壳 + applocal 离线 wheel）
+pip install pkapp-*.whl      :: GitHub Release 下载；源码形态见下方「构建前提」
 
 :: 建项目 + 本地开发
 pkapp create myapp
 cd myapp
 pkapp dev          :: 起开发服务，浏览器直连
 
-:: 托管工具链（唯一网络入口；--from 目录可离线导入）
+:: 打包出交付物（私钥缺失自动生成，壳公钥自动配对项目密钥）
 pkapp fetch windows
 pkapp build windows
-pkapp package windows   :: 产物：release\myapp-0.1.0-windows-x86_64.zip
+pkapp package windows   :: 产物：release\myapp-0.1.0-windows-x86_64.zip，双击即用
 ```
 
 **构建前提**：项目 `pkapp.toml` 的 `[platforms.windows].python_version` 声明运行时意图
 （create 模板已内置），`pkapp fetch windows` 把 PBS CPython 快照下载进托管缓存
-（PKAPP_CACHE / %LOCALAPPDATA%/pkapp；build 不隐式联网）。Android 打包另需
-`pkapp fetch android`（JDK17 + Gradle 8.9 + SDK 35 + NDK 27 + py-android 运行时），
+（PKAPP_CACHE / %LOCALAPPDATA%/pkapp；build 不隐式联网）。applocal 不在 PyPI——
+wheel 安装形态由内置离线 wheel 命中；源码形态先 `pip install -e applocal && pip install -e pkapp`。
+Android 打包另需 `pkapp fetch android`（JDK17 + Gradle 8.9 + SDK 35 + NDK 27 + py-android 运行时），
 或设 `PKAPP_ANDROID_TOOLCHAIN` 指向手工布置的整体根，
 布局约定见 [shell-android/README.md](shell-android/README.md)。
+
+**发布制品**（[.github/workflows/release.yml](.github/workflows/release.yml)）：tag 推送
+自动构建 pkapp wheel（内置 Windows 壳 + applocal wheel）发 GitHub Release；
+本机自建同一条路：`shell-windows\build.bat` → `python pkapp/scripts/vendor.py` →
+`python -m build --wheel pkapp`。
 
 **GitHub 直连不稳时**用 `PKAPP_MIRROR_*` 前缀替换镜像（值为「镜像地址 + 原始前缀」
 拼接段，注意 gh-proxy 类要带完整 `https://github.com` 尾巴）：
@@ -69,8 +74,9 @@ pkapp fetch windows
 **最小示例**：[examples/helloworld](examples/helloworld/) —— 纯 ASGI + 一次性握手鉴权
 + 前端自检页的完整打包样例。
 
-**安全模型**：spk 用 Ed25519 签名，验签公钥烧进壳；`pkapp create` 生成项目级
-`.pkapp/sign.key`（已默认进 .gitignore，绝不入库）。壳默认严格鉴权
+**安全模型**：spk 用 Ed25519 签名，验签公钥烧进壳；`pkapp build` 首次构建自动生成
+项目级 `.pkapp/sign.key`（已默认进 .gitignore，绝不入库）。包内置壳在 package 时
+原位补丁内置公钥与项目密钥配对（配对自检闸门兜底，验不过不出货）。壳默认严格鉴权
 （握手码一次性换取 token，API 调用带 `x-myapp-token`）。
 
 ## 测试

@@ -1,0 +1,38 @@
+name: release
+# pkapp 发布制品：包内置壳（零编译壳）+ applocal 离线 wheel + pkapp wheel。
+# tag 推送（v*）→ GitHub Release；workflow_dispatch → 仅出 artifact 供试用。
+# 产物使用：pip install pkapp-*.whl 后 create/build/package 全链路零编译零手工 wheel。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # softprops/action-gh-release 创建 Release 需要写权限
+
+jobs:
+  pkapp-wheel:
+    runs-on: windows-latest      # 壳是 MSVC /MT 产物，构建机须带 VS2022 C++ 工具链
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build Windows shell (build.bat)
+        working-directory: shell-windows
+        run: .\build.bat
+      - name: Vendor _vendor (shell + applocal wheel)
+        run: python pkapp/scripts/vendor.py
+      - name: Build pkapp wheel
+        run: |
+          python -m pip install -q build
+          python -m build --wheel pkapp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkapp-wheel
+          path: pkapp/dist/*.whl
+      - name: Publish to GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pkapp/dist/*.whl
