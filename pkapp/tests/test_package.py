@@ -53,6 +53,27 @@ def test_package_android_requires_spk(tmp_path, capsys):
     assert "先 pkapp build android" in capsys.readouterr().out
 
 
+def test_find_rcedit_fallback_chain(tmp_path, monkeypatch):
+    """_find_rcedit 查找序：--rcedit > PKAPP_RCEDIT > 托管缓存 > PATH；
+    PINS 无 rcedit pin 时 ToolchainError 被接住降级 PATH（不崩，可选增强契约）。"""
+    from pkapp import toolchain
+    from pkapp.commands.package import _find_rcedit
+
+    monkeypatch.setenv("PKAPP_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv("PKAPP_RCEDIT", raising=False)
+    exe = tmp_path / "my-rcedit.exe"
+    exe.write_bytes(b"MZ")
+    assert _find_rcedit(str(exe)) == str(exe)            # 显式文件优先
+
+    managed = toolchain.rcedit_path()                    # 托管缓存命中
+    os.makedirs(os.path.dirname(managed), exist_ok=True)
+    shutil.copyfile(exe, managed)
+    assert _find_rcedit(None) == managed
+
+    monkeypatch.setattr(toolchain, "PINS", ())           # pin 缺失 → 接住降级
+    assert _find_rcedit(None) == (shutil.which("rcedit") or shutil.which("rcedit-x64"))
+
+
 def _add_android_package(proj):
     """android 组装前置：[platforms.android].package（★v1.2★ 起必填 = applicationId）。
     新模板平台段已实体化 → 精准替换注释行（追加会产生重复 TOML 表）。"""

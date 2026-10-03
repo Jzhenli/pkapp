@@ -400,10 +400,38 @@ def test_fetch_from_dir_offline(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- 路径推导（真 PINS）
+def test_fetch_file_kind_bare_tool(tmp_path, monkeypatch, capsys):
+    """kind=file（裸 exe 工具，rcedit 形态）：下载直拷落位不解压 + snapshot 记账 + 幂等。"""
+    monkeypatch.setenv("PKAPP_CACHE", str(tmp_path / "cache"))
+    exe = tmp_path / "rcedit-x64.exe"
+    exe.write_bytes(b"MZ-fake-rcedit")
+    sha = _sha(str(exe))
+    pins = (Pin(id="rcedit", platform="windows", filename="rcedit-x64.exe",
+                urls=("https://example.test/rcedit-x64.exe",), sha256=sha,
+                kind="file", dest_parent="tools"),)
+    monkeypatch.setattr(toolchain, "PINS", pins)
+    assert toolchain.fetch("windows", fetcher=_fetcher_by_name(
+        {"rcedit-x64.exe": str(exe)})) == 0
+    dest = tmp_path / "cache" / "tools" / "rcedit-x64.exe"
+    assert dest.read_bytes() == b"MZ-fake-rcedit"
+    snap = tomllib.load(open(tmp_path / "cache" / "tools" / "snapshot.toml", "rb"))
+    assert snap["pins"]["rcedit"]["sha256"] == sha
+    assert "已就位" not in capsys.readouterr().out
+
+    def boom(url, part):                                 # 第二跑零下载
+        raise AssertionError("should not download")
+
+    assert toolchain.fetch("windows", fetcher=boom) == 0
+    assert capsys.readouterr().out.count("已就位") == 1
+
+
 def test_managed_runtime_dir_and_android_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("PKAPP_CACHE", str(tmp_path / "cache"))
     assert toolchain.managed_runtime_dir("windows") == \
         str(tmp_path / "cache" / "runtimes" / "pbs-cpython-3.12.14+20260929")
+    # rcedit 裸文件 pin：路径推导契约（package 侧 _find_rcedit 同源）
+    assert toolchain.rcedit_path() == \
+        str(tmp_path / "cache" / "tools" / "rcedit-x64.exe")
     assert toolchain.managed_runtime_dir("android") == \
         str(tmp_path / "cache" / "runtimes" / "py-android-3.12.14")
     ap = toolchain.android_paths()

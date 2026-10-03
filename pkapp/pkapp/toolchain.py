@@ -53,7 +53,7 @@ class Pin:
     filename: str
     urls: tuple              # 主源在前；镜像经 PKAPP_MIRROR_* 前缀替换
     sha256: str              # "" = 未核定（仅 TLS + 打印实测哈希）
-    kind: str                # zip | tar.gz
+    kind: str                # zip | tar.gz | file（裸文件直落，不解压）
     dest_parent: str         # 相对 cache_root 的落盘父目录（/ 分隔）
     inner_rename: str = ""   # 内层目录重命名目标；"" = 保留内层名
     rootless: bool = False   # tar 包根即文件本体（py-android），直接解入 dest_parent
@@ -68,6 +68,12 @@ PINS: tuple[Pin, ...] = (
         sha256="f38e68f4d612ade6dd50c894fc80b14c0be0c3b5201145d6fff5f20b9323204d",
         kind="tar.gz", dest_parent="runtimes",
         inner_rename="pbs-cpython-3.12.14+20260929"),
+    # ---- windows 资源工具（package windows 改图标/版本资源；裸 exe 直落 tools/，不解压）----
+    Pin(id="rcedit", platform="windows",
+        filename="rcedit-x64.exe",
+        urls=("https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe",),
+        sha256="3e7801db1a5edbec91b49a24a094aad776cb4515488ea5a4ca2289c400eade2a",
+        kind="file", dest_parent="tools"),
     # ---- android 工具链 ----
     Pin(id="jdk17", platform="android",
         filename="jdk17.zip",
@@ -180,6 +186,14 @@ def managed_runtime_dir(platform: str, root: str | None = None) -> str:
                                     *_split(os.path.dirname(p.dest_parent)))
             return installed_dir(p, root)
     raise ToolchainError(f"平台无托管运行时 pin: {platform}")
+
+
+def rcedit_path(root: str | None = None) -> str:
+    """托管 rcedit 裸文件路径（按 pin id 锁定，fetch 未跑时文件不存在）。"""
+    for p in PINS:
+        if p.id == "rcedit":
+            return os.path.join(root or cache_root(), *_split(p.dest_parent), p.filename)
+    raise ToolchainError("PINS 无 rcedit pin")
 
 
 def android_paths(root: str | None = None) -> dict:
@@ -443,6 +457,18 @@ def _download_all(pins: tuple[Pin, ...] | list[Pin], dl_dir: str, fetcher) -> No
 def _install(pin: Pin, dl_dir: str, base: str) -> None:
     archive = os.path.join(dl_dir, pin.filename)
     sha = pin.sha256 or _sha256_file(archive)
+    if pin.kind == "file":
+        # 裸文件（rcedit 等单 exe 工具）：dl/ 直拷落位，无解压无内层概念
+        dest = os.path.join(base, *_split(pin.dest_parent), pin.filename)
+        snap = os.path.join(os.path.dirname(dest), "snapshot.toml")
+        if os.path.isfile(dest) and _snap_has(snap, pin, sha):
+            print(f"[fetch] {pin.id} 已就位（跳过）")
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(archive, dest)
+        _snap_write(snap, pin, sha)
+        print(f"[fetch] {pin.id} → {dest}")
+        return
     if pin.rootless:
         # tar 包根即文件本体（./libpython3.12.so …）——直接解入 <dest_parent>，
         # snapshot.toml 写共享父目录（py-android 两 abi 同源）

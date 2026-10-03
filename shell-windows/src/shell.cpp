@@ -892,14 +892,24 @@ static int dpi_scaled(int dip, UINT dpi) { return MulDiv(dip, (int)dpi, 96); }
 static void ensure_window(void) {
     if (g_hwnd) return;
     UINT dpi = GetDpiForSystem();
-    WNDCLASSW wc;
+    WNDCLASSEXW wc;
     memset(&wc, 0, sizeof(wc));
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = GetModuleHandleW(NULL);
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = g_class.c_str();
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    RegisterClassW(&wc);
+    /* 窗口/任务栏图标：从 exe 自身资源取首个图标组（rcedit --set-icon 写入后即
+       生效，资源 ID 无关）；裸壳无图标资源时 hIcon 为 NULL，行为同旧版。 */
+    HICON icon_big = NULL, icon_small = NULL;
+    WCHAR exe_path[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exe_path, MAX_PATH) &&
+        ExtractIconExW(exe_path, 0, &icon_big, &icon_small, 1) > 0) {
+        wc.hIcon = icon_big ? icon_big : icon_small;
+        wc.hIconSm = icon_small ? icon_small : icon_big;
+    }
+    RegisterClassExW(&wc);
     g_hwnd = CreateWindowExW(0, g_class.c_str(), g_title.c_str(), WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, dpi_scaled(1280, dpi),
                              dpi_scaled(800, dpi), NULL, NULL, wc.hInstance, NULL);

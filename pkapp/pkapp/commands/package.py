@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import zipfile
 
+from .. import toolchain
 from ..appspec import SpecError, load
 from ..packager.apk import ApkError, artifact_name, build_apk
 
@@ -38,12 +39,18 @@ def _find_shell(explicit: str | None) -> str | None:
 
 
 def _find_rcedit(explicit: str | None) -> str | None:
-    """rcedit 定位：--rcedit / PKAPP_RCEDIT / PATH（可选增强，缺省跳过资源修改）。"""
+    """rcedit 定位：--rcedit / PKAPP_RCEDIT / 托管缓存（pkapp fetch windows）/ PATH。"""
     if explicit:
         return explicit if os.path.isfile(explicit) else None
     env = os.environ.get("PKAPP_RCEDIT")
     if env and os.path.isfile(env):
         return env
+    try:
+        managed = toolchain.rcedit_path()
+    except toolchain.ToolchainError:      # PINS 无 rcedit pin（防御）：走 PATH 降级
+        managed = ""
+    if managed and os.path.isfile(managed):
+        return managed
     return shutil.which("rcedit") or shutil.which("rcedit-x64")
 
 
@@ -141,7 +148,7 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
         print(f"[package] rcedit 资源已更新（icon={bool(icon)} desc/版本={version}）")
     else:
         print("[package] 未找到 rcedit（可选增强）：图标/版本资源未改；"
-              "可设 PKAPP_RCEDIT 或 --rcedit 重跑")
+              "运行 `pkapp fetch windows` 或设 PKAPP_RCEDIT / --rcedit 后重跑")
 
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
     os.makedirs(out_dir, exist_ok=True)
