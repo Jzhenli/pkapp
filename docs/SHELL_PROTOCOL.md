@@ -139,6 +139,10 @@ $ python.exe -I -c "import sys; print(sys.path)"
   首拍即成功 → ready 与服务可用同秒点亮；此前先 sleep(interval) 会让壳首帧
   导航固定白等一整个 interval（Windows 实测 ~5s）。首拍失败仅计 fails=1，
   下一拍成功走抖动恢复清记录，无误报。
+  ★v1.4★ 首拍竞速窗口（android 实测）：uvicorn 线程在子线程 bind→listen，
+  listen 可能晚于主线程首拍 → ECONNREFUSED。seq=0 且开跑 2s 内失败按 0.25s
+  快速重试、不计 fails 不落 diag（是启动竞速不是健康故障）；窗口内成功或窗口
+  过后恢复 interval 节奏。Android 真机实测：ready 白等 5s → ~0.5s。
 ```
 理由：只有 uvicorn 所在进程能真实探测 uvicorn 是否还在服务；`is_alive()` 类判断对死锁 hang 无效。
 

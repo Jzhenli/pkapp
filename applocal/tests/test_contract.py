@@ -356,7 +356,8 @@ def test_heartbeat_writes_diag_on_failure(env):
     ready = env / "cache" / "ready"
     free = _core.pick_port(0)
     applocal.start_heartbeat(free, _cfg(env, strict=False),
-                             interval=0.05, timeout=0.2)             # 无服务监听 → 必失败
+                             interval=0.05, timeout=0.2,
+                             ramp=0)                                 # 无服务监听 → 必失败（绕过首拍竞速窗口）
     time.sleep(0.6)
     d = applocal.read_diag()
     assert "healthz" in d.get("error", "") and d["stage"] == "runtime"  # 失败可观测（§6）
@@ -520,7 +521,8 @@ def test_heartbeat_survives_non_oserror(env, monkeypatch):
         raise http.client.BadStatusLine("garbage")                    # 非 OSError 子类
 
     monkeypatch.setattr(_core, "_OPENER", _FakeOpener(fn=boom))
-    t = applocal.start_heartbeat(12345, _cfg(env, strict=False), interval=0.02, timeout=0.2)
+    t = applocal.start_heartbeat(12345, _cfg(env, strict=False), interval=0.02,
+                                 timeout=0.2, ramp=0)   # 非竞速期：连拍失败 → diag
     time.sleep(0.3)
     assert t.is_alive()                                               # 心跳线程不得被非 OSError 打死
     assert "healthz" in applocal.read_diag().get("error", "")
@@ -549,12 +551,36 @@ def test_healthz_diag_cleared_on_recovery(env, monkeypatch):
     _core.diag("runtime", "healthz probe failed 2x (port 1)", detail="simulated")
     monkeypatch.setattr(_core, "_OPENER", _FakeOpener(fn=flaky))
     ready = env / "cache" / "ready"
-    applocal.start_heartbeat(1, _cfg(env, strict=False), interval=0.02, timeout=0.2)
+    applocal.start_heartbeat(1, _cfg(env, strict=False), interval=0.02,
+                             timeout=0.2, ramp=0)   # 非竞速期：前两拍失败 → diag → 恢复清除
     deadline = time.time() + 3
     while not ready.exists() and time.time() < deadline:
         time.sleep(0.02)
     assert ready.exists()                                             # 抖动恢复成功
     assert not (env / "cache" / "diag.json").exists()                 # 过期失败记录已清（§9）
+
+
+def test_first_beat_race_ramp(env, monkeypatch):
+    """★首拍竞速窗口★（android 实测：uvicorn 线程 listen 晚于首拍 → ECONNREFUSED）：
+    窗口内 0.25s 快速重试、不计 fails 不落 diag；listen 就绪后 ready 立即点亮（非整拍白等）。"""
+    calls = {"n": 0}
+
+    def flaky(url, timeout=None):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise OSError("conn refused")                             # 模拟 listen 未就绪
+        return _Resp()
+
+    monkeypatch.setattr(_core, "_OPENER", _FakeOpener(fn=flaky))
+    ready = env / "cache" / "ready"
+    applocal.start_heartbeat(1, _cfg(env, strict=False), interval=5.0, timeout=0.2)
+    deadline = time.time() + 3
+    while not ready.exists() and time.time() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()                                             # 0.25s 步进重试即点亮
+    assert json.loads(ready.read_text())["seq"] == 1
+    assert not (env / "cache" / "diag.json").exists()                 # 竞速期失败不算健康故障
+    # 不断言精确探测次数：全量跑时其它用例遗留的 daemon 心跳线程会共用本用例的假 opener
 
 
 def _fake_uvicorn(monkeypatch, captured):

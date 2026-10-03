@@ -292,12 +292,16 @@ def build_asgi_app(user_app, cfg: Cfg | None = None, *,
 
 # ---------------------------------------------------------------- 心跳
 def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
-                    timeout: float = 2.0) -> threading.Thread:
+                    timeout: float = 2.0, ramp: float = 2.0) -> threading.Thread:
     """探测式心跳（§6）：真实请求 /healthz，成功才 seq+=1 并原子写 ready；失败不 touch。
 
     首拍立即探测（其后每 interval 秒一拍）：服务器已在 bootstrap 内绑定并接受连接，
     首拍即成功 → ready 在服务可用的同一秒点亮；否则壳首帧导航要白等一整个 interval。
-    首拍失败仅计 fails=1（连续 2 拍才落 diag），下一拍成功即走抖动恢复清记录。"""
+    首拍失败仅计 fails=1（连续 2 拍才落 diag），下一拍成功即走抖动恢复清记录。
+
+    ★首拍竞速窗口★（android 实测：uvicorn 线程在子线程里 bind→listen，慢于主线程的
+    首拍 → ECONNREFUSED → 白等一整拍 5s）：seq=0 且开跑 2s 内失败按 0.25s 快速重试、
+    不计 fails（是启动竞速不是健康故障）；窗口过后回到 interval 节奏并恢复 fails 语义。"""
     cfg = cfg or _env.load_env()
     ready = cfg.paths.ready_file
     state = {"seq": 0}
@@ -305,9 +309,11 @@ def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
     def _beat():
         fails = 0
         first = True
+        ramp_until = time.monotonic() + ramp
         while True:
-            if not first:                  # 首拍立即；其后（含失败路径）每 interval 秒一拍
-                time.sleep(interval)
+            if not first:                  # 首拍立即；窗口内未成功按 0.25s 重试，其余每 interval 一拍
+                time.sleep(0.25 if state["seq"] == 0
+                           and time.monotonic() < ramp_until else interval)
             first = False
             try:
                 with _get_opener().open(f"http://127.0.0.1:{port}/healthz",
@@ -318,6 +324,8 @@ def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
                 # 必须捕 Exception：http.client.HTTPException（BadStatusLine 等）不是 OSError 子类，
                 # 漏掉会让心跳线程静默死亡 → ready 永不再更新 → 壳 30s 误判死
             if not ok:
+                if state["seq"] == 0 and time.monotonic() < ramp_until:
+                    continue               # 首跳竞速期：uvicorn 尚未 listen，不算健康故障
                 fails += 1
                 if fails == 2:  # 连续 2 拍失败 → 写一次 diag 供错误页显示（此后不刷盘）
                     try:
