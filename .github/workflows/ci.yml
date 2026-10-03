@@ -14,13 +14,16 @@ jobs:
         os: [windows-latest]        # 自用主开发环境；后续可加 ubuntu
         python: ["3.11", "3.12"]
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"               # runner 默认 cp1252，中文测试输出统一 UTF-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install applocal + pkapp
+      - name: Install applocal + pkapp + pytest
         run: |
+          python -m pip install pytest -q
           python -m pip install -e applocal -q
           python -m pip install -e pkapp -q
       - name: applocal 契约测试（协议 A §12.1）
