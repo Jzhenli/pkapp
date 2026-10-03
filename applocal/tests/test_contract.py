@@ -358,8 +358,13 @@ def test_heartbeat_writes_diag_on_failure(env):
     applocal.start_heartbeat(free, _cfg(env, strict=False),
                              interval=0.05, timeout=0.2,
                              ramp=0)                                 # 无服务监听 → 必失败（绕过首拍竞速窗口）
-    time.sleep(0.6)
-    d = applocal.read_diag()
+    deadline = time.time() + 3    # CI 慢机：两次探测可各挂满 timeout=0.2s + 线程调度延迟，
+    d = {}              # 固定 sleep(0.6) 会踩空 → 轮询等 diag 落盘（测试只关心可观测性，不卡时序）
+    while time.time() < deadline:
+        d = applocal.read_diag()
+        if d.get("stage") == "runtime" and "healthz" in d.get("error", ""):
+            break
+        time.sleep(0.05)
     assert "healthz" in d.get("error", "") and d["stage"] == "runtime"  # 失败可观测（§6）
     assert not ready.exists()                                        # 失败不 touch ready
 
