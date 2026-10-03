@@ -8,7 +8,7 @@ def test_create_scaffold(tmp_path):
     root = str(tmp_path / "demo")
     assert cmd_create("demo", root, no_venv=True) == 0
     for rel in ("pkapp.toml", ".gitignore",
-                "app/__init__.py", "app/main.py", "dist/index.html"):
+                "app/__init__.py", "app/main.py", "ui/index.html"):
         assert os.path.isfile(os.path.join(root, rel)), rel
     assert not os.path.exists(os.path.join(root, "runtime.lock"))  # ★fetch★ 退役
     toml = open(os.path.join(root, "pkapp.toml"), encoding="utf-8").read()

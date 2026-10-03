@@ -24,7 +24,7 @@ def sha256_file(path: str) -> str:
 def walk_files(root: str, excludes: tuple[str, ...] = ()) -> list[str]:
     """root 下全部文件的相对路径（'/' 分隔，UTF-8 字节序排序）。
 
-    excludes 只剪 **root 顶层** 目录名（如 ("app", "dist")）——不做全层级匹配，
+    excludes 只剪 **root 顶层** 目录名（如 ("app", "ui")）——不做全层级匹配，
     防止误伤 site-packages 内同名深层目录。
     """
     out: list[str] = []

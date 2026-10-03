@@ -29,7 +29,7 @@ timeout_s = 30
 cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap 返回）
 
 [dist]
-dir = "dist"                   # 前端产物目录（恒存在；空缺时 build 生成占位页）
+dir = "ui"                     # 前端产物目录（恒存在；空缺时 build 生成占位页）
 
 # 平台段（参考 XAgent pyproject 设计）：依赖追加式合并（公共 + 平台），未知段名/未知键报错。
 [platforms.windows]
@@ -79,7 +79,7 @@ _InitPy = '"""用户后端 import 根（packager 永不写入 app/，协议 B §
 _IndexHtml = """\
 <!doctype html>
 <html><head><meta charset="utf-8"><title>{name}</title></head>
-<body><h1>{name}</h1><p>前端占位页（dist 恒存在；SPA 路由兜底与 index.html no-store
+<body><h1>{name}</h1><p>前端占位页（ui 恒存在；SPA 路由兜底与 index.html no-store
 由 applocal 静态分支处理，SHELL_PROTOCOL §8）。</p></body></html>
 """
 
@@ -88,9 +88,12 @@ _Gitignore = """\
 .dev/
 build/
 release/
+install-test/
 .pkapp/
 __pycache__/
 *.pyc
+node_modules/
+ui/
 """
 
 
@@ -105,12 +108,12 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
         return 2
 
     os.makedirs(os.path.join(root, "app"), exist_ok=True)
-    os.makedirs(os.path.join(root, "dist"), exist_ok=True)
+    os.makedirs(os.path.join(root, "ui"), exist_ok=True)
     atomic_write(os.path.join(root, "pkapp.toml"), _PkappToml.format(name=name).encode())
     atomic_write(os.path.join(root, ".gitignore"), _Gitignore.encode())
     atomic_write(os.path.join(root, "app", "__init__.py"), _InitPy.encode())
     atomic_write(os.path.join(root, "app", "main.py"), _MainPy.encode())
-    atomic_write(os.path.join(root, "dist", "index.html"),
+    atomic_write(os.path.join(root, "ui", "index.html"),
                  _IndexHtml.format(name=name).encode())
     print(f"[create] 项目骨架就绪: {root}")
 

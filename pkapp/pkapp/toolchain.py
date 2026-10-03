@@ -16,6 +16,7 @@ import hashlib
 import http.client
 import os
 import shutil
+import sys
 import tarfile
 import time
 import urllib.request
@@ -78,12 +79,15 @@ PINS: tuple[Pin, ...] = (
     Pin(id="jdk17", platform="android",
         filename="jdk17.zip",
         urls=("https://github.com/adoptium/temurin17-binaries/releases/"
-              "download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip",),
+              "download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip",
+              "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/windows/"
+              "OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip"),
         sha256="e53a79c3c3d86865bd7e787903884331068e71321714ffd44f145785affc7cb0",
         kind="zip", dest_parent="android/jdk", inner_rename="jdk-17.0.20.1+1"),
     Pin(id="gradle-8.9", platform="android",
         filename="gradle-8.9-bin.zip",
-        urls=("https://services.gradle.org/distributions/gradle-8.9-bin.zip",),
+        urls=("https://services.gradle.org/distributions/gradle-8.9-bin.zip",
+              "https://mirrors.cloud.tencent.com/gradle/gradle-8.9-bin.zip"),
         sha256="d725d707bfabd4dfdc958c624003b3c80accc03f7037b5122c4b1d0ef15cecab",
         kind="zip", dest_parent="android", inner_rename="gradle-8.9"),
     # google 四包：repository2-3.xml 无 sha256 元数据 → ""（首下打印实测哈希，人工回填闭环）
@@ -218,9 +222,13 @@ def _sha256_file(path: str) -> str:
 
 
 def _urllib_fetch(url: str, part: str, progress: bool = True) -> None:
-    """默认下载器（可被注入替换——测试零联网）。并发模式关 progress（多线程 \r 行会交错）。"""
+    """默认下载器（可被注入替换——测试零联网）。并发模式关 progress（多线程 \r 行会交错）。
+    timeout=60：socket 级 per-recv 超时——零进度吊死（国内外源常见）60s 内抛超时换源。
+    ★progress 仅 TTY 生效★：\r 进度行打到重定向输出（管道/文件）会撑满管道缓冲，
+    print(flush=True) 反压死锁下载线程（连 recv 超时都轮不到触发）——非 TTY 一律关。"""
+    progress = progress and sys.stdout.isatty()
     req = urllib.request.Request(url, headers={"User-Agent": f"pkapp/{_pkapp_version()}"})
-    with urllib.request.urlopen(req) as r, open(part, "wb") as f:
+    with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         done = 0
         while True:
@@ -249,34 +257,39 @@ def download(pin: Pin, dl_dir: str, fetcher=None, progress: bool = True) -> str:
             return final
         print(f"[fetch] {pin.filename} 缓存哈希不符（重下）")
     part = final + ".part"
-    url = apply_mirror(pin.urls[0])
-    print(f"[fetch] 下载 {pin.filename}\n        {url}")
-    if fetcher is None:
-        fetcher = lambda u, p: _urllib_fetch(u, p, progress=progress)   # noqa: E731
-    try:
-        fetcher(url, part)
-    except ToolchainError:
-        if os.path.isfile(part):
+    # 多源 fallback：urls[0] 主源在前，失败（网络/超时/哈希不符）自动换下一镜像源；
+    # 全部失败抛最后一个错误。PKAPP_MIRROR_* 前缀替换仍作用于每个 url。
+    last_err: Exception | None = None
+    for i, raw_url in enumerate(pin.urls):
+        url = apply_mirror(raw_url)
+        print(f"[fetch] 下载 {pin.filename}（源 {i + 1}/{len(pin.urls)}）\n        {url}")
+        if fetcher is None:
+            fetcher = lambda u, p: _urllib_fetch(u, p, progress=progress)   # noqa: E731
+        try:
+            fetcher(url, part)
+        except ToolchainError as e:
+            last_err = e
+            if os.path.isfile(part):
+                os.remove(part)
+            continue
+        except (OSError, http.client.HTTPException) as e:
+            # URLError/连接重置/超时/IncompleteRead 等（.part 不留半件）
+            last_err = ToolchainError(f"下载失败 {url}: {e}")
+            if os.path.isfile(part):
+                os.remove(part)
+            continue
+        got = _sha256_file(part)
+        if pin.sha256 and got != pin.sha256:
             os.remove(part)
-        raise
-    except OSError as e:      # URLError/连接重置等（.part 不留半件）
-        if os.path.isfile(part):
-            os.remove(part)
-        raise ToolchainError(f"下载失败 {url}: {e}") from e
-    except http.client.HTTPException as e:   # IncompleteRead 非 OSError 子类，同样不留半件
-        if os.path.isfile(part):
-            os.remove(part)
-        raise ToolchainError(f"下载失败 {url}: {e}") from e
-    got = _sha256_file(part)
-    if pin.sha256 and got != pin.sha256:
-        os.remove(part)
-        raise ToolchainError(f"{pin.filename} sha256 校验失败：期望 {pin.sha256}，实得 {got}"
-                             "（网络劫持/镜像陈旧？可换 PKAPP_MIRROR_* 或 --from 离线导入）")
-    if not pin.sha256:
-        print(f"[fetch] 注意：{pin.id} 无基准 sha256（PINS 未核定），实测 = {got}\n"
-              f"        请回填 pkapp/toolchain.py PINS 表后重新分发")
-    os.replace(part, final)
-    return final
+            last_err = ToolchainError(f"{pin.filename} sha256 校验失败（源 {i + 1}）：期望 "
+                                      f"{pin.sha256}，实得 {got}（网络劫持/镜像陈旧？）")
+            continue
+        if not pin.sha256:
+            print(f"[fetch] 注意：{pin.id} 无基准 sha256（PINS 未核定），实测 = {got}\n"
+                  f"        请回填 pkapp/toolchain.py PINS 表后重新分发")
+        os.replace(part, final)
+        return final
+    raise last_err or ToolchainError(f"{pin.filename} 所有源均失败")
 
 
 def import_from_dir(src_dir: str, dl_dir: str, pins: tuple[Pin, ...]) -> list[str]:

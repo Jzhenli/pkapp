@@ -3,8 +3,9 @@
 ★v8.4★ 取代原 ship 成为三平台统一终产物命令；中间产物（spk）归 build，
 本命令只做"壳 + spk → 交付容器"，产物统一落 <project>/release/。
 
-windows（模式 A）：预编译壳 + spk 组装三件套到 build/ship-windows/（rcedit 可选
-增强），配对自检闸门通过后打 zip（内含 <name>/ 一层目录）到 release/。
+windows（模式 A）：预编译壳 + spk 组装三件套到一次性 staging（build/staging-windows/，
+rcedit 可选增强），配对自检闸门通过后打 zip（内含 <name>/ 一层目录）到 release/，
+staging 成功即焚毁；失败保留现场（错误信息指向该目录）。
 模式 A（单一发布密钥）：壳内置公钥 = 发布密钥公钥，全项目共用一个预编译壳；
 每项目零编译：复制壳改名 + 放 <stem>.spk + （可选）rcedit 改图标/版本资源。
 项目若误用 --keygen 项目密钥签名，通用壳验不过——出货前用壳的 --selftest-spk
@@ -133,8 +134,11 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
             print(f"  壳输出: {detail}")
         return 2
 
-    # 组装区（中间产物）：build/ship-windows/；release/ 只放终产物 zip
-    stage = os.path.join(project, "build", "ship-windows")
+    # 一次性组装 staging：build/staging-windows/——壳是共用预编译件，rcedit 改资源
+    # 必须在副本上做；staging 成功打 zip 后即焚毁（release/ 只放终产物 zip），
+    # 失败保留现场（错误信息指向该目录），下次 package 先清残留。
+    stage = os.path.join(project, "build", "staging-windows")
+    shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage, exist_ok=True)
     exe_path = os.path.join(stage, f"{name}.exe")
     shutil.copyfile(shell_exe, exe_path)
@@ -144,6 +148,7 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
     rc_tool = _find_rcedit(rcedit)
     if rc_tool:
         if _rcedit_apply(rc_tool, exe_path, icon, desc or name, version) != 0:
+            print(f"[package] 组装 staging 保留现场: {stage}")
             return 1
         print(f"[package] rcedit 资源已更新（icon={bool(icon)} desc/版本={version}）")
     else:
@@ -159,10 +164,14 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
             zf.write(os.path.join(stage, f), arcname=f"{name}/{f}")
     os.replace(zip_tmp, zip_path)
 
+    sizes = [(f, os.path.getsize(os.path.join(stage, f)))
+             for f in (f"{name}.exe", f"{name}.spk", "WebView2Loader.dll")]
+    shutil.rmtree(stage, ignore_errors=True)   # 成功即焚：staging 只服务本次组装
+
     print(f"[package] {zip_path}  ({os.path.getsize(zip_path):,} B)")
-    for f in (f"{name}.exe", f"{name}.spk", "WebView2Loader.dll"):
-        print(f"  {name}/{f}  ({os.path.getsize(os.path.join(stage, f)):,} B)")
-    print(f"[package] 组装区: {stage}（运行时身份随 exe 文件名派生：数据目录 %LOCALAPPDATA%\\{name}）")
+    for f, sz in sizes:
+        print(f"  {name}/{f}  ({sz:,} B)")
+    print(f"[package] 运行时身份随 exe 文件名派生：数据目录 %LOCALAPPDATA%\\{name}")
     return 0
 
 

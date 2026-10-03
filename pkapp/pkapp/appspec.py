@@ -23,7 +23,8 @@ _PYVER_RE = re.compile(r"^3\.\d+\.\d+$")
 
 # 平台段白名单：未知键报错（同 [network] 精神——拼写错误静默丢弃 = 配置悄悄失效，B.w 兜住）
 _PLAT_KEYS = {"dependencies", "icon", "setproctitle", "package", "abis",
-              "keystore", "python_version", "runtime_dir"}
+              "keystore", "python_version", "runtime_dir",
+              "index_url", "extra_index_url"}
 
 
 class SpecError(ValueError):
@@ -91,12 +92,20 @@ class AppSpec:
     android_runtime_dir: str = ""        # [platforms.android].runtime_dir
     platform_deps: dict = field(default_factory=dict)   # [platforms.*].dependencies（追加式，不含公共）
     platform_icon: str = ""              # [platforms.windows].icon → ship 图标默认值
+    platform_index: dict = field(default_factory=dict)        # [platforms.*].index_url（主源；缺省 PyPI）
+    platform_extra_index: dict = field(default_factory=dict)  # [platforms.*].extra_index_url（补充源，如 flet）
     network: NetworkSpec = field(default_factory=NetworkSpec)  # [network] 段（§5）
     raw: dict = field(default_factory=dict, repr=False, compare=False)
 
     def deps_for(self, platform: str) -> tuple[str, ...]:
         """构建依赖 = 公共 [dependencies].python + 平台段追加（同包约束由 pip 合并）。"""
         return self.dependencies + self.platform_deps.get(platform, ())
+
+    def wheels_index(self, platform: str) -> tuple[str, str]:
+        """平台 wheel 源 (index_url, extra_index_url)；缺省 ("", "") = 不传 pip、
+        尊重本机 pip 配置（镜像等）。显式配置时 packager 原样透传。"""
+        return (self.platform_index.get(platform, ""),
+                self.platform_extra_index.get(platform, ""))
 
     def all_platform_deps(self) -> tuple[str, ...]:
         """全平台依赖并集（check 的 import 声明集：平台特有依赖同样算已声明）。"""
@@ -145,6 +154,11 @@ def validate(spec: AppSpec) -> list[str]:
     for pv in (spec.windows_python_version, spec.android_python_version):
         if pv and not _PYVER_RE.match(pv):
             problems.append(f"[platforms.*].python_version 须为 3.X.Y 格式（如 3.12.14）: {pv!r}")
+    for key, pmap in (("index_url", spec.platform_index),
+                      ("extra_index_url", spec.platform_extra_index)):
+        for p, u in pmap.items():
+            if not u.startswith(("http://", "https://")):
+                problems.append(f"[platforms.{p}].{key} 须为 http(s) URL: {u!r}")
     net = spec.network
     if net.present:
         bad = [m for m in net.auth if m not in ("login", "provision", "none")]
@@ -230,6 +244,12 @@ def load(path: str) -> AppSpec:
 
     platform_deps = {p: tuple(str(d) for d in (plat.get(p) or {}).get("dependencies", ()))
                      for p in known}
+    platform_index = {p: str((plat.get(p) or {}).get("index_url", ""))
+                      for p in known}
+    platform_index = {p: u for p, u in platform_index.items() if u}
+    platform_extra_index = {p: str((plat.get(p) or {}).get("extra_index_url", ""))
+                            for p in known}
+    platform_extra_index = {p: u for p, u in platform_extra_index.items() if u}
 
     spec = AppSpec(
         name=str(app.get("name", "")),
@@ -255,6 +275,8 @@ def load(path: str) -> AppSpec:
         android_runtime_dir=str(android.get("runtime_dir", "")),
         platform_deps=platform_deps,
         platform_icon=str(windows.get("icon", "")),
+        platform_index=platform_index,
+        platform_extra_index=platform_extra_index,
         network=network,
         raw=data,
     )

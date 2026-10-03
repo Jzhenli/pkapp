@@ -314,7 +314,7 @@ env 透传（`MYAPP_BIND` / `MYAPP_*`）是三平台统一底座——Linux 端�
 > （review F3 修复：缺失用户跑等价 PBKDF2，用户名存在性不经时序外泄）；
 > UserStore mtime 变更重读（架构方案A：应用后端运行中建/改/删用户，门 verify/exists
 > 前 stat 检测免重启可见——权威数据回到文件，v1.2 裁定自此无悬空缺口）；
-> 登录 UI 归属定稿（架构模糊带关闭）：dist/login.html 存在则门在 GET /login
+> 登录 UI 归属定稿（架构模糊带关闭）：ui/login.html 存在则门在 GET /login
 > 原样回该文件（Vue 自包含编译产物，no-store），内置页退化为零前端兜底——
 > UI 归应用、机制归门，豁免面恒等于一条路由（§8.3）；
 > token 载体收敛（真机联调前定稿）：/auth 响应体不再含 token（`{"ok": true}`），

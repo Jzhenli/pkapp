@@ -2,7 +2,7 @@
 
 windows 管线步骤（M1 定稿；linux/android 在 M2/M3 接入）：
   快照解析 → stage ← {解释器 DLL, stdlib zip(B.x 派生), DLLs/(B.s 闭包自检),
-  _pth 四行, site-packages(pip --target + B.v certifi 断言), app/, dist/}
+  _pth 四行, site-packages(pip --target + B.v certifi 断言), app/, ui/}
   → app/ checked-hash pyc(B.u) → *_hash → manifest + Ed25519 → spk(STORED)。
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ import glob
 import importlib.metadata
 import os
 import py_compile
+import re
 import shutil
 import subprocess
 import sys
@@ -131,30 +132,108 @@ def _zip_lib(lib_dir: str, out_path: str, pyc_tag: str | None = None) -> int:
     return n
 
 
+def _wheels_cache(project_dir: str, platform: str) -> str:
+    """★v1.2★ wheel 缓存托管目录：build/platform-<plat>/wheels——构建中间产物归 build/，
+    跨次构建复用（离线优先）；显式 --wheels-dir 仍为纯离线供应商目录语义。"""
+    return os.path.join(project_dir, "build", f"platform-{platform}", "wheels")
+
+
+def _dep_name(req: str) -> str:
+    """PEP 503 归一化需求名（applocal>=0.1.0 → applocal；Foo_bar → foo-bar）。"""
+    return re.sub(r"[-_.]+", "-", re.split(r"[!<>=~;\[\s]", req.strip(), 1)[0]).lower()
+
+
+def _wheel_name(fn: str) -> str:
+    """wheel 文件名 → 归一化发行版名（Foo_bar-1.0-*.whl → foo-bar）。"""
+    return re.sub(r"[-_.]+", "-", fn.split("-", 1)[0]).lower()
+
+
+def _uncached_deps(dep_list: list[str], wheels_dir: str) -> list[str]:
+    """download 需求过滤：缓存已有发行版不进补齐（applocal 等私有件不在任何公共
+    索引——留在列表里只会让 download 炸掉；先入缓存是它们的唯一入口）。
+    只过滤顶层需求；传递依赖恒在公共索引，不受影响。"""
+    have = {_wheel_name(fn) for fn in os.listdir(wheels_dir) if fn.endswith(".whl")}
+    return [d for d in dep_list if _dep_name(d) not in have]
+
+
 def _install_site_packages(stage: str, deps: tuple[str, ...],
-                           wheels_dir: str | None) -> str:
+                           wheels_dir: str, *,
+                           allow_download: bool = False,
+                           pip_tags: list[str] | None = None,
+                           index_url: str = "",
+                           extra_index_url: str = "") -> str:
     """pip --target 装入 site-packages；--no-compile（site-packages 恒只带 .py——
-    目录树可写，首启 import 自动建 __pycache__ 缓存，后续命中，★v0.7 默认行为★）。"""
+    目录树可写，首启 import 自动建 __pycache__ 缓存，后续命中，★v0.7 默认行为★）。
+
+    wheels_dir 两态（★v1.2★ wheel 缓存托管；调用点缺省填托管缓存，恒非 None）：
+    - 显式 --wheels-dir（allow_download=False）：纯离线供应商目录，不完整即失败；
+    - 托管缓存（allow_download=True）：离线优先命中，未命中 `pip download` 在线补齐后重装
+      （applocal 等非 PyPI 私有件需先入缓存，download 前按缓存剔除顶层需求）。
+
+    pip_tags（★v1.3★ 交叉安装）：目标平台 ≠ 打包机时必须显式给目标标签
+    （android：--only-binary=:all: --platform android_24_<abi> --abi cp312 …），
+    install/download 全程携带；index_url / extra_index_url 透传 AppSpec
+    [platforms.<平台>] 的 wheel 源配置——缺省空串 = 不干预，尊重本机 pip 配置
+    （镜像等；显式 pin 主站会绕开镜像，网络抖动时 pip 会静默降级到老版本组合）。
+    """
     sp_dir = os.path.join(stage, "site-packages")
     os.makedirs(sp_dir, exist_ok=True)
     if deps:
         # B.v：certifi 装入是硬约束（出网信任链）——无论用户是否声明，packager 恒装入
         dep_list = list(deps) + ([] if any(d.lower().startswith("certifi") for d in deps)
                                  else ["certifi"])
-        cmd = [sys.executable, "-m", "pip", "install", "--no-compile",
-               "--disable-pip-version-check", "--no-cache-dir",
-               "--target", sp_dir]
-        if wheels_dir:
-            cmd += ["--no-index", "--find-links", wheels_dir]
-        cmd += dep_list
+        base = [sys.executable, "-m", "pip", "install", "--no-compile",
+                "--disable-pip-version-check", "--no-cache-dir",
+                "--target", sp_dir] + (pip_tags or [])
         env = dict(os.environ, SOURCE_DATE_EPOCH="1577836800")  # B.u 固化
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+
+        def _run(cmd: list, what: str) -> None:
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if r.returncode != 0:
+                raise BuildError(f"{what} 失败:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+
+        offline = base + ["--no-index", "--find-links", wheels_dir] + dep_list
+        r = subprocess.run(offline, capture_output=True, text=True, env=env)
         if r.returncode != 0:
-            raise BuildError(f"pip install 失败:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+            if not allow_download:
+                raise BuildError(f"pip install 失败:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+            missing = _uncached_deps(dep_list, wheels_dir)
+            if missing:
+                dl = [sys.executable, "-m", "pip", "download",
+                      "--disable-pip-version-check", "-d", wheels_dir]
+                if index_url:
+                    dl += ["--index-url", index_url]
+                if extra_index_url:
+                    dl += ["--extra-index-url", extra_index_url]
+                dl += (pip_tags or []) + missing
+                _run(dl, f"pip download（wheel 缓存补齐 {wheels_dir}）")
+                _run(offline, "pip install（wheel 缓存补齐后）")
+            else:
+                raise BuildError(
+                    "pip install 失败（缓存已含全部顶层需求，无法在线补齐）。"
+                    "常见成因：① 缓存缺传递依赖 wheel；② 缓存内有损坏 wheel"
+                    "（文件名在缓存中但解析失败）——删除该 wheel 后重跑触发补齐"
+                    f":\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
         # 可复现性：direct_url.json 含本地 wheel 绝对路径 → 必删（INSTALLER 内容恒定可留）
         for du in glob.glob(os.path.join(sp_dir, "*.dist-info", "direct_url.json")):
             os.remove(du)
     return sp_dir
+
+
+def _android_pip_tags(spec: AppSpec) -> list[str]:
+    """Android 交叉安装 pip 标志（打包机 ≠ 目标平台，pip 必须显式给目标标签集）。
+
+    平台标签 android_24_<abi> 为 flet 索引约定（pypi.flet.dev wheel 文件名
+    cp312-cp312-android_24_*；py-android 运行时同出自 flet python-build，自洽）。
+    """
+    ver = spec.android_python_version or "3.12.14"
+    short = ver.rsplit(".", 1)[0]                     # 3.12.14 → 3.12
+    tags = ["--only-binary=:all:", "--python-version", short,
+            "--implementation", "cp", "--abi", "cp" + short.replace(".", "")]
+    for abi in spec.android_abis:
+        # ABI 名（NDK 约定，连字符 arm64-v8a）→ wheel 平台标签（下划线 arm64_v8a）
+        tags += ["--platform", "android_24_" + abi.replace("-", "_")]
+    return tags
 
 
 def _compile_checked_hash(root: str, python_exe: str | None = None,
@@ -236,11 +315,11 @@ print("PYC-OK", "%d.%d.%d" % sys.version_info[:3], n)
 """
 
 
-def _placeholder_dist(dist_dir: str) -> None:
-    os.makedirs(dist_dir, exist_ok=True)
-    atomic_write(os.path.join(dist_dir, "index.html"),
-                 b"<!doctype html><meta charset=utf-8><title>pkapp</title>"
-                 b"<p>pkapp placeholder dist - replace with frontend build output</p>")
+def _placeholder_ui(ui_dir: str) -> None:
+    os.makedirs(ui_dir, exist_ok=True)
+    atomic_write(os.path.join(ui_dir, "index.html"),
+                 b"<!doctype html><title>pkapp</title>"
+                 b"<p>pkapp placeholder ui - replace with frontend build output</p>")
 
 
 def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
@@ -289,31 +368,36 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         pth = "\n".join([f"{stem}.zip", "DLLs", "site-packages", "import site"]) + "\n"
         atomic_write(os.path.join(stage, f"{stem}._pth"), pth.encode("utf-8"))
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）
-        sp_dir = _install_site_packages(stage, spec.deps_for(platform), wheels_dir)
+        #    wheels_dir 缺省 → 托管缓存（build/platform-windows/wheels，跨次构建离线复用）
+        index_url, extra_index = spec.wheels_index(platform)
+        sp_dir = _install_site_packages(stage, spec.deps_for(platform),
+                                        wheels_dir or _wheels_cache(project_dir, platform),
+                                        allow_download=wheels_dir is None,
+                                        index_url=index_url, extra_index_url=extra_index)
         if not os.path.isdir(os.path.join(sp_dir, "certifi")):
             raise BuildError("site-packages 缺 certifi（B.v 出网信任链硬约束，B.z⑥）")
-        # 6) app/ 与 dist/（packager 永不改写 app 内容；dist 恒存在）
+        # 6) app/ 与 ui/（packager 永不改写 app 内容；ui 恒存在。包内契约目录名 ui）
         app_src = os.path.join(project_dir, spec.app_dir)
         if not os.path.isdir(app_src):
             raise BuildError(f"项目缺 {spec.app_dir}/ 目录")
         copy_tree(app_src, os.path.join(stage, "app"))
-        dist_src = os.path.join(project_dir, spec.dist_dir)
-        if os.path.isdir(dist_src) and os.listdir(dist_src):
-            copy_tree(dist_src, os.path.join(stage, "dist"))
+        ui_src = os.path.join(project_dir, spec.dist_dir)
+        if os.path.isdir(ui_src) and os.listdir(ui_src):
+            copy_tree(ui_src, os.path.join(stage, "ui"))
         else:
-            _placeholder_dist(os.path.join(stage, "dist"))
+            _placeholder_ui(os.path.join(stage, "ui"))
         # 7) app/ checked-hash pyc（B.u）——仅 app/（★v0.7★ site-packages 恒只带 .py，
         #    目录树首启自动建 __pycache__ 缓存，零副作用；app/ 恒保留源码，用户可内省）
         _compile_checked_hash(os.path.join(stage, "app"), _snapshot_exe,
                               snapshot.python_dll)
 
         # 8) 树哈希 + manifest + 签名 + spk
-        runtime_hash = tree_hash(stage, excludes=("app", "dist"))
+        runtime_hash = tree_hash(stage, excludes=("app", "ui"))
         fields = _manifest_fields(spec, snapshot.python_dll,
                                   f"sha256:{runtime_hash}",
                                   _detect_applocal(sp_dir),
                                   os.path.join(stage, "app"),
-                                  os.path.join(stage, "dist"))
+                                  os.path.join(stage, "ui"))
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -321,7 +405,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
 
 
 def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
-                     applocal_version: str, app_dir: str, dist_dir: str) -> dict:
+                     applocal_version: str, app_dir: str, ui_dir: str) -> dict:
     fields = {
         "format_version": FORMAT_VERSION,
         "app_version": spec.version,
@@ -331,7 +415,7 @@ def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
         "entry": spec.entry,
         "runtime_hash": runtime_hash,
         "app_hash": f"sha256:{tree_hash(app_dir)}",
-        "dist_hash": f"sha256:{tree_hash(dist_dir)}",
+        "ui_hash": f"sha256:{tree_hash(ui_dir)}",
     }
     fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
     return fields
@@ -373,28 +457,40 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
                        wheels_dir: str | None = None) -> dict:
     """Android spk（M2）：解释器级 runtime 走 APK（jniLibs 的 libpython + assets 的
     stdlib.zip/modules.zip），壳退化为引导器、验签由 APK 签名承担（SHELL_PROTOCOL §10.2）。
-    spk = manifest + signature + site-packages/ + app/ + dist/——pip 依赖随应用版本走，
+    spk = manifest + signature + site-packages/ + app/ + ui/——pip 依赖随应用版本走，
     必须进 spk（APK 里只放与解释器版本绑定的件）。
     runtime_hash = libpythonbundle.so 的 sha256（标识所针对的运行时 bundle）。
     """
+    if len(spec.android_abis) != 1:
+        raise BuildError(
+            f"[platforms.android].abis 须为单 ABI（当前 {list(spec.android_abis)}）："
+            "flet android 解释器的扩展后缀无 ABI 段，双 ABI 的 .so 同名冲突无法共存于"
+            "同一 site-packages——一次只打包一种 ABI（多 ABI 分次构建出多个 APK）")
     snapshot = runtime.resolve(spec, "android", abis=spec.android_abis)
 
     stage = tempfile.mkdtemp(prefix="pkapp-build-android-")
     try:
         # 1) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.android] 追加）
-        sp_dir = _install_site_packages(stage, spec.deps_for("android"), wheels_dir)
+        #    wheels_dir 缺省 → 托管缓存（build/platform-android/wheels）；交叉安装 +
+        #    平台 wheel 源（AppSpec [platforms.android].extra_index_url，如 flet 索引）
+        index_url, extra_index = spec.wheels_index("android")
+        sp_dir = _install_site_packages(stage, spec.deps_for("android"),
+                                        wheels_dir or _wheels_cache(project_dir, "android"),
+                                        allow_download=wheels_dir is None,
+                                        pip_tags=_android_pip_tags(spec),
+                                        index_url=index_url, extra_index_url=extra_index)
         if not os.path.isdir(os.path.join(sp_dir, "certifi")):
             raise BuildError("site-packages 缺 certifi（B.v 出网信任链硬约束，B.z⑥）")
-        # 2) app/ 与 dist/（同 windows：packager 永不改写 app 内容；dist 恒存在）
+        # 2) app/ 与 ui/（同 windows：packager 永不改写 app 内容；ui 恒存在）
         app_src = os.path.join(project_dir, spec.app_dir)
         if not os.path.isdir(app_src):
             raise BuildError(f"项目缺 {spec.app_dir}/ 目录")
         copy_tree(app_src, os.path.join(stage, "app"))
-        dist_src = os.path.join(project_dir, spec.dist_dir)
-        if os.path.isdir(dist_src) and os.listdir(dist_src):
-            copy_tree(dist_src, os.path.join(stage, "dist"))
+        ui_src = os.path.join(project_dir, spec.dist_dir)
+        if os.path.isdir(ui_src) and os.listdir(ui_src):
+            copy_tree(ui_src, os.path.join(stage, "ui"))
         else:
-            _placeholder_dist(os.path.join(stage, "dist"))
+            _placeholder_ui(os.path.join(stage, "ui"))
         # 3) app/ checked-hash pyc（B.u）。android 快照无 python.exe——借用 windows 快照解释器
         #   （版本哨兵按 python_dll 名校验 3.12 == 3.12，pyc 字节与平台无关）；
         #   项目未注册 windows 快照时回退打包机解释器（pyc 版本标签可能与运行时不符）。
@@ -413,7 +509,7 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
                                   f"sha256:{_sha256_file(bundle)}",
                                   _detect_applocal(sp_dir),
                                   os.path.join(stage, "app"),
-                                  os.path.join(stage, "dist"))
+                                  os.path.join(stage, "ui"))
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)

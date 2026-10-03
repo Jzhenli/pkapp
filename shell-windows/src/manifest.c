@@ -9,7 +9,7 @@
 
 static const char *kRequired[] = {
     "format_version", "app_version", "min_app_version", "applocal_version",
-    "python_dll", "entry", "runtime_hash", "app_hash", "dist_hash",
+    "python_dll", "entry", "runtime_hash", "app_hash", "ui_hash",
     "spk_hash", "signature", NULL};
 
 int manifest_parse(const char *text, size_t text_len, manifest_doc *doc) {

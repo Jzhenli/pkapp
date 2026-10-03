@@ -9,7 +9,7 @@ from . import spk
 
 # §2 键位顺序（写盘顺序即展示顺序；signature 恒最后）
 KEYS = ("format_version", "app_version", "min_app_version", "applocal_version",
-        "python_dll", "entry", "runtime_hash", "app_hash", "dist_hash", "spk_hash")
+        "python_dll", "entry", "runtime_hash", "app_hash", "ui_hash", "spk_hash")
 REQUIRED_NONEMPTY = KEYS + ("signature",)  # G2：全键非空
 
 

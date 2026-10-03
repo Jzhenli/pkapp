@@ -35,7 +35,7 @@
 | `MYAPP_LOG_DIR` | 日志目录 | `…\cache\log\` | **optional**，缺省＝`MYAPP_CACHE_DIR/log`；壳消费（stdio 落盘 §7），applocal 仅解析 |
 | `MYAPP_READY_FILE` | ready 文件绝对路径 | `…\cache\ready` | 见 §5 |
 | `MYAPP_DIAG_FILE` | diag 文件绝对路径 | `…\cache\diag.json` | 见 §9 |
-| `MYAPP_STATIC_DIR` | Vue 产物目录（dist） | `…\runtime\dist\` | **恒存在** |
+| `MYAPP_STATIC_DIR` | 前端产物目录（ui） | `…\runtime\ui\` | **恒存在** |
 | `MYAPP_PORT` | **端口偏好**，非最终值 | `8765` 或 `0`（＝自选） | **optional**，缺省 `0`＝自选。⚠ 壳**禁止**假设实际端口＝此值（实际端口以 ready 为准）。★v1.2★ 壳**不再注入**（原注入 `0` 会压过 manifest `network_port`）：打包端口经 manifest，父进程 env `MYAPP_PORT` = 运维覆盖层 |
 | `MYAPP_VERSION` | 版本号 | `1.4.2` / dev 下 `0.0.0-dev` | |
 | `MYAPP_MANIFEST_PATH` | 展开区 manifest 路径 | `…\runtime\manifest` | applocal 只读；**禁止用其做安全决策**（信任源是壳的验签） |

@@ -1516,7 +1516,7 @@ static int run_shell(void) {
         SetEnvironmentVariableW(L"MYAPP_LOG_DIR", g_logdir.c_str());
         SetEnvironmentVariableW(L"MYAPP_READY_FILE", g_ready.c_str());
         SetEnvironmentVariableW(L"MYAPP_DIAG_FILE", g_diag.c_str());
-        SetEnvironmentVariableW(L"MYAPP_STATIC_DIR", join_path(g_runtime, L"dist").c_str());
+        SetEnvironmentVariableW(L"MYAPP_STATIC_DIR", join_path(g_runtime, L"ui").c_str());
         /* MYAPP_PORT 不注入（★v1.2★）：端口偏好走 manifest network_port（打包期 [network].port）；
            父进程 env 里的 MYAPP_PORT = 运维显式覆盖层，保留继承。 */
         SetEnvironmentVariableW(L"MYAPP_VERSION", utf8_to_wide(doc.app_version).c_str());

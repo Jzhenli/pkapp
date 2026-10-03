@@ -21,7 +21,7 @@ def test_dev_env_contract(tmp_path):
     assert env["MYAPP_VERSION"] == "0.0.0-dev"
     assert env["MYAPP_PORT"] == str(DEV_PORT)
     assert os.path.isabs(env["MYAPP_DATA_DIR"]) and ".dev" in env["MYAPP_DATA_DIR"]
-    assert env["MYAPP_STATIC_DIR"].endswith("dist")
+    assert env["MYAPP_STATIC_DIR"].endswith("ui")
     # 非 strict：不注入鉴权变量（§2 optional 缺省 = 旁路）
     assert "MYAPP_STRICT_AUTH" not in env and "MYAPP_TOKEN" not in env
     assert code is None

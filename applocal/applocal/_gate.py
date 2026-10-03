@@ -293,7 +293,11 @@ def build_lan_app(user_app, cfg, *, roles_table=None, route_perms=None):
         # ── 4) 壳首次导航窄豁免（§14）：?handshake= 且码值与握手文件一致 → 放页面加载。
         #    码不符静默落入 ⑤/⑥ 正常链（会话或登录门）——F5 后旧码随文件已消费而失效，
         #    由 Cookie/sessionStorage 会话兜底，不依赖此豁免。
-        if _handshake_ok(scope, cfg.paths.handshake_file):
+        #    ★login 模式不豁免★：豁免只放行带码的文档请求，SPA 的 /assets/* 子资源
+        #    无码无会话仍被 ⑥ 截走 → 首屏半加载白屏、且到不了登录页。login 模式下
+        #    未持会话的首航应整体 302 /login（登录页自包含，不受影响）。
+        if not (require_session and want_login) and _handshake_ok(
+                scope, cfg.paths.handshake_file):
             return await inner(scope, receive, send)
 
         # ── 5) 会话解析（§7 唯一校验点：Cookie 或 header 任一载体）────────────

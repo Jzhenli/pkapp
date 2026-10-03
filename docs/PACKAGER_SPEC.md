@@ -13,10 +13,10 @@ _runtime/
 ├── python312._pth          ← Windows 目标必产；★必须与 python_dll 同目录，内容派生★
 ├── site-packages/          ← 全部第三方依赖（applocal 为普通一员）
 ├── app/                    ← 用户后端代码（import 根）★packager 永不写入★
-├── dist/                   ← Vue 产物 ★恒存在★
+├── ui/                     ← 前端产物 ★恒存在★（★v1.2★ 包内契约目录名 ui；项目侧目录名随 pkapp.toml [dist].dir）
 └── manifest                ← 包内自述（键位见 §2）
 ```
-**同构约束**：`app/` 与 `dist/` 之外的任何产出都不得含平台条件分支；Android 的 so 迁出至 APK `lib/<abi>/` 发生在**打包 APK 阶段**（APK 装配），不属于 packager 管线分支。
+**同构约束**：`app/` 与 `ui/` 之外的任何产出都不得含平台条件分支；Android 的 so 迁出至 APK `lib/<abi>/` 发生在**打包 APK 阶段**（APK 装配），不属于 packager 管线分支。
 
 ---
 ## 2. manifest 键位定稿
@@ -28,7 +28,7 @@ applocal_version = 0.1.0
 python_dll       = python312.dll # ★壳据此 LoadLibrary，禁止硬编码；必填非空★
 runtime_hash     = sha256:...
 app_hash         = sha256:...
-dist_hash        = sha256:...
+ui_hash          = sha256:...
 spk_hash         = sha256:...
 signature        = base64:...    # 发布私钥对上述全部字段签名（或 minisign 独立 .sig）
 ```
@@ -127,6 +127,10 @@ AppSpec [build] 段废除：残留即 SpecError（防配置静默失效）。
 
 ### B.v（★v8.1 V10★）出网信任链
 默认装入 `certifi` wheel；出网统一 `ssl.create_default_context(cafile=certifi.where())`（在 applocal 内部使用，**不新增冻结 API**）。缺失则 HTTPS 更新链必然失败。
+
+**wheel 缓存托管（★v1.2★）**：`pkapp build` 缺省把依赖 wheel 落到 `<project>/build/platform-<plat>/wheels/`（构建中间产物归 `build/`，跨次构建离线复用——离线优先，未命中自动 `pip download` 补齐后重装；applocal 等非 PyPI 私有件需先入缓存，补齐前按缓存剔除顶层需求）。显式 `--wheels-dir` 保持**纯离线供应商目录**语义（不完整即失败）。
+
+**平台 wheel 源 + Android 交叉安装（★v1.3★）**：AppSpec `[platforms.<平台>]` 支持配置库源——`index_url`（主源）与 `extra_index_url`（补充源）；缺省**不干预**，尊重本机 pip 配置（镜像等；显式 pin 主站会绕开镜像，网络抖动时 pip 会静默降级到老版本组合）。Android 目标 ≠ 打包机，pip 必须显式给目标标签集：`--only-binary=:all: --platform android_24_<abi> --python-version <X.Y> --implementation cp --abi cp<X.Y>`（平台标签 `android_24_*` 为 flet 索引约定，与 py-android 运行时同出自 flet python-build）。**ABI 名（NDK 连字符 `arm64-v8a`）→ wheel 平台标签（下划线 `arm64_v8a`）**须转换，否则平台相关 wheel 对 pip 不可见（`from versions: none`）、纯 py 件静默降级。Android 二进制 wheel（pydantic_core 等 PyPI 无 android 件的包）来自 **flet 索引快照**（方案 v8 §2）：`extra_index_url = "https://pypi.flet.dev/"`；单 ABI 打包（flet android 扩展后缀无 ABI 段，双 ABI 的 .so 同名冲突，一次只出一种 ABI）。
 
 ---
 ## 6. spk 封装规则

@@ -425,13 +425,27 @@ def test_handshake_query_narrow_bypass(env):
     assert s == 302
     s, _, _ = _runx(app, path="/", headers={"Accept": "text/html"}, query=b"handshake=")
     assert s == 302                                     # 空值不豁免
-    # 码值一致 → 壳首航放行（且不消费文件——消费仅发生在 POST /auth）
+    # 码值一致 → ★login 模式不豁免★：带码首航也 302 /login。豁免只放行带码的
+    # 文档请求，SPA 的 /assets/* 子资源无码无会话仍被登录门截走 → 首屏半加载
+    # 白屏且到不了登录页；login 模式必须由登录页整页接管（只读比对、不消费文件）
     s, _, _ = _runx(app, path="/", headers={"Accept": "text/html"}, query=b"handshake=CODE-1")
-    assert s == 200
+    assert s == 302
     assert hf.exists() and hf.read_text() == "CODE-1"
     # 无握手参数 → 登录门照旧
     s, _, _ = _runx(app, path="/", headers={"Accept": "text/html"})
     assert s == 302
+
+
+def test_handshake_query_exemption_without_login(env):
+    """非 login 模式（provision 等）：§14 豁免仍放行带码首航（页面 JS 自行 POST /auth 换凭证）。"""
+    hf = env / "cache" / "handshake"
+    hf.parent.mkdir(exist_ok=True)
+    hf.write_text("CODE-1", encoding="utf-8")
+    app = _gate(env, auth=("provision",))
+    s, _, _ = _runx(app, path="/", headers={"Accept": "text/html"}, query=b"handshake=CODE-1")
+    assert s == 200
+    s, _, _ = _runx(app, path="/", headers={"Accept": "text/html"}, query=b"handshake=WRONG")
+    assert s == 401                                     # 非 login：未持会话 → 401 JSON
 
 
 def test_provision_entry(env):

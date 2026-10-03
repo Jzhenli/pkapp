@@ -25,7 +25,7 @@ def test_build_and_golden(project, wheels_dir, tmp_path):
     fields = _build(project, wheels_dir, out)
     # G2 manifest 键位齐全
     for k in ("format_version", "app_version", "min_app_version", "applocal_version",
-              "python_dll", "entry", "runtime_hash", "app_hash", "dist_hash",
+              "python_dll", "entry", "runtime_hash", "app_hash", "ui_hash",
               "spk_hash", "signature"):
         assert fields.get(k), f"G2: {k} 非空失败"
     assert fields["entry"] == "app.main:app"
@@ -49,6 +49,21 @@ def test_reproducible(project, wheels_dir, tmp_path):   # G1
         _build(project, wheels_dir, p)
         outs.append(open(p, "rb").read())
     assert outs[0] == outs[1], "G1: 同输入两次构建必须字节级一致"
+
+
+def test_managed_wheels_cache(project, wheels_dir, tmp_path, mock_runtime):
+    """★v1.2★ wheel 缓存托管：缺省构建（不带 --wheels-dir）落到
+    build/platform-windows/wheels 并离线命中；二跑 G1 字节级一致。"""
+    import shutil
+
+    cache = os.path.join(project, "build", "platform-windows", "wheels")
+    shutil.copytree(wheels_dir, cache)                      # 预置热缓存（fixture 同源）
+    out = str(tmp_path / "managed.spk")
+    fields = _build(project, None, out)
+    assert fields["applocal_version"] == "0.1.0"
+    out2 = str(tmp_path / "managed2.spk")
+    _build(project, None, out2)
+    assert open(out, "rb").read() == open(out2, "rb").read()
 
 
 def test_tamper_detected(project, wheels_dir, tmp_path):  # G4 负向
@@ -101,11 +116,11 @@ def test_android_build(project, mock_android_runtime, wheels_dir, tmp_path):    
     pub = sign.public_key_hex(os.path.join(project, ".pkapp", "sign.key"))
     got, _ = mf.verify_spk(out, pub)
     assert got["python_dll"] == "libpython3.12.so"
-    # 布局：manifest + site-packages + app + dist；无解释器件（_pth/DLLs/python zip 不存在）
+    # 布局：manifest + site-packages + app + ui；无解释器件（_pth/DLLs/python zip 不存在）
     names = {p for p, _ in spk.read_spk(out)}
     assert spk.MANIFEST_ENTRY in names
     assert "app/main.py" in names
-    assert "dist/index.html" in names
+    assert "ui/index.html" in names
     assert "site-packages/applocal/__init__.py" in names
     assert not any(n.endswith("._pth") or n.startswith("DLLs/") for n in names)
     # G1 android：可复现
