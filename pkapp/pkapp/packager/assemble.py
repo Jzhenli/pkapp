@@ -93,7 +93,13 @@ def check_closure(stage: str, python_dll: str) -> None:
         raise BuildError("原生依赖闭包不完整（B.s/G7）: 缺 " + ", ".join(sorted(missing)))
 
 
-def _zip_lib(lib_dir: str, out_path: str) -> int:
+def _zip_lib(lib_dir: str, out_path: str, pyc_tag: str | None = None) -> int:
+    """Lib/ → <STEM>.zip（PACKAGER_SPEC §9）。
+
+    pyc_tag 给定时（如 cpython-312）：把 lib_dir 内 __pycache__/<mod>.<tag>.pyc
+    以扁平 <dir>/<mod>.pyc 布局一并写入——zipimport 在 zip 内只查扁平 .pyc 条目、
+    不认 __pycache__ 目录；命中即免源码重编译（★启动优化★，实测省 ~2s/次启动）。
+    checked-hash 失效模式校验读 zip 内同位 .py 即可，无 mtime 依赖。"""
     n = 0
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         from ..util import walk_files
@@ -106,6 +112,17 @@ def _zip_lib(lib_dir: str, out_path: str) -> int:
             with open(os.path.join(lib_dir, rel.replace("/", os.sep)), "rb") as f:
                 zf.writestr(zi, f.read())
             n += 1
+            if pyc_tag and rel.endswith(".py"):
+                d, base = os.path.split(rel)
+                pc = os.path.join(lib_dir, d, "__pycache__",
+                                  f"{base[:-3]}.{pyc_tag}.pyc")
+                if os.path.isfile(pc):
+                    zi2 = zipfile.ZipInfo(rel[:-3] + ".pyc", date_time=SPK_DATE)
+                    zi2.external_attr = 0o644 << 16
+                    zi2.compress_type = zipfile.ZIP_DEFLATED
+                    with open(pc, "rb") as f:
+                        zf.writestr(zi2, f.read())
+                    n += 1
     return n
 
 
@@ -223,6 +240,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
     stem = runtime.dll_stem(snapshot.python_dll)
 
     stage = tempfile.mkdtemp(prefix="pkapp-build-")
+    lib_work = tempfile.mkdtemp(prefix="pkapp-libwork-")
     try:
         # 1) 解释器本体（布局 §3.1：与 _pth 同目录，getpath 首选 DLL 相邻路径 V3）
         shutil.copyfile(os.path.join(snapshot.dir, snapshot.python_dll),
@@ -233,8 +251,19 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
             if fn.lower().endswith(".dll") and fn != snapshot.python_dll:
                 shutil.copyfile(os.path.join(snapshot.dir, fn), os.path.join(stage, fn))
         # 2) 标准库 zip（PBS 为松散 Lib/ → packager 打成 <STEM>.zip，PACKAGER_SPEC §9）
-        _zip_lib(os.path.join(snapshot.dir, "Lib"),
-                 os.path.join(stage, f"{stem}.zip"))
+        #    ★启动优化★ 快照解释器预编译 checked-hash pyc 一并打入（zipimport 只认扁平
+        #    <mod>.pyc，__pycache__ 布局在 zip 内无效）——缺 pyc 时每次启动都从源码重编
+        #    译整个被引标准库（实测 ~2s）。编译走独立暂存副本（stage 外，免被 tree_hash/
+        #    check_closure 扫入），不改快照本体。
+        _snapshot_exe = os.path.join(snapshot.dir, "python.exe")
+        shutil.copytree(os.path.join(snapshot.dir, "Lib"), lib_work,
+                        ignore=shutil.ignore_patterns("site-packages", "test",
+                                                      "tests", "__pycache__"),
+                        dirs_exist_ok=True)  # mkdtemp 已建空目录
+        _compile_checked_hash(lib_work, _snapshot_exe, snapshot.python_dll)
+        _zip_lib(lib_work, os.path.join(stage, f"{stem}.zip"),
+                 pyc_tag="cpython-" +
+                         "".join(c for c in snapshot.python_dll if c.isdigit()))
         # 3) DLLs/（.pyd + 传递原生依赖整体拷入；闭包自检见下）
         shutil.copytree(os.path.join(snapshot.dir, "DLLs"),
                         os.path.join(stage, "DLLs"))
@@ -257,7 +286,6 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         else:
             _placeholder_dist(os.path.join(stage, "dist"))
         # 7) checked-hash pyc（B.u）——对 app 与 site-packages（快照解释器编译，见函数注）
-        _snapshot_exe = os.path.join(snapshot.dir, "python.exe")
         _compile_checked_hash(os.path.join(stage, "app"), _snapshot_exe,
                               snapshot.python_dll)
         _compile_checked_hash(sp_dir, _snapshot_exe, snapshot.python_dll)
@@ -272,6 +300,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(lib_work, ignore_errors=True)
 
 
 def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,

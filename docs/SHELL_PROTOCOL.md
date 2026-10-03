@@ -130,11 +130,15 @@ $ python.exe -I -c "import sys; print(sys.path)"
 ---
 ## 6. 探测式心跳（applocal 侧）
 ```
-每 5s：向自身 http://127.0.0.1:{port}/healthz 发真实请求（超时 2s）
+首拍立即，其后每 5s 一拍：向自身 http://127.0.0.1:{port}/healthz 发真实请求（超时 2s）
   成功 → seq += 1，touch ready（原子写）
   失败/hang → 不 touch → 壳 30s 超时判死
   ★v1.1★ 连续 2 拍失败 → 写一次 diag("runtime")（此后不刷盘）——
   uvicorn startup 失败（端口被抢/ASGI 异常）时错误页有因可查
+  ★v1.2★ 首拍立即探测（★启动优化★）：bootstrap 内 socket 已绑定并接受连接，
+  首拍即成功 → ready 与服务可用同秒点亮；此前先 sleep(interval) 会让壳首帧
+  导航固定白等一整个 interval（Windows 实测 ~5s）。首拍失败仅计 fails=1，
+  下一拍成功走抖动恢复清记录，无误报。
 ```
 理由：只有 uvicorn 所在进程能真实探测 uvicorn 是否还在服务；`is_alive()` 类判断对死锁 hang 无效。
 

@@ -106,6 +106,8 @@ _pth 查找顺序 = [library(python3XX.dll 全路径, 去扩展名+._pth),
 ### B.u（★v8.1 V12★）pyc 可复现性
 统一使用 `--invalidation-mode checked-hash` + 固化 `SOURCE_DATE_EPOCH`；否则源 mtime 被烧进 pyc → spk hash 每次不同 → golden test 随机红。
 
+**★v0.5★ 标准库 zip 必须预编译 pyc 一并打入（★启动优化★）**：`<STEM>.zip` 打包时由快照解释器对全部 `.py` 预编译 checked-hash pyc，以**扁平 `<dir>/<mod>.pyc` 布局**写入（zipimport 在 zip 内只查扁平 `.pyc` 条目、不认 `__pycache__/` 目录；`.pyc` 优先于同名 `.py`）。缺 pyc 时每次启动都从源码重编译整个被引标准库——Windows 实测每次启动多花 ~2s（`import applocal` 2.7s → 0.2s）。compileall 走独立暂存副本，不改快照本体。
+
 ### B.v（★v8.1 V10★）出网信任链
 默认装入 `certifi` wheel；出网统一 `ssl.create_default_context(cafile=certifi.where())`（在 applocal 内部使用，**不新增冻结 API**）。缺失则 HTTPS 更新链必然失败。
 
@@ -180,3 +182,4 @@ G11 Windows 目标实跑断言（M0 D2 起的 CI 门槛）：
 | v0.2 | M0 D2 实测回填：§9 实测已定案表（stdlib 需自行打 zip、`_pth` 需自行生成、依赖闭包清单）、V15 安装目录洁净（G10）、Windows 目标实跑门槛（G11） |
 | v0.3 | ★pkapp 0.1.0 实现对账（零机制变更）★：§6 补 spk_hash 精确定义（原空洞条款——manifest 含 spk_hash 而 manifest 在 spk 内，定义为"除 manifest 外全部条目的拼接 sha256"）+ pyc 相对 co_filename 实现注记；B.z 补 ⑥ certifi（v8.2 已定，本文档此前漏抄）；B.v 补"packager 恒装入 certifi"。工具侧落地：Ed25519 签名（M0 D1 决策的 minisign 轻量替代——manifest 正文 Ed25519 签名，壳内置公钥 hex 验签） |
 | v0.4 | ★M0 D2 补齐实测回填（PBS cpython-3.12.14+20260929 x64 msvc install_only_stripped）★：① B.t① 探测须用 `python3\d+\.dll` 正则——字典序 python3.dll（稳定 ABI 转发器）排在 python312.dll 前，宽松 glob 选错；② 闭包解析域 = DLLs/ ∪ 根目录（pyd 依赖解释器本体，只扫 DLLs/ 全误报）；③ 系统白名单实测新增：Cabinet/msi（_msi.pyd）、PROPSYS（_wmi.pyd）、IMM32（_tkinter.pyd）；④ python312.dll 动态依赖 VCRUNTIME140.dll（非静态 CRT）→ 根目录伴生 DLL（vcruntime140\*/python3.dll）须随包拷贝（PyInstaller 同款）；⑤ stdlib 排除 test/idlelib/tkinter/turtledemo/site-packages/\_\_pycache\_\_ 后 611 文件 / 12.6MB → python312.zip；DLLs 31×.pyd；runtime.spk ≈ 30.5MB；⑥ G11 实跑通过：解包安装目录形态 + 快照 python.exe 读 python312._pth 启动，sys.path 含 zip 与 site-packages，ssl/sqlite3/asyncio/bz2/lzma 真 pyd 加载成功。证据：pkapp/tools/runtime_probe.py、pkapp/tools/make_runtime_proto.py、pkapp/tests/test_real_runtime.py |
+| v0.5 | ★启动优化★：B.u 增补 stdlib zip 预编译 pyc（扁平布局，实测省 ~2s/次启动）——Windows 实测首帧 8.9s → 2.6s（配合 applocal 心跳首拍立即 §6 与 uvicorn 子模块直导） |

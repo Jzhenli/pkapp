@@ -18,7 +18,6 @@ import sys
 import threading
 import time
 import traceback
-import urllib.request
 
 from . import _env
 from ._env import Cfg, ContractError
@@ -38,9 +37,19 @@ _MIME = {
     ".txt": "text/plain; charset=utf-8", ".webmanifest": "application/manifest+json",
 }
 
-# 心跳专用 opener：显式空代理表 → 强制直连。urlopen 会读系统/注册表代理，Windows 下
-# ProxyOverride 无 127.0.0.1/<local> 例外时探测会被转发给代理 → 健康进程被误判死（§6）。
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# 心跳专用 opener（惰性建）：显式空代理表 → 强制直连。urlopen 会读系统/注册表代理，
+# Windows 下 ProxyOverride 无 127.0.0.1/<local> 例外时探测会被转发给代理 → 健康进程被
+# 误判死（§6）。★启动优化★ 不在模块层 import urllib.request（拉 http.client/email/ssl
+# 编译链 ~0.5s）——移到心跳首拍（后台线程，与壳 WebView 启动并行，不占引导关键路径）。
+_OPENER = None
+
+
+def _get_opener():
+    global _OPENER
+    if _OPENER is None:
+        import urllib.request
+        _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _OPENER
 
 
 # ---------------------------------------------------------------- ready / diag
@@ -284,17 +293,25 @@ def build_asgi_app(user_app, cfg: Cfg | None = None, *,
 # ---------------------------------------------------------------- 心跳
 def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
                     timeout: float = 2.0) -> threading.Thread:
-    """探测式心跳（§6）：真实请求 /healthz，成功才 seq+=1 并原子写 ready；失败不 touch。"""
+    """探测式心跳（§6）：真实请求 /healthz，成功才 seq+=1 并原子写 ready；失败不 touch。
+
+    首拍立即探测（其后每 interval 秒一拍）：服务器已在 bootstrap 内绑定并接受连接，
+    首拍即成功 → ready 在服务可用的同一秒点亮；否则壳首帧导航要白等一整个 interval。
+    首拍失败仅计 fails=1（连续 2 拍才落 diag），下一拍成功即走抖动恢复清记录。"""
     cfg = cfg or _env.load_env()
     ready = cfg.paths.ready_file
     state = {"seq": 0}
 
     def _beat():
         fails = 0
+        first = True
         while True:
-            time.sleep(interval)
+            if not first:                  # 首拍立即；其后（含失败路径）每 interval 秒一拍
+                time.sleep(interval)
+            first = False
             try:
-                with _OPENER.open(f"http://127.0.0.1:{port}/healthz", timeout=timeout) as r:
+                with _get_opener().open(f"http://127.0.0.1:{port}/healthz",
+                                        timeout=timeout) as r:
                     ok = r.status == 200
             except Exception:
                 ok = False  # 失败/hang/畸形响应 → 不 touch → 壳判死
@@ -457,7 +474,7 @@ def _inject_native(lib_dir: str | None) -> None:
     """Android so 注入（§4.2 步骤 2）——实现与 finder 在 _ndk。
 
     ★v1.2★ 注册点已前移到 __init__（`import applocal` 自身即触发扩展导入链：
-    _core → urllib → base64 → struct → _struct，先于 bootstrap()）；此处保留
+    _core → base64 → struct → _struct，先于 bootstrap()）；此处保留
     幂等再注册（bootstrap 步骤 2 语义不变，重复调用无害）。
     """
     if lib_dir:
@@ -466,9 +483,29 @@ def _inject_native(lib_dir: str | None) -> None:
 
 
 # ---------------------------------------------------------------- bootstrap
+def _tmark(label: str, t0: float, path: str | None) -> float:
+    """启动性能打点：分阶段耗时 → cache_dir/boot-timing.log（追加）。
+
+    不走 stderr：嵌入式解释器的 sys.stderr 在 Windows 壳下不落 shell 日志（实测）。"""
+    now = time.perf_counter()
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {label}: {now - t0:.3f}s\n")
+        except Exception:
+            pass  # 打点绝不影响引导
+    return now
+
+
 def bootstrap(entry: str = "app.main:app") -> int:
     """壳唯一入口（§4.2 五步）。返回实际监听端口；ready 由心跳线程负责。"""
+    _t0 = _t = time.perf_counter()                 # _t0 = 引导起点（total 打点用；_t 走段链）
     cfg = _env.load_env()
+    try:
+        _tlog = os.path.join(cfg.paths.cache_dir, "boot-timing.log")
+    except Exception:
+        _tlog = None
+    _t = _tmark("load_env", _t, _tlog)
     rt = cfg.runtime
     if rt.platform == "linux":                     # 步骤 0（§4.2：仅 Linux）
         set_process_title("myapp")
@@ -481,6 +518,7 @@ def bootstrap(entry: str = "app.main:app") -> int:
     try:
         mod_name, _, attr = entry.partition(":")
         mod = importlib.import_module(mod_name)
+        _t = _tmark(f"import {entry}", _t, _tlog)
         user_app = getattr(mod, attr or "app")
         roles_table = getattr(mod, "ROLES", None) or {}          # 姿势 B 约定（§9.2）：
         route_perms = getattr(mod, "ROUTE_PERMS", None) or []    # 缺省 = 应用自管授权
@@ -495,11 +533,18 @@ def bootstrap(entry: str = "app.main:app") -> int:
         diag("bootstrap", str(e), recoverable=True)
         raise
     port = sock.getsockname()[1]
+    _t = _tmark("bind_socket", _t, _tlog)
     try:
         asgi_app = build_asgi_app(user_app, cfg, roles_table=roles_table,
                                   route_perms=route_perms)
+        _t = _tmark("build_asgi_app", _t, _tlog)
         try:
-            import uvicorn                         # 惰性：由用户应用自带，applocal 零强制依赖
+            # ★启动优化★ 直导 uvicorn.server/uvicorn.config（本函数仅用 Server/Config），
+            # 跳过 uvicorn/__init__ → uvicorn.main 的 CLI 面（click/supervisors ~0.5s）。
+            # 语义不变：uvicorn.main 的 Server/Config 本就是从这两个模块转口再出的。
+            from uvicorn.config import Config
+            from uvicorn.server import Server
+            _t = _tmark("import uvicorn(server/config)", _t, _tlog)
         except Exception as e:                     # 缺依赖 → diag → 向壳上抛（否则错误页无因可查）
             diag("bootstrap", f"import uvicorn failed: {e}",
                  detail=traceback.format_exc(), recoverable=False)
@@ -507,10 +552,11 @@ def bootstrap(entry: str = "app.main:app") -> int:
     except BaseException:
         sock.close()                               # 起不来就别占着端口
         raise
-    server = uvicorn.Server(uvicorn.Config(
+    server = Server(Config(
         asgi_app, host=cfg.network.bind, port=port, access_log=False, log_config=None))
     threading.Thread(target=_run_server, args=(server, sock),
                      name="applocal-uvicorn", daemon=True).start()
+    _tmark("uvicorn thread started (bootstrap total)", _t0, _tlog)
     start_heartbeat(port, cfg)                     # 步骤 5′：ready 由首跳成功点亮
     return port
 

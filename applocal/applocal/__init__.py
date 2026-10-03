@@ -10,10 +10,13 @@
 事实源：docs/SHELL_PROTOCOL.md（协议 A）。
 """
 import os as _os
+import time as _time
+
+_IMPORT_T0 = _time.perf_counter()  # 模块导入起点（__init__ 自身 + _core 链）
 
 if _os.environ.get("MYAPP_NATIVE_LIB_DIR"):
     # ★v1.2★ Android W^X：finder 必须在 `from ._core import` 之前注册——
-    # _core → urllib → base64 → struct → _struct 的导入链先于 bootstrap() 触发
+    # _core → base64 → struct → _struct 的导入链先于 bootstrap() 触发
     from ._ndk import register as _ndk_register
     _ndk_register(_os.environ["MYAPP_NATIVE_LIB_DIR"])
 
@@ -43,6 +46,15 @@ def runtime():
 def native_lib_dir():
     """Android 原生库目录（lib/<abi>/）；桌面端返回 None。"""
     return load_env().runtime.native_lib_dir
+
+
+try:  # 启动打点：import applocal 全链耗时（诊断用，绝不影响功能）
+    with open(_os.path.join(_os.environ["MYAPP_CACHE_DIR"], "boot-timing.log"),
+              "a", encoding="utf-8") as _f:
+        _f.write(f"[{_time.strftime('%H:%M:%S')}] import applocal (module init): "
+                 f"{_time.perf_counter() - _IMPORT_T0:.3f}s\n")
+except Exception:
+    pass
 
 
 __all__ = [

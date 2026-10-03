@@ -380,7 +380,7 @@ def test_heartbeat_opener_bypasses_system_proxy(env, monkeypatch):
     srv = HTTPServer(("127.0.0.1", 0), _H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        with _core._OPENER.open(
+        with _core._get_opener().open(
                 f"http://127.0.0.1:{srv.server_address[1]}/", timeout=2) as r:
             assert r.status == 200                                   # 直连成功 → 未走代理
     finally:
@@ -558,9 +558,13 @@ def test_healthz_diag_cleared_on_recovery(env, monkeypatch):
 
 
 def _fake_uvicorn(monkeypatch, captured):
-    """注入假 uvicorn 模块，捕获 Server.run 收到的 sockets/Config。"""
+    """注入假 uvicorn 模块，捕获 Server.run 收到的 sockets/Config。
+
+    bootstrap 直导 uvicorn.config/uvicorn.server（★启动优化★，跳过 CLI 面），
+    故三个模块名都要进 sys.modules（config/server 以 package 形态挂在 uvicorn 下）。"""
     import types
     fake = types.ModuleType("uvicorn")
+    fake.__path__ = []  # 标记为 package，使 from uvicorn.config import ... 可解析
 
     class Config:
         def __init__(self, app, **kw):
@@ -575,7 +579,13 @@ def _fake_uvicorn(monkeypatch, captured):
             captured["bound_port"] = sockets[0].getsockname()[1] if sockets else None
 
     fake.Config, fake.Server = Config, Server
+    fake_config = types.ModuleType("uvicorn.config")
+    fake_config.Config = Config
+    fake_server = types.ModuleType("uvicorn.server")
+    fake_server.Server = Server
     monkeypatch.setitem(sys.modules, "uvicorn", fake)
+    monkeypatch.setitem(sys.modules, "uvicorn.config", fake_config)
+    monkeypatch.setitem(sys.modules, "uvicorn.server", fake_server)
     return fake
 
 

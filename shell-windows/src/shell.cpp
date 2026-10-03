@@ -276,9 +276,13 @@ static void stdio_redirect_to_log(void) {
     fflush(stdout);
 }
 
-/* 引导阶段日志锚点（立即落盘——卡死时也必须看得到卡点） */
+/* 引导阶段日志锚点（立即落盘——卡死时也必须看得到卡点）。
+ * 前缀 [+.sss] = 自 stdio 重定向（≈进程启动）起的毫秒数：启动性能归因用。 */
+static ULONGLONG g_t0 = 0;
 static void slog(const char *s) {
-    printf("[shell] %s\n", s);
+    if (!g_t0) g_t0 = GetTickCount64();
+    printf("[+%5llu ms] [shell] %s\n",
+           (unsigned long long)(GetTickCount64() - g_t0), s);
     fflush(stdout);
 }
 
@@ -714,8 +718,7 @@ public:
         (void)sender;
         BOOL ok = FALSE;
         args->get_IsSuccess(&ok);
-        printf("[shell] nav completed ok=%d\n", ok ? 1 : 0);
-        fflush(stdout);
+        slog(ok ? "nav completed ok=1" : "nav completed ok=0");
         if (ok) {
             if (g_splash) { /* 页面已实际渲染：撤掉加载层 */
                 DestroyWindow(g_splash);
@@ -732,14 +735,16 @@ private:
 
 /* 导航到应用首页（附一次性握手码） */
 static void navigate_to_app(void) {
-    char code[65];
+    char code[65], line[128];
     wchar_t url[160];
     if (!g_web2 || !g_port) return;
     if (!random_hex64(code)) return;
     atomic_write_utf8(g_handshake, code, 64);
     _snwprintf(url, 159, L"http://127.0.0.1:%d/?handshake=%hs", g_port, code);
     url[159] = 0;
-    printf("[shell] navigate port=%d\n", g_port);
+    _snprintf(line, sizeof(line) - 1, "navigate port=%d", g_port);
+    line[sizeof(line) - 1] = 0;
+    slog(line);
     g_web2->Navigate(url);
 }
 
@@ -976,7 +981,13 @@ static void on_tick(void) {
             g_last_seq_change = now;
             g_phase = PH_RUNTIME;
             if (g_web2) navigate_to_app();
-            printf("[shell] ready seen port=%d seq=%ld\n", g_port, g_last_seq);
+            {
+                char line[96];
+                _snprintf(line, sizeof(line) - 1, "ready seen port=%d seq=%ld",
+                          g_port, g_last_seq);
+                line[sizeof(line) - 1] = 0;
+                slog(line);
+            }
             return;
         }
         if (now - g_boot_start > BOOT_TIMEOUT_MS) {
