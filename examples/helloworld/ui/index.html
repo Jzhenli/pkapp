@@ -10,31 +10,44 @@
 </style></head>
 <body>
 <h1>Hello, World!</h1>
-<p>pkapp 打包链演示：create → build → 换名重编壳 → 装壳启动。</p>
+<p>pkapp 打包链演示：create → build → package → 解压即用。</p>
 <p>接口自检：<code id="api">请求 /api/hello …</code></p>
 <script>
-  // 鉴权握手：壳导航带一次性 ?handshake= 码 → POST /auth 换 token → API 带 x-myapp-token 头。
-  // token 存 sessionStorage，页面刷新免重复握手。
+  // dev（pkapp dev，非严格鉴权）直连即可；打包态（壳注入 MYAPP_STRICT_AUTH=1）先直连，
+  // 401 时走握手：壳导航带一次性 ?handshake= 码 → POST /auth 换 token → API 带
+  // x-myapp-token 头。token 存 sessionStorage，页面刷新免重复握手。
   (function () {
     var el = document.getElementById('api');
-    var qs = new URLSearchParams(location.search);
-    var call = function (tk) {
-      sessionStorage.setItem('tk', tk);
-      fetch('/api/hello', { headers: { 'x-myapp-token': tk } })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          el.textContent = 'version=' + j.version + ' · data_dir=' + j.data_dir;
-        })
-        .catch(function (e) { el.textContent = '失败: ' + e; });
+    var show = function (j) {
+      el.textContent = 'version=' + j.version + ' · data_dir=' + j.data_dir;
     };
-    var tk = sessionStorage.getItem('tk');
-    if (tk) { call(tk); return; }
-    fetch('/auth', { method: 'POST',
-                     headers: { 'content-type': 'application/json' },
-                     body: JSON.stringify({ handshake: qs.get('handshake') }) })
-      .then(function (r) { return r.json(); })
-      .then(function (j) { call(j.token); })
-      .catch(function (e) { el.textContent = '失败: ' + e; });
+    var handshaken = false;   // 握手单次闸门：码缺失/已消费时 applocal 恒回 403 JSON，
+                              // 不设闸门 call(undefined) → 401 → 再握手会无限循环
+    var call = function (tk) {
+      if (tk) { sessionStorage.setItem('tk', tk); }
+      fetch('/api/hello', tk ? { headers: { 'x-myapp-token': tk } } : {})
+        .then(function (r) {
+          if (r.status === 401 || r.status === 403) { throw { needHandshake: true }; }
+          return r.json();
+        })
+        .then(show)
+        .catch(function (e) {
+          if (!e || !e.needHandshake) { el.textContent = '失败: ' + (e.message || e); return; }
+          if (handshaken) { el.textContent = '握手失败：一次性握手码缺失或已消费'; return; }
+          handshaken = true;
+          var qs = new URLSearchParams(location.search);
+          fetch('/auth', { method: 'POST',
+                           headers: { 'content-type': 'application/json' },
+                           body: JSON.stringify({ handshake: qs.get('handshake') }) })
+            .then(function (r) { return r.json(); })
+            .then(function (j) {
+              if (!j || !j.token) { throw new Error((j && j.error) || '未取得 token'); }
+              call(j.token);
+            })
+            .catch(function (e2) { el.textContent = '握手失败: ' + (e2.message || e2); });
+        });
+    };
+    call(sessionStorage.getItem('tk'));
   })();
 </script>
 </body></html>

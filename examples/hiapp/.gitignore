@@ -6,3 +6,5 @@ install-test/
 .pkapp/
 __pycache__/
 *.pyc
+node_modules/
+ui/
