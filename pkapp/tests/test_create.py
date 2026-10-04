@@ -68,3 +68,25 @@ def test_create_fullstack(tmp_path):
 def test_create_bad_name_and_template(tmp_path):
     assert cmd_create("9bad", str(tmp_path / "x"), no_venv=True) == 2
     assert cmd_create("ok", str(tmp_path / "y"), template="bogus", no_venv=True) == 2
+
+
+def test_create_skips_pip_bytecode(tmp_path, monkeypatch):
+    """wheel 装入 venv 后 pip compileall 会在模板 app/*.py 旁生成 __pycache__/*.pyc，
+    二进制读入即 UnicodeDecodeError（0.1.4 wheel 实测事故）——必须跳过。"""
+    import shutil
+
+    from pkapp.commands import create as create_mod
+
+    tpl_root = tmp_path / "tpl"
+    shutil.copytree(os.path.join(create_mod._TEMPLATE_ROOT, "minimal"),
+                    tpl_root / "minimal")
+    pyc_dir = tpl_root / "minimal" / "app" / "__pycache__"
+    pyc_dir.mkdir()
+    (pyc_dir / "main.cpython-312.pyc").write_bytes(b"\xcb\x0d\x0d\x0a" + b"\x00" * 16)
+    monkeypatch.setattr(create_mod, "_TEMPLATE_ROOT", str(tpl_root))
+
+    root = str(tmp_path / "demo")
+    assert create_mod.cmd_create("demo", root, no_venv=True) == 0
+    assert not os.path.exists(os.path.join(root, "app", "__pycache__"))
+    src = open(os.path.join(root, "app", "main.py"), encoding="utf-8").read()
+    assert "applocal" in src and "async def app(" in src

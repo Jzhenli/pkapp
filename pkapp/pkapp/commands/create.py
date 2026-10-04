@@ -28,9 +28,13 @@ def _render_file(src: str, dst: str, name: str, pkg: str) -> None:
 def _scaffold(template: str, root: str, name: str, pkg: str) -> None:
     tpl_dir = os.path.join(_TEMPLATE_ROOT, template)
     for rel in walk_files(tpl_dir):
+        # pip 装 wheel 后 compileall 会在模板 app/*.py 旁生成 __pycache__/*.pyc
+        # （非模板内容，二进制读入即 UnicodeDecodeError）——安装噪声一律跳过
+        parts = rel.split("/")
+        if "__pycache__" in parts or parts[-1].endswith(".pyc"):
+            continue
         # 模板内 .gitignore 存为 gitignore（避免其 ui/ 等规则在仓库内误伤模板自身），
         # 生成时还原文件名
-        parts = rel.split("/")
         if parts[-1] == "gitignore":
             parts[-1] = ".gitignore"
         _render_file(os.path.join(tpl_dir, rel), os.path.join(root, *parts), name, pkg)
