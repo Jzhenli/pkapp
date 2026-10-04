@@ -36,7 +36,8 @@ out/
 .kotlin/
 local.properties
 
-# Android 壳解释器件（prepare_runtime.py / prepare_libpython.py 从 flet 快照铺设，可再生成）
+# Android 壳解释器件（★方案A★：package 时 android_shell.py 注入到物化目录，可再生成；
+# d1-spike 用 prepare_libpython.py 铺设）
 **/jniLibs/
 **/assets/stdlib.zip
 

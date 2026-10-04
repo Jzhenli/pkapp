@@ -11,6 +11,10 @@ val ksAlias = project.findProperty("pkappKsAlias") as String? ?: "pkapp"
 // 应用图标（★v1.2★）：pkapp 经 -PpkappIconRes 注入 PNG 资源目录——debug/release
 // sourceSet 优先级高于 main，同名 @drawable/ic_app 同配置整体覆盖壳默认矢量图标
 val pkappIconRes = project.findProperty("pkappIconRes") as String?
+// abi 集（★方案A★）：pkapp 经 -PpkappAbis 注入（如 "arm64-v8a" / "arm64-v8a,x86_64"）——
+// 裸模板无预铺设 jniLibs，abi 过滤与注入的运行时一致由 pkapp 保证；缺省 = 直接构建壳工程
+val pkappAbis = (project.findProperty("pkappAbis") as String?)
+    ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
 
 android {
     namespace = "com.pkapp.shell"
@@ -60,8 +64,9 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.2.0"
-        // M2 真机回归：arm64-v8a 单 ABI（模拟器 x86_64 时在 ndk.abiFilters 增补并重跑 prepare_runtime.py）
-        ndk { abiFilters += listOf("arm64-v8a") }
+        // abi 过滤（★方案A★）：-PpkappAbis 注入（pkapp 与注入的运行时 abi 集一致）；
+        // 缺省回退 arm64-v8a（M2 真机回归形态）
+        ndk { abiFilters += (pkappAbis ?: listOf("arm64-v8a")) }
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=none") } }
     }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }

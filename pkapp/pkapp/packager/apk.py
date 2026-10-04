@@ -1,4 +1,9 @@
-"""APK 组装引擎（★v8.4★，pkapp package android 的实现）：spk 入壳 assets → gradle → 验收落 release/。
+"""APK 组装引擎（★v8.5★，pkapp package android 的实现）：壳模板 → 注入运行时 → spk 入壳 assets → gradle → 验收落 release/。
+
+壳模板解析顺序：--shell-dir > PKAPP_SHELL_DIR > 仓库 shell-android/shell >
+wheel 内置 _vendor/shell-android（android_shell.vendored_template_dir）。
+模板一律为裸源码形态（★方案A★）：构建前先物化到 <cache>/shells/android/<指纹>/
+并注入托管运行时（android_shell.py）。
 
 壳工程（gradle）与安卓工具链是构建机环境，路径解析顺序：显式参数 > 环境变量
 （PKAPP_SHELL_DIR / PKAPP_ANDROID_TOOLCHAIN）> toolchain 默认布局。
@@ -11,12 +16,20 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import zipfile
 
 # 壳工程随仓库分发，默认取仓库内 shell-android/shell（apk.py 位于 <repo>/pkapp/pkapp/packager/）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 DEFAULT_SHELL_DIR = os.path.join(_REPO_ROOT, "shell-android", "shell")
+
+# 物化壳目录构建锁（★方案A★ review 加固）：物化目录 <cache>/shells/android/android-<fp>/
+# 跨项目共享（指纹=模板×运行时×abis，不含项目身份），并发构建互踩（runtime.spk 覆写 /
+# gradle app/build 冲突）→ O_CREAT|O_EXCL 原子互斥；残留锁超时自愈（gradle 正常 ≤900s
+# 超时，远小于阈值）。残余缺口：两个同指纹冷物化同时进行仍可能互踩（锁在物化之后）。
+_LOCK_NAME = ".pkapp-build.lock"
+_LOCK_STALE_S = 3600
 
 
 def _toolchain_paths() -> dict:
@@ -54,14 +67,41 @@ def artifact_name(name: str, version: str, platform: str,
     return f"{name}-{version}-{platform}-{arch}.{ext}"
 
 
+def _acquire_shell_lock(shell: str) -> str:
+    """物化目录互斥锁：返回锁文件路径（构建毕由调用方删除）。
+
+    新鲜锁在场 → ApkError 指向并发互斥语义（而非神秘 gradle 失败）；陈旧锁（崩溃
+    残留，超 _LOCK_STALE_S）→ 接管自愈。接管竞争由下一轮 O_EXCL 天然裁决。
+    """
+    lock = os.path.join(shell, _LOCK_NAME)
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if os.path.getmtime(lock) >= time.time() - _LOCK_STALE_S:
+                raise ApkError(f"物化壳目录正被另一 pkapp 构建占用（{lock}）——"
+                               "同指纹目录跨项目共享，勿并发构建；确认无并发后"
+                               "删除锁文件重试")
+            os.remove(lock)     # 崩溃残留的陈旧锁 → 自愈接管
+            continue
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return lock
+    raise ApkError(f"构建锁接管失败（{lock}）——请重试")
+
+
 def build_apk(project: str, app_name: str, spk_path: str, *,
               shell_dir: str | None = None, out_dir: str | None = None,
               variant: str = "debug", app_id: str = "",
               version: str = "", abis: tuple[str, ...] = (),
               keystore: str = "", keystore_pass: str = "",
-              keystore_alias: str = "pkapp", icon: str = "") -> str:
-    """spk → 壳 assets → gradle → <project>/release/<artifact_name>（如
-    HiApp-0.1.0-android-arm64_v8a-x86_64.apk，★产物命名带版本/平台/架构★）。
+              keystore_alias: str = "pkapp", icon: str = "",
+              runtime_dir: str | None = None) -> str:
+    """壳模板 → 注入运行时 → spk 入壳 assets → gradle → <project>/release/<artifact_name>
+    （如 HiApp-0.1.0-android-arm64_v8a.apk，★产物命名带版本/平台/架构★）。
+
+    runtime_dir = android 托管运行时快照根（package.py 经 runtime.resolve 传入）——
+    注入的数据源；缺失时 materialize fail-fast 指向 fetch。
 
     app_id = [platforms.android].package（必填；经 -PpkappAppId 注入 gradle
     applicationId，★v1.2★ 解决多应用同机共存——固定 com.pkapp.shell 会互相顶替）。
@@ -80,42 +120,59 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     if keystore and not keystore_pass:
         raise ApkError("提供 keystore 时必须同时提供密码"
                        "（env PKAPP_KEYSTORE_PASS；密码永不写入 AppSpec）")
-    shell = shell_dir or os.environ.get("PKAPP_SHELL_DIR") or DEFAULT_SHELL_DIR
-    assets = os.path.join(shell, "app", "src", "main", "assets")
-    gradle_py = os.path.join(shell, "build.gradle.kts")
-    if not os.path.isdir(assets) or not os.path.isfile(gradle_py):
-        raise ApkError(f"壳工程不完整（缺 {assets} 或 {gradle_py}）；"
-                       "可用 --shell-dir 或 PKAPP_SHELL_DIR 指定壳工程根")
+    from . import android_shell
 
-    with open(spk_path, "rb") as f:
-        spk_bytes = f.read()
-    # 拷入 + touch 目录（绕过增量 mergeDebugAssets 的 mtime 盲区）
-    os.makedirs(assets, exist_ok=True)
-    with open(os.path.join(assets, "runtime.spk"), "wb") as f:
-        f.write(spk_bytes)
-    os.utime(assets, None)
+    src = (shell_dir or os.environ.get("PKAPP_SHELL_DIR")
+           or (DEFAULT_SHELL_DIR if os.path.isdir(DEFAULT_SHELL_DIR) else None)
+           or android_shell.vendored_template_dir())
+    gradle_py = os.path.join(src or "", "build.gradle.kts")
+    app_gradle = os.path.join(src or "", "app", "build.gradle.kts")
+    if not src or not os.path.isfile(gradle_py) or not os.path.isfile(app_gradle):
+        raise ApkError(f"壳模板缺失或不完整（{src or '无候选'}：缺 {gradle_py} 或 "
+                       f"{app_gradle}）；可用 --shell-dir 或 PKAPP_SHELL_DIR 指定壳模板根")
+    try:
+        shell = android_shell.materialize(src, runtime_dir, abis)
+    except android_shell.AndroidShellError as e:
+        raise ApkError(str(e)) from None
 
-    _run_gradle(shell, variant, app_id, app_name,
-                keystore if keystore else None,
-                keystore_pass if keystore else "",
-                keystore_alias if keystore else "",
-                _stage_icon_res(project, icon) if icon else None)
+    lock = _acquire_shell_lock(shell)   # 物化目录跨项目共享 → 构建期互斥
+    try:
+        with open(spk_path, "rb") as f:
+            spk_bytes = f.read()
+        assets = os.path.join(shell, "app", "src", "main", "assets")
+        # 拷入 + touch 目录（绕过增量 mergeDebugAssets 的 mtime 盲区）
+        os.makedirs(assets, exist_ok=True)
+        with open(os.path.join(assets, "runtime.spk"), "wb") as f:
+            f.write(spk_bytes)
+        os.utime(assets, None)
 
-    apk_src = os.path.join(shell, "app", "build", "outputs", "apk", variant,
-                           f"app-{variant}.apk")
-    if not os.path.isfile(apk_src):
-        unsigned = os.path.join(shell, "app", "build", "outputs", "apk", variant,
-                                f"app-{variant}-unsigned.apk")
-        if os.path.isfile(unsigned):
-            raise ApkError(f"检测到未签名产物 {unsigned}——keystore 未注入 gradle？")
-        raise ApkError(f"gradle 未产出 {apk_src}")
-    _verify_asset_in_apk(apk_src, spk_bytes)
+        _run_gradle(shell, variant, app_id, app_name,
+                    keystore if keystore else None,
+                    keystore_pass if keystore else "",
+                    keystore_alias if keystore else "",
+                    _stage_icon_res(project, icon) if icon else None, abis)
 
-    dest_dir = out_dir or os.path.join(project, "release")
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, artifact_name(app_name, version, "android", abis))
-    shutil.copyfile(apk_src, dest)
-    return dest
+        apk_src = os.path.join(shell, "app", "build", "outputs", "apk", variant,
+                               f"app-{variant}.apk")
+        if not os.path.isfile(apk_src):
+            unsigned = os.path.join(shell, "app", "build", "outputs", "apk", variant,
+                                    f"app-{variant}-unsigned.apk")
+            if os.path.isfile(unsigned):
+                raise ApkError(f"检测到未签名产物 {unsigned}——keystore 未注入 gradle？")
+            raise ApkError(f"gradle 未产出 {apk_src}")
+        _verify_asset_in_apk(apk_src, spk_bytes)
+
+        dest_dir = out_dir or os.path.join(project, "release")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, artifact_name(app_name, version, "android", abis))
+        shutil.copyfile(apk_src, dest)
+        return dest
+    finally:
+        if lock:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
 
 
 def _stage_icon_res(project: str, icon: str) -> str:
@@ -138,9 +195,11 @@ def _stage_icon_res(project: str, icon: str) -> str:
 
 def _run_gradle(shell: str, variant: str, app_id: str, label: str,
                 keystore: str | None = None, keystore_pass: str = "",
-                keystore_alias: str = "", icon_res: str | None = None) -> None:
+                keystore_alias: str = "", icon_res: str | None = None,
+                abis: tuple[str, ...] = ()) -> None:
     """转发 gradle assemble<Variant>；-PpkappAppId/-PpkappLabel 注入 applicationId/
-    应用显示名（★v1.2★）；icon_res 非空时经 -PpkappIconRes 注入图标组资源目录 +
+    应用显示名（★v1.2★）；-PpkappAbis 注入 ndk.abiFilters（★方案A★，裸模板按注入的
+    abi 集构建；缺省壳回退 arm64-v8a）；icon_res 非空时经 -PpkappIconRes 注入图标组资源目录 +
     -PpkappIcon 把 manifest android:icon placeholder 切到 @mipmap/ic_app；keystore
     非空时经 ORG_GRADLE_PROJECT_pkappKs/Pass/Alias 环境变量注入（gradle 映射为同名
     project property，findProperty 原样可读）——密码不进命令行，防同机进程列表
@@ -161,6 +220,8 @@ def _run_gradle(shell: str, variant: str, app_id: str, label: str,
         env["ORG_GRADLE_PROJECT_pkappKsPass"] = keystore_pass
         env["ORG_GRADLE_PROJECT_pkappKsAlias"] = keystore_alias
     props = [f"-PpkappAppId={app_id}", f"-PpkappLabel={label}"]
+    if abis:
+        props.append(f"-PpkappAbis={','.join(abis)}")
     if icon_res:
         props += [f"-PpkappIconRes={icon_res}", "-PpkappIcon=@mipmap/ic_app"]
     r = subprocess.run([gradle, "--no-daemon", "-p", shell, *props,

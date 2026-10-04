@@ -103,8 +103,8 @@ def _add_android_icon(proj):
 
 
 def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
-    """monkeypatch gradle：记录 -PpkappAppId/-PpkappIconRes 注入；在壳工程产物位放一个
-    假 APK（含/缺 assets/runtime.spk）。返回 captured 字典供断言。"""
+    """monkeypatch gradle：记录 -PpkappAppId/-PpkappIconRes/-PpkappAbis 注入；在壳工程产物位
+    放一个假 APK（含/缺 assets/runtime.spk）。返回 captured 字典供断言。"""
     fake_apk = tmp_path / "fake.apk"
     with zipfile.ZipFile(fake_apk, "w") as zf:
         if with_asset:
@@ -114,10 +114,10 @@ def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
 
     def fake_gradle(shell_dir, variant, app_id, label,
                     keystore=None, keystore_pass="", keystore_alias="",
-                    icon_res=None):
+                    icon_res=None, abis=()):
         captured.update(app_id=app_id, label=label, keystore=keystore,
                         keystore_pass=keystore_pass, keystore_alias=keystore_alias,
-                        icon_res=icon_res)
+                        icon_res=icon_res, abis=abis)
         out_apk = os.path.join(shell_dir, "app", "build", "outputs", "apk", variant)
         os.makedirs(out_apk)
         name = f"app-{variant}.apk"
@@ -129,14 +129,19 @@ def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
     return captured
 
 
-def _fake_shell(tmp_path):
-    shell = tmp_path / "shell"
-    (shell / "app" / "src" / "main" / "assets").mkdir(parents=True)
-    (shell / "build.gradle.kts").write_text("// stub", encoding="utf-8")
-    return str(shell)
+def _bare_template(tmp_path):
+    """裸壳模板（★方案A★ 唯一形态）：纯源码，物化+注入由 mock 快照供给数据。"""
+    t = tmp_path / "tpl"
+    (t / "app" / "src" / "main").mkdir(parents=True)
+    (t / "settings.gradle.kts").write_text("// s", encoding="utf-8")
+    (t / "build.gradle.kts").write_text("// r", encoding="utf-8")
+    (t / "app" / "build.gradle.kts").write_text("// a", encoding="utf-8")
+    (t / "app" / "src" / "main" / "AndroidManifest.xml").write_text("<m/>",
+                                                                    encoding="utf-8")
+    return str(t)
 
 
-def test_package_android_builds_apk(tmp_path, monkeypatch):
+def test_package_android_builds_apk(tmp_path, monkeypatch, mock_android_runtime):
     proj = _make_project(tmp_path)
 
     _write_spk(proj, "android")
@@ -145,7 +150,7 @@ def test_package_android_builds_apk(tmp_path, monkeypatch):
         spk_bytes = f.read()
     captured = _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=spk_bytes)
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 0
+                 "--shell-dir", _bare_template(tmp_path)]) == 0
     assert captured["app_id"] == "com.example.myapp"      # -PpkappAppId 注入链（★v1.2★）
     assert captured["label"] == "myapp"                   # -PpkappLabel = app.name（★v1.2★）
     apk_path = os.path.join(proj, "release", "myapp-0.1.0-android-arm64_v8a.apk")
@@ -154,7 +159,7 @@ def test_package_android_builds_apk(tmp_path, monkeypatch):
         assert zf.read("assets/runtime.spk") == spk_bytes
 
 
-def test_package_android_icon_injected(tmp_path, monkeypatch):
+def test_package_android_icon_injected(tmp_path, monkeypatch, mock_android_runtime):
     """[platforms.android].icon → 相对路径解析 + 图标组生成 + -PpkappIconRes 注入链。"""
     from PIL import Image
 
@@ -166,7 +171,7 @@ def test_package_android_icon_injected(tmp_path, monkeypatch):
         spk_bytes = f.read()
     captured = _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=spk_bytes)
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 0
+                 "--shell-dir", _bare_template(tmp_path)]) == 0
     res_dir = os.path.join(os.path.abspath(proj), "build", "platform-android", "icon-res")
     assert os.path.normcase(captured["icon_res"]) == os.path.normcase(res_dir)
     # 图标组：全密度传统位图 + 自适应前景层 + anydpi-v26 定义 + 背景色
@@ -184,7 +189,8 @@ def test_package_android_icon_injected(tmp_path, monkeypatch):
                             encoding="utf-8").read()
 
 
-def test_package_android_icon_missing(tmp_path, monkeypatch, capsys):
+def test_package_android_icon_missing(tmp_path, monkeypatch, capsys,
+                                      mock_android_runtime):
     """icon 指向不存在的文件 → fail-fast（exit 2，同 windows 图标前置检查语义）。"""
     proj = _make_project(tmp_path)
 
@@ -197,11 +203,12 @@ def test_package_android_icon_missing(tmp_path, monkeypatch, capsys):
     with open(path, "w", encoding="utf-8") as f:
         f.write(txt)
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 2
+                 "--shell-dir", _bare_template(tmp_path)]) == 2
     assert "图标文件不存在" in capsys.readouterr().out
 
 
-def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys):
+def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys,
+                                      mock_android_runtime):
     """icon 非位图（Pillow 无法识别）→ ApkError 拒绝组装。"""
     proj = _make_project(tmp_path)
 
@@ -211,22 +218,23 @@ def test_package_android_icon_not_png(tmp_path, monkeypatch, capsys):
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 1
+                 "--shell-dir", _bare_template(tmp_path)]) == 1
     assert "图标" in capsys.readouterr().out
 
 
-def test_package_android_requires_app_id(tmp_path, monkeypatch, capsys):
+def test_package_android_requires_app_id(tmp_path, monkeypatch, capsys,
+                                         mock_android_runtime):
     """未配 [platforms.android].package → 拒绝组装（固定共享 id 会同机互相顶替）。"""
     proj = _make_project(tmp_path)
     _strip_android_package(proj)          # 模板已预填 → 还原缺省态以覆盖缺失分支
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=b"PK")
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 1
+                 "--shell-dir", _bare_template(tmp_path)]) == 1
     assert "package 必填" in capsys.readouterr().out
 
 
-def test_package_android_release_signed(tmp_path, monkeypatch):
+def test_package_android_release_signed(tmp_path, monkeypatch, mock_android_runtime):
     """★v1.2★ release 签名链：env keystore+密码 → -PpkappKs* 注入 → release 产物。"""
     ks = tmp_path / "release.keystore"
     ks.write_bytes(b"ks-stub")
@@ -240,7 +248,7 @@ def test_package_android_release_signed(tmp_path, monkeypatch):
     monkeypatch.setenv("PKAPP_KEYSTORE_PASS", "s3cret")
     monkeypatch.setenv("PKAPP_KEYSTORE_ALIAS", "mykey")
     assert main(["package", "android", "--project", proj, "--variant", "release",
-                 "--shell-dir", _fake_shell(tmp_path)]) == 0
+                 "--shell-dir", _bare_template(tmp_path)]) == 0
     assert captured["keystore"] == str(ks)
     assert captured["keystore_pass"] == "s3cret"
     assert captured["keystore_alias"] == "mykey"
@@ -248,7 +256,8 @@ def test_package_android_release_signed(tmp_path, monkeypatch):
         proj, "release", "myapp-0.1.0-android-arm64_v8a.apk"))
 
 
-def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys):
+def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys,
+                                                mock_android_runtime):
     """★v1.2★ keystore 有路径无密码 → 拒绝（密码永不落文件,只走 env）。"""
     proj = _make_project(tmp_path)
 
@@ -257,17 +266,18 @@ def test_package_android_keystore_requires_pass(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PKAPP_KEYSTORE", str(tmp_path / "ks"))
     monkeypatch.delenv("PKAPP_KEYSTORE_PASS", raising=False)
     assert main(["package", "android", "--project", proj, "--variant", "release",
-                 "--shell-dir", _fake_shell(tmp_path)]) == 1
+                 "--shell-dir", _bare_template(tmp_path)]) == 1
     assert "必须同时提供密码" in capsys.readouterr().out
 
 
-def test_package_android_rejects_missing_asset(tmp_path, monkeypatch, capsys):
+def test_package_android_rejects_missing_asset(tmp_path, monkeypatch, capsys,
+                                               mock_android_runtime):
     proj = _make_project(tmp_path)
 
     _write_spk(proj, "android")
     _fake_gradle(monkeypatch, tmp_path, with_asset=False, spk_bytes=b"")
     assert main(["package", "android", "--project", proj,
-                 "--shell-dir", _fake_shell(tmp_path)]) == 1
+                 "--shell-dir", _bare_template(tmp_path)]) == 1
     out = capsys.readouterr().out
     assert "APK 组装失败" in out
     assert "未入 APK" in out

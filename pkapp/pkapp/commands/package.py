@@ -261,13 +261,25 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
             os.path.abspath(project), spec.android_keystore))
     keystore_pass = os.environ.get("PKAPP_KEYSTORE_PASS") or ""
     keystore_alias = os.environ.get("PKAPP_KEYSTORE_ALIAS") or "pkapp"
+    # android 运行时快照 = 壳模板注入的数据源；解析失败降级 None（上方已透出原因），
+    # 由 apk.py fail-fast 指向 fetch
+    runtime_dir = None
+    try:
+        from ..packager import runtime as _rt
+        runtime_dir = _rt.resolve(spec, "android", abis=spec.android_abis).dir
+    except Exception as e:
+        runtime_dir = None
+        # 静默降级会让"快照在场但校验失败"（python_version 不一致等）伪装成缺快照，
+        # 误导用户重跑 fetch——透出真实原因一行
+        print(f"[package] android 运行时快照未解析: {e}")
     try:
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
                              out_dir=out_dir, variant=variant,
                              app_id=spec.android_package,
                              version=spec.version, abis=spec.android_abis,
                              keystore=keystore, keystore_pass=keystore_pass,
-                             keystore_alias=keystore_alias, icon=icon)
+                             keystore_alias=keystore_alias, icon=icon,
+                             runtime_dir=runtime_dir)
     except ApkError as e:
         print(f"[package] APK 组装失败: {e}")
         return 1

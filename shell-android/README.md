@@ -1,4 +1,4 @@
-# shell-android — pkapp Android Kotlin 壳 ★v8.4★
+# shell-android — pkapp Android Kotlin 壳 ★v8.5★
 
 协议 A（v1.3）的 Android 实现。壳 = **引导器**（§10.2 投影：验签由 APK 签名承担、
 单实例由 launcher 承担、原子性由 PackageManager 承担），剩余职责：assets 解压 →
@@ -22,9 +22,6 @@ shell-android/
 ├── d1-spike/                     # D1 硬闸遗留：JNI 引导最小验证（九步配方来源）
 ├── shell/                        # gradle 工程根
 │   ├── settings.gradle.kts / build.gradle.kts / gradle.properties
-│   ├── tools/
-│   │   └── prepare_runtime.py    # flet 快照 → 壳工程：支持库+libpython→jniLibs、
-│   │                             #   modules/*.so 平铺→jniLibs、stdlib→assets/stdlib.zip(STORED)
 │   └── app/
 │       ├── build.gradle.kts      # abiFilters / useLegacyPackaging / noCompress "spk"
 │       ├── src/main/
@@ -34,26 +31,27 @@ shell-android/
 │       │   │   ├── MainActivity.kt   # 解压→env→engineBoot→ready tick→WebView+握手镜像
 │       │   │   ├── BootService.kt    # 前台服务（specialUse：embedded-python-local-server）
 │       │   │   └── ShellLog.kt       # logcat+文件双写，按天轮转留 7 份
-│       │   ├── assets/           # runtime.spk（pkapp package android 自动拷入）+ stdlib.zip（prepare 生成）
-│       │   ├── jniLibs/arm64-v8a/    # libpython3.12.so + 支持库 + 56 个扩展模块平铺
 │       │   └── res/              # network_security_config（仅 127.0.0.1 明文）+ 图标
 │       └── build/outputs/apk/debug/app-debug.apk   # 构建产物
+│
+│   # assets/ 与 jniLibs/ 不入仓库（★方案A★ 裸模板）：package 时 android_shell.py
+│   # 按指纹物化到 <PKAPP_CACHE>/shells/android/ 并从托管快照注入（lib 前缀契约
+│   # + stdlib.zip ZIP_STORED + runtime.spk 拷入）
 └── tests/
     └── test_shell_contract_device.py   # 8 例真机契约回归（§12.2 外部可观测子集）
 ```
 
-## 构建（★v8.4★ 两条命令版）
+## 构建（★v8.5★ 两条命令版，★方案A★ 裸模板+构建期注入）
 
 前置：toolchain 就位（JDK17 + SDK 35 + NDK 27）——推荐 `pkapp fetch android` 托管缓存
 （JDK/Gradle/SDK 五组件/py-android 运行时一次到位，licenses 自动落盘）；或手工布置
 `%PKAPP_ANDROID_TOOLCHAIN%\{jdk\jdk-17.0.20.1+1,android-sdk,gradle-8.9,gradle-home}` 整体根
-（见 `shell/build.bat`；首次需 `prepare_runtime.py` 铺解释器件）。
+（见 `shell/build.bat`）。
 
 ```bat
-:: 1) 首次/换快照：准备解释器件（从 flet python-build 快照铺设 jniLibs/assets）
-python shell-android\tools\prepare_runtime.py --dist <快照目录> --abi arm64-v8a
-
-:: 2) 构建 spk + 打 APK（cwd=项目目录；applocal 不在 PyPI 需 PIP_FIND_LINKS）
+:: 构建 spk + 打 APK（cwd=项目目录；applocal 不在 PyPI 需 PIP_FIND_LINKS）
+:: 解释器件（jniLibs/stdlib.zip）无需预铺设——package 时按指纹物化模板并从托管
+:: 快照注入（android_shell.py）；快照缺失时报错指向 `pkapp fetch android`
 cd /d <项目目录>
 set PIP_FIND_LINKS=%REPO%\out\e2e\wheels
 %REPO%\.venv\Scripts\pkapp.exe build android
