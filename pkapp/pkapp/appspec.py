@@ -72,6 +72,7 @@ class AppSpec:
     min_app_version: str
     dependencies: tuple[str, ...] = ()
     coexist: bool = False
+    code_encryption: bool = False        # [app] code_encryption（★②加密+壳持钥★ §8；缺省关闭 G6）
     min_pkapp_version: str = "0.1.0"
     dist_dir: str = "dist"
     app_dir: str = "app"
@@ -255,6 +256,7 @@ def load(path: str) -> AppSpec:
         min_app_version=str(app.get("min_app_version", "")),
         dependencies=tuple(str(d) for d in deps.get("python", ())),
         coexist=bool(app.get("coexist", False)),
+        code_encryption=bool(app.get("code_encryption", False)),
         min_pkapp_version=str(app.get("min_pkapp_version", "0.1.0")),
         dist_dir=str(dist.get("dir", "dist")),
         app_dir=str(dist.get("app_dir", "app")),

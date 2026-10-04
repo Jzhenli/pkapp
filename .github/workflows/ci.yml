@@ -12,7 +12,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest]        # 自用主开发环境；后续可加 ubuntu
-        python: ["3.11", "3.12"]
+        python: ["3.12"]            # 工具链测试绑定 3.12 语义（golden mock python312.dll、
+                                    # 加密链 pyc tag 锁 3.12——设计 §3"项目锁定 CPython 3.12"）
     runs-on: ${{ matrix.os }}
     env:
       PYTHONUTF8: "1"               # runner 默认 cp1252，中文测试输出统一 UTF-8
@@ -26,6 +27,9 @@ jobs:
           python -m pip install pytest -q
           python -m pip install -e applocal -q
           python -m pip install -e pkapp -q
+      - name: Build keylib key-holder (keylib 契约/运行期 finder 测试前置)
+        working-directory: keylib
+        run: .\build.bat
       - name: applocal 契约测试（协议 A §12.1）
         run: python -m pytest applocal/tests -q
       - name: pkapp 工具测试（含 golden G1-G7，mock runtime）

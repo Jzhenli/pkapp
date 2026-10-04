@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import importlib.metadata
+import marshal
 import os
 import py_compile
 import re
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import zipfile
 
 from ..appspec import AppSpec
@@ -23,6 +25,9 @@ from ..toolchain import cache_root
 from ..util import SPK_DATE, atomic_write, copy_tree, tree_hash
 from . import manifest as mf
 from . import pe, runtime, sign, spk
+from .keylib import (KeyLib, KeyLibError, INDEX_FILE_NAME, INDEX_MODULE_ID,
+                     blob_name, build_index_payload, ensure_code_key,
+                     locate_dll, module_id_for, patch_dll)
 from .runtime import RuntimeResolveError, RuntimeSnapshot
 
 FORMAT_VERSION = "1"
@@ -46,11 +51,13 @@ def _is_system_dll(name: str) -> bool:
     return n in _SYSTEM_DLLS or n.startswith(("api-ms-win-", "ext-ms-"))
 
 
-def check_closure(stage: str, python_dll: str) -> None:
+def check_closure(stage: str, python_dll: str,
+                  extra_dirs: tuple[str, ...] = ()) -> None:
     """B.s 依赖闭包自检：pyd/.dll 的传递依赖必须闭环（缺 → 构建失败，G7）。
 
-    解析域 = DLLs/ ∪ stage 根（解释器本体与伴生 DLL 在根，不在 DLLs/）——
-    真 PBS 实测教训：pyd 依赖 python312.dll，只扫 DLLs/ 会误报缺口。
+    解析域 = DLLs/ ∪ stage 根 ∪ extra_dirs（★v1.3★ Q5：app/ 纳入扫描域，为③ pyd
+    立项预留健康检查位）——真 PBS 实测教训：pyd 依赖 python312.dll，只扫 DLLs/
+    会误报缺口。
     """
     dlls_dir = os.path.join(stage, "DLLs")
     present: dict[str, str] = {}   # 小写文件名 → 完整路径
@@ -60,6 +67,11 @@ def check_closure(stage: str, python_dll: str) -> None:
     for fn in os.listdir(stage):
         if fn.lower().endswith(".dll"):
             present.setdefault(fn.lower(), os.path.join(stage, fn))
+    for extra in extra_dirs:
+        for dirpath, _dirnames, filenames in os.walk(extra):
+            for fn in filenames:
+                if fn.lower().endswith((".pyd", ".dll")):
+                    present.setdefault(fn.lower(), os.path.join(dirpath, fn))
 
     stack = [p for k, p in present.items() if k.endswith(".pyd")]
     pdl = python_dll.lower()
@@ -421,10 +433,10 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         _zip_lib(lib_work, os.path.join(stage, f"{stem}.zip"),
                  pyc_tag="cpython-" +
                          "".join(c for c in snapshot.python_dll if c.isdigit()))
-        # 3) DLLs/（.pyd + 传递原生依赖整体拷入；闭包自检见下）
+        # 3) DLLs/（.pyd + 传递原生依赖整体拷入；闭包自检见 step 7 之后——app/ 落盘
+        #    后统一扫描，扫描域含 app/（Q5），行为不变仅时序后移）
         shutil.copytree(os.path.join(snapshot.dir, "DLLs"),
                         os.path.join(stage, "DLLs"))
-        check_closure(stage, snapshot.python_dll)
         # 4) _pth 四行（B.x 派生式；app/ 不得写入——由 applocal bootstrap 运行时追加）
         pth = "\n".join([f"{stem}.zip", "DLLs", "site-packages", "import site"]) + "\n"
         atomic_write(os.path.join(stage, f"{stem}._pth"), pth.encode("utf-8"))
@@ -449,24 +461,146 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
             _placeholder_ui(os.path.join(stage, "ui"))
         # 7) app/ checked-hash pyc（B.u）——仅 app/（★v0.7★ site-packages 恒只带 .py，
         #    目录树首启自动建 __pycache__ 缓存，零副作用；app/ 恒保留源码，用户可内省）
-        _compile_checked_hash(os.path.join(stage, "app"), _snapshot_exe,
-                              snapshot.python_dll)
+        app_stage = os.path.join(stage, "app")
+        _compile_checked_hash(app_stage, _snapshot_exe, snapshot.python_dll)
+        # 7b) 代码加密（CODE_PROTECTION_DESIGN §6.1，[app] code_encryption=true 才启用；
+        #     缺省关闭 → 本步骤整体跳过，G6 零回归）
+        code_key_id = ""
+        if spec.code_encryption:
+            code_key_id = _encrypt_app_tree(app_stage, snapshot.python_dll,
+                                            project_dir)
 
-        # 8) 树哈希 + manifest + 签名 + spk
+        # 8) 树哈希 + manifest + 签名 + spk（闭包自检扫描域含 app/，Q5）
+        check_closure(stage, snapshot.python_dll, extra_dirs=(app_stage,))
         runtime_hash = tree_hash(stage, excludes=("app", "ui"))
         fields = _manifest_fields(spec, snapshot.python_dll,
                                   f"sha256:{runtime_hash}",
                                   _detect_applocal(sp_dir),
-                                  os.path.join(stage, "app"),
-                                  os.path.join(stage, "ui"))
+                                  app_stage,
+                                  os.path.join(stage, "ui"),
+                                  code_key_id=code_key_id)
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
         shutil.rmtree(lib_work, ignore_errors=True)
 
 
+def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
+    """代码加密主步骤（CODE_PROTECTION_DESIGN §6.1）——app/ 树 pyc → 加密 blob。
+
+    流程：ensure_code_key（Q1 自动 keygen）→ 逐模块 剥 16 字节 pyc 头 →
+    pkapp_encrypt（module_id 作确定性 nonce 派生 + AAD）→ 落 <sha256(mid)>.enc →
+    解密回读验证（GCM 打开 + marshal 成功）→ 才删该模块明文 .py/.pyc（顺序硬约束：
+    明文不允许越过"已验证密文"这道闸）→ 全量完成后落加密清单 index.enc + 删明文闸。
+    非 .py 资源明文保留（Q2）。返回 code_key_id（manifest 写入，§7.3 配对校验）。
+
+    G5 依赖链：pyc 载荷（PYTHONHASHSEED=0 子进程编译 + dfile=rel）与 nonce
+    （HMAC(K, mid)）双确定性 → 密文字节跨构建稳定 → app_hash 不变。
+    """
+    dll_path = locate_dll("windows")
+    if not dll_path:
+        raise BuildError(
+            "code_encryption=true 但 key-holder 件缺失（预期 keylib/build/"
+            "pkapp_key.dll 或 _vendor/keylib/windows/，可设 PKAPP_KEYLIB 指定）——"
+            "构建期即定局，运行期不可能凭空有件（§8）")
+    key, generated = ensure_code_key(project_dir)
+    if generated:
+        print("[build] .pkapp/code.key 已自动生成（256-bit）——请务必备份："
+              "丢失 = 无法按原 K 重建；轮换 = 全量重加密 + 重打包")
+    try:
+        KeyLib(dll_path)                       # 加载健全性检查（缺失/坏 PE 早炸）
+    except KeyLibError as e:
+        raise BuildError(str(e)) from e
+    # pyc 定位须用运行时解释器的 tag（_zip_lib 同款）——打包机解释器的
+    # cache_from_source 可能产出不同 magic tag 名
+    pyc_tag = "cpython-" + "".join(c for c in python_dll if c.isdigit())
+    # 加密/回验统一用 K 补丁后的 dll 副本：pkapp_encrypt 恒走参数 K，pkapp_decrypt
+    # 恒走内嵌 K——通用件的锚点 K 解不开项目密文；补丁形态与运行期逐位一致，
+    # 回验才等价于运行期打开
+    patch_dir = tempfile.mkdtemp(prefix="pkapp-keylib-")
+    try:
+        patched = os.path.join(patch_dir, "pkapp_key.dll")
+        try:
+            patch_dll(dll_path, patched, key)
+            kl = KeyLib(patched)
+        except KeyLibError as e:
+            raise BuildError(str(e)) from e
+        return _encrypt_app_tree_inner(stage_app, kl, key, pyc_tag)
+    finally:
+        shutil.rmtree(patch_dir, ignore_errors=True)
+
+
+def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
+                            pyc_tag: str) -> str:
+    """加密执行体（kl = K 补丁件副本；加密走参数 K、回验走内嵌 K）。"""
+    from ..util import walk_files
+    mids: list[str] = []
+    for rel in walk_files(stage_app):
+        if not rel.endswith(".py"):
+            continue
+        mid = module_id_for(rel)
+        src = os.path.join(stage_app, rel.replace("/", os.sep))
+        d, base = os.path.split(rel)
+        pyc = os.path.join(stage_app, d, "__pycache__", f"{base[:-3]}.{pyc_tag}.pyc")
+        if not os.path.isfile(pyc):
+            raise BuildError(f"加密缺 pyc（编译步骤未产出）: {rel}")
+        with open(pyc, "rb") as f:
+            raw = f.read()
+        if len(raw) <= 16:
+            raise BuildError(f"pyc 过短（不足 16 字节头）: {rel}")
+        payload = raw[16:]                       # 剥 pyc 头 = marshal 载荷（§5.3）
+        try:
+            blob = kl.encrypt(key, mid, payload)
+        except KeyLibError as e:
+            raise BuildError(f"加密失败: {mid}: {e}") from e
+        # 回验闸：GCM 打开 + marshal 载荷合法，才允许删该模块明文
+        try:
+            back = kl.decrypt(mid, blob)
+        except KeyLibError as e:
+            raise BuildError(f"加密回验解密失败: {mid}: {e}") from e
+        if back != payload:
+            raise BuildError(f"加密回验不一致（密文与明文不符）: {mid}")
+        try:
+            code = marshal.loads(back)
+        except Exception as e:
+            raise BuildError(f"加密载荷 marshal 校验失败: {mid}: {e}") from e
+        if not isinstance(code, types.CodeType):
+            raise BuildError(f"加密载荷非 code object: {mid}")
+        with open(os.path.join(stage_app, blob_name(mid)), "wb") as f:
+            f.write(blob)
+        os.remove(src)
+        os.remove(pyc)
+        mids.append(mid)
+    if not mids:
+        raise BuildError("app/ 内无 .py 模块（加密无从进行；纯资源 app/ 请关闭 code_encryption）")
+    if "app" not in mids:
+        raise BuildError("code_encryption 需要 app/__init__.py 根包——加密模式 finder 必须能"
+                         "认领 'app' 包本身，namespace 包（缺根 __init__.py）不受支持")
+    # 加密清单（§6.1 step3）：AAD 身份 app.__index__，落盘 app/index.enc；
+    # finder 以它做成员资格判定（§7.1），避免误吞用户侧同名顶层模块
+    index_payload = build_index_payload(sorted(mids))
+    try:
+        iblob = kl.encrypt(key, INDEX_MODULE_ID, index_payload)
+        if kl.decrypt(INDEX_MODULE_ID, iblob) != index_payload:
+            raise BuildError("加密清单回验不一致")
+    except KeyLibError as e:
+        raise BuildError(f"加密清单失败: {e}") from e
+    with open(os.path.join(stage_app, INDEX_FILE_NAME), "wb") as f:
+        f.write(iblob)
+    # 删明文闸（§6.1 step4）：staging app/ 内不允许残留任何 .py/.pyc
+    leftovers = [rel for rel in walk_files(stage_app)
+                 if rel.endswith((".py", ".pyc"))]
+    if leftovers:
+        raise BuildError("删明文闸失败（staging 仍残留明文）: " + ", ".join(leftovers[:8]))
+    for dirpath, dirnames, _filenames in os.walk(stage_app, topdown=False):
+        if os.path.basename(dirpath) == "__pycache__" and not os.listdir(dirpath):
+            os.rmdir(dirpath)
+    return kl.key_id()
+
+
 def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
-                     applocal_version: str, app_dir: str, ui_dir: str) -> dict:
+                     applocal_version: str, app_dir: str, ui_dir: str,
+                     code_key_id: str = "") -> dict:
     fields = {
         "format_version": FORMAT_VERSION,
         "app_version": spec.version,
@@ -478,6 +612,8 @@ def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
         "app_hash": f"sha256:{tree_hash(app_dir)}",
         "ui_hash": f"sha256:{tree_hash(ui_dir)}",
     }
+    if code_key_id:
+        fields["code_key_id"] = code_key_id    # 可选扩展键（§7.3；明文构建无此键）
     fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
     return fields
 
@@ -522,6 +658,10 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     必须进 spk（APK 里只放与解释器版本绑定的件）。
     runtime_hash = libpythonbundle.so 的 sha256（标识所针对的运行时 bundle）。
     """
+    if spec.code_encryption:
+        raise BuildError(
+            "android 目标暂不支持 code_encryption（②首版仅 Windows 全链；"
+            "Android 落位随 M2 jniLibs 机制接入，届时构建期判定自动生效）")
     if len(spec.android_abis) != 1:
         raise BuildError(
             f"[platforms.android].abis 须为单 ABI（当前 {list(spec.android_abis)}）："

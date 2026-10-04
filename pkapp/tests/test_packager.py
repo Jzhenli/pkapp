@@ -243,3 +243,47 @@ def test_default_layout_py_sources(project, wheels_dir, tmp_path):
     assert not any("__pycache__" in f for f in sp_files)
     assert os.path.isfile(os.path.join(stage, "app", "main.py"))      # app 源码恒保留
     golden_mod.assert_bz(stage, "python312.dll")
+
+
+# ---------------------------------------------------------------- 代码加密构建链（CODE_PROTECTION_DESIGN §6）
+def _enable_code_encryption(project):
+    toml = os.path.join(project, "pkapp.toml")
+    with open(toml, encoding="utf-8") as f:
+        text = f.read()
+    assert "[app]" in text
+    with open(toml, "w", encoding="utf-8") as f:
+        f.write(text.replace("[app]\n", "[app]\ncode_encryption = true\n", 1))
+
+
+def test_build_code_encrypted(project, wheels_dir, tmp_path):   # §6.1 + G5 加密态
+    from pkapp.packager import keylib
+
+    _enable_code_encryption(project)
+    out1, out2 = str(tmp_path / "e1.spk"), str(tmp_path / "e2.spk")
+    fields = _build(project, wheels_dir, out1)
+    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
+        key = bytes.fromhex(f.read().strip())
+    assert fields["code_key_id"] == keylib.key_id_hex(key)     # manifest ↔ K 配对
+    with zipfile.ZipFile(out1) as zf:
+        names = zf.namelist()
+    assert "app/index.enc" in names                            # 加密清单
+    app_entries = [n for n in names if n.startswith("app/")]
+    assert not any(n.endswith((".py", ".pyc")) or "__pycache__" in n
+                   for n in app_entries)                       # 删明文闸：spk 内无源码
+    assert any(n.startswith("app/") and n.endswith(".enc")
+               and n != "app/index.enc" for n in names)        # 模块 blob 在
+    # G5：加密构建两跑字节级一致（确定性 nonce + 稳定 pyc 载荷）
+    _build(project, wheels_dir, out2)
+    assert open(out1, "rb").read() == open(out2, "rb").read()
+    # 验签链覆盖 code_key_id 扩展键
+    pub = sign.public_key_hex(os.path.join(project, ".pkapp", "sign.key"))
+    got, _ = mf.verify_spk(out1, pub)
+    assert got["code_key_id"] == fields["code_key_id"]
+
+
+def test_build_code_encryption_android_rejected(project, tmp_path):
+    """首版仅 Windows 全链：android 目标开关开启 → 构建期报错（不静默降级）。"""
+    _enable_code_encryption(project)
+    spec = load(os.path.join(project, "pkapp.toml"))
+    with pytest.raises(assemble.BuildError, match="android"):
+        assemble.build_spk(project, spec, "android", str(tmp_path / "a.spk"))

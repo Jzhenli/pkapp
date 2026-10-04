@@ -34,7 +34,10 @@ jobs:
       - name: Build Windows shell (build.bat)
         working-directory: shell-windows
         run: .\build.bat
-      - name: Vendor _vendor (shell + applocal wheel)
+      - name: Build keylib key-holder (build.bat)
+        working-directory: keylib
+        run: .\build.bat
+      - name: Vendor _vendor (shell + keylib + applocal wheel)
         run: python pkapp/scripts/vendor.py
       - name: Build pkapp wheel
         run: |

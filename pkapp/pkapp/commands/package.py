@@ -81,6 +81,60 @@ def _shell_accepts(shell: str, spk: str) -> tuple[bool, str]:
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def _spk_manifest_fields(spk_path: str) -> dict:
+    """读 spk 内 manifest 字段（package 期判定加密态：code_key_id 存在 = 加密产物）。
+
+    读取失败按非加密处理（明文流程零新增失败模式，G6）——损坏 spk 由壳配对
+    自检闸门兜底拦截。
+    """
+    from ..packager import manifest as mf
+    from ..packager import spk as spk_mod
+    try:
+        entries = spk_mod.read_spk(spk_path)
+        entry = next((e for e in entries if e[0] == spk_mod.MANIFEST_ENTRY), None)
+        if entry is None:
+            return {}
+        return mf.parse(entry[1].decode("utf-8"))
+    except Exception:                     # BadZipFile 等损坏包 → 按明文处理（壳自检兜底）
+        return {}
+
+
+def _stage_keylib(project: str, stage: str, code_key_id: str) -> int:
+    """key-holder 件落位 staging（exe 旁）+ K 锚点补丁 + key_id 配对闸门（§6.2）。
+
+    通用件（包内置 _vendor / 仓库 build 产物）：staging 副本上 patch_dll 改写 K
+    包裹态（复用壳公钥补丁的锚点语义）；自管件（PKAPP_KEYLIB 指定，模式 B，
+    K 编译期内嵌）不补丁仅落位。补丁后 pkapp_key_id 必须与 manifest code_key_id
+    一致——不一致 = code.key 与 spk 不配对（K 丢失后重生成/新旧混装），闸门拦下。
+    返回 0 = 成功；非 0 = 失败（调用方保留 staging 现场）。
+    """
+    from ..packager.keylib import KeyLib, KeyLibError, locate_dll, patch_dll, read_code_key
+    dll_path = locate_dll("windows")
+    if not dll_path:
+        print("[package] spk 为加密产物（manifest 有 code_key_id）但 key-holder 件缺失——"
+              "预期 _vendor/keylib/windows/pkapp_key.dll（重装 pkapp）或设 PKAPP_KEYLIB")
+        return 2
+    out_dll = os.path.join(stage, "pkapp_key.dll")
+    try:
+        if os.environ.get("PKAPP_KEYLIB"):
+            shutil.copyfile(dll_path, out_dll)   # 模式 B：K 已编译期内嵌，不补丁
+        else:
+            patch_dll(dll_path, out_dll, read_code_key(project))
+        got = KeyLib(out_dll).key_id()
+    except (KeyLibError, OSError, AttributeError) as e:
+        # AttributeError：件缺 pkapp_* 导出符号（ctypes 属性访问，模式 B 坏件）——
+        # 与其余失败路径同收敛：提示语 + rc=2 + 保留 staging 现场
+        print(f"[package] key-holder 件处理失败: {e}")
+        return 2
+    if got != code_key_id:
+        print(f"[package] key-holder 配对失败：件 key_id {got[:12]}… ≠ manifest "
+              f"code_key_id {code_key_id[:12]}…——.pkapp/code.key 与该 spk 不配对"
+              "（恢复正确密钥文件或重新 pkapp build windows）")
+        return 2
+    print(f"[package] key-holder 已配对（key_id {got[:12]}…）")
+    return 0
+
+
 def _patch_shell_pubkey(exe: str, pub_hex: str) -> None:
     """壳内置公钥原位补丁（staging 副本上调用，绝不触碰分发原件）。
 
@@ -171,6 +225,10 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
     if not os.path.isfile(loader):
         print(f"[package] 壳旁缺 WebView2Loader.dll: {loader}")
         return 2
+    # 代码加密（②）：manifest 带 code_key_id = 加密构建产物 → key-holder 件补丁进
+    # staging（exe 旁）+ key_id 配对闸门；明文产物零改动（G6）
+    fields = _spk_manifest_fields(spk)
+    encrypted = bool(fields.get("code_key_id"))
 
     # 一次性组装 staging：build/staging-windows/——壳是共用预编译件，公钥补丁 /
     # rcedit 资源改写都必须在副本上做；staging 成功打 zip 后即焚毁（release/ 只放
@@ -215,6 +273,13 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
         print(f"[package] 组装 staging 保留现场: {stage}")
         return 2
 
+    # key-holder 件（仅加密产物）：K 锚点补丁 + key_id 配对闸门（失败保留现场）
+    if encrypted:
+        rc = _stage_keylib(project, stage, fields["code_key_id"])
+        if rc != 0:
+            print(f"[package] 组装 staging 保留现场: {stage}")
+            return rc
+
     rc_tool = _find_rcedit(rcedit)
     if rc_tool:
         if _rcedit_apply(rc_tool, exe_path, icon, desc or name, version) != 0:
@@ -229,13 +294,15 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
     os.makedirs(out_dir, exist_ok=True)
     zip_path = os.path.join(out_dir, artifact_name(name, version, "windows"))
     zip_tmp = zip_path + ".tmp"
+    files = [f"{name}.exe", f"{name}.spk", "WebView2Loader.dll"]
+    if encrypted:
+        files.append("pkapp_key.dll")          # exe 旁（§5.5；applocal ctypes 取用）
     with zipfile.ZipFile(zip_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in (f"{name}.exe", f"{name}.spk", "WebView2Loader.dll"):
+        for f in files:
             zf.write(os.path.join(stage, f), arcname=f"{name}/{f}")
     os.replace(zip_tmp, zip_path)
 
-    sizes = [(f, os.path.getsize(os.path.join(stage, f)))
-             for f in (f"{name}.exe", f"{name}.spk", "WebView2Loader.dll")]
+    sizes = [(f, os.path.getsize(os.path.join(stage, f))) for f in files]
     shutil.rmtree(stage, ignore_errors=True)   # 成功即焚：staging 只服务本次组装
 
     print(f"[package] {zip_path}  ({os.path.getsize(zip_path):,} B)")

@@ -46,6 +46,11 @@ local.properties
 *.pdb
 *.apk
 
+# keylib 探针工具编译产物（tools/aes_probe.c 手动编译，可再生成，不入库）
+keylib/tools/*.exe
+keylib/tools/*.lib
+keylib/tools/*.exp
+
 # IDE
 .vscode/
 .idea/

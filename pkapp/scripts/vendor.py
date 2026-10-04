@@ -1,12 +1,15 @@
 """组装 pkapp 内置制品目录 _vendor/（CI release 与本地同一条命令）。
 
 输入：仓库根 shell-windows/build/MyApp.exe + WebView2Loader.dll（build.bat 产物）
+      仓库根 keylib/build/pkapp_key.dll（keylib/build.bat 产物，key-holder 通用件）
       仓库根 shell-android/shell（源码壳模板，★方案A★：排除二进制/jniLibs/assets）
-输出：pkapp/pkapp/_vendor/{shell,shell-android,wheels}——包内置壳 + android 模板 +
-applocal 离线 wheel（applocal 不在 PyPI，build/create 的零配置入口全靠它）。
+输出：pkapp/pkapp/_vendor/{shell,shell-android,keylib,wheels}——包内置壳 + android
+      模板 + key-holder 件（locate_dll 首选回退位；package 期锚点补丁注入 K）+
+      applocal 离线 wheel（applocal 不在 PyPI，build/create 的零配置入口全靠它）。
 
-用法（仓库根）：先在 shell-windows 跑 build.bat，然后 `python pkapp/scripts/vendor.py`；
-pyproject 的 package-data 已收录 _vendor/**，直接 `python -m build --wheel pkapp` 出制品。
+用法（仓库根）：先在 shell-windows 跑 build.bat、keylib 跑 build.bat，然后
+`python pkapp/scripts/vendor.py`；pyproject 的 package-data 已收录 _vendor/**，
+直接 `python -m build --wheel pkapp` 出制品。
 """
 from __future__ import annotations
 
@@ -61,19 +64,23 @@ def main() -> int:
     shell_build = os.path.join(ROOT, "shell-windows", "build")
     exe = os.path.join(shell_build, "MyApp.exe")
     dll = os.path.join(shell_build, "WebView2Loader.dll")
-    for p in (exe, dll):
+    keylib_dll = os.path.join(ROOT, "keylib", "build", "pkapp_key.dll")
+    for p in (exe, dll, keylib_dll):
         if not os.path.isfile(p):
-            print(f"[vendor] 缺 {p}——先在 shell-windows 跑 build.bat")
+            print(f"[vendor] 缺 {p}——先在 shell-windows / keylib 跑 build.bat")
             return 2
 
     vroot = os.path.join(ROOT, "pkapp", "pkapp", "_vendor")
     shell_dir = os.path.join(vroot, "shell")
+    keylib_dir = os.path.join(vroot, "keylib", "windows")
     wheels_dir = os.path.join(vroot, "wheels")
     shutil.rmtree(wheels_dir, ignore_errors=True)   # 防旧版本 wheel 滞留
     os.makedirs(shell_dir, exist_ok=True)
+    os.makedirs(keylib_dir, exist_ok=True)
     os.makedirs(wheels_dir, exist_ok=True)
     shutil.copyfile(exe, os.path.join(shell_dir, "MyApp.exe"))
     shutil.copyfile(dll, os.path.join(shell_dir, "WebView2Loader.dll"))
+    shutil.copyfile(keylib_dll, os.path.join(keylib_dir, "pkapp_key.dll"))
     _vendor_android_shell(vroot)
 
     r = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
@@ -83,6 +90,7 @@ def main() -> int:
         return 1
     n = len([f for f in os.listdir(wheels_dir) if f.endswith(".whl")])
     print(f"[vendor] OK: _vendor/shell（MyApp.exe + WebView2Loader.dll）"
+          f"+ _vendor/keylib/windows（key-holder 通用件）"
           f"+ _vendor/wheels（{n} wheel）")
     return 0
 

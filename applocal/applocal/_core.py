@@ -509,6 +509,25 @@ def _tmark(label: str, t0: float, path: str | None) -> float:
     return now
 
 
+def _install_codekey(cfg: Cfg, key_id: str, _t: float, _tlog: str | None) -> float:
+    """加密态 bootstrap 分支（CODE_PROTECTION_DESIGN.md §7.1）：key-holder 三 stage
+    闸门（keylib_load / key_pair_check / code_decrypt）+ meta_path finder 注册。
+
+    _codekey 失败路径一律先写 §7.3 中性文案 diag 再上抛（CodeProtectError 带
+    pkapp_diag_written 标记）——本兜底与 bootstrap 的 import 兜底 diag 见标记跳过，
+    不把中性记录覆盖成技术文案。
+    """
+    try:
+        from ._codekey import install
+        install(cfg, key_id)
+    except Exception as e:
+        if not getattr(e, "pkapp_diag_written", False):
+            diag("bootstrap", f"keylib install failed: {e}",
+                 detail=traceback.format_exc(), recoverable=False)
+        raise
+    return _tmark("keylib install", _t, _tlog)
+
+
 def bootstrap(entry: str = "app.main:app") -> int:
     """壳唯一入口（§4.2 五步）。返回实际监听端口；ready 由心跳线程负责。"""
     _t0 = _t = time.perf_counter()                 # _t0 = 引导起点（total 打点用；_t 走段链）
@@ -522,7 +541,13 @@ def bootstrap(entry: str = "app.main:app") -> int:
     if rt.platform == "linux":                     # 步骤 0（§4.2：仅 Linux）
         set_process_title("myapp")
     sys.argv = [os.path.basename(sys.executable) or "myapp"]  # 步骤 0′（R25 嵌入态修正）
-    if os.path.isdir(cfg.paths.app_dir) and cfg.paths.app_dir not in sys.path:
+    key_id = str(rt.manifest.get("code_key_id") or "").strip()
+    if key_id:                                     # 步骤 1′（加密态 §7.1）：三 stage 闸门
+        _t = _install_codekey(cfg, key_id, _t, _tlog)   # + finder 注册；app_dir 不 append
+                                                       # ——finder 是 app.* 唯一供给方（§7.1
+                                                       # 两分支互斥，防 PathFinder 判成
+                                                       # namespace 包）
+    elif os.path.isdir(cfg.paths.app_dir) and cfg.paths.app_dir not in sys.path:
         sys.path.append(cfg.paths.app_dir)         # 步骤 1：追加到最后（§2.1③ stdlib/依赖优先；
                                                    # insert(0) 会让用户目录 shadow 标准库——已实证）
     _inject_native(rt.native_lib_dir)              # 步骤 2：Android so 注入
@@ -535,8 +560,9 @@ def bootstrap(entry: str = "app.main:app") -> int:
         roles_table = getattr(mod, "ROLES", None) or {}          # 姿势 B 约定（§9.2）：
         route_perms = getattr(mod, "ROUTE_PERMS", None) or []    # 缺省 = 应用自管授权
     except Exception as e:                         # import 失败 → diag → 向壳上抛（非零退出）
-        diag("bootstrap", f"import {entry} failed: {e}",
-             detail=traceback.format_exc(), recoverable=True)
+        if not getattr(e, "pkapp_diag_written", False):   # _codekey 已写中性 diag（§7.3），勿覆盖
+            diag("bootstrap", f"import {entry} failed: {e}",
+                 detail=traceback.format_exc(), recoverable=True)
         raise
     try:
         sock = _bind_socket(rt.port_pref, cfg.network.bind,    # 步骤 3′：先绑定并持有，消除 bind 前的

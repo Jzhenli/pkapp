@@ -47,7 +47,7 @@ def make_fields(**over) -> dict:
         "entry": "app.main:app",
         "runtime_hash": "sha256:" + "ab" * 32,
         "app_hash": "sha256:" + "cd" * 32,
-        "dist_hash": "sha256:" + "ef" * 32,
+        "ui_hash": "sha256:" + "ef" * 32,     # dist→ui 全链路改名 ★v1.2★ 后的键名
     }
     fields.update(over)
     return fields
