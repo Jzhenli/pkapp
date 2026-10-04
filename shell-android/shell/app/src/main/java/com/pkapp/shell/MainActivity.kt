@@ -220,7 +220,7 @@ class MainActivity : Activity() {
                 "MYAPP_LOG_DIR=$logDir",
                 "MYAPP_READY_FILE=$readyFile",
                 "MYAPP_DIAG_FILE=$diagFile",
-                "MYAPP_STATIC_DIR=${File(runtimeDir, "dist")}",
+                "MYAPP_STATIC_DIR=${File(runtimeDir, "ui")}",   // spk 契约目录名 ui（assemble.py），非 dist
                 // MYAPP_PORT 不注入（★v1.2★）：端口偏好走 manifest network_port（打包期 [network].port）
                 "MYAPP_VERSION=${mf.version}",
                 "MYAPP_MANIFEST_PATH=${File(runtimeDir, "manifest")}",
