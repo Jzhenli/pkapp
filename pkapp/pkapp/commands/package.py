@@ -99,28 +99,46 @@ def _spk_manifest_fields(spk_path: str) -> dict:
         return {}
 
 
-def _stage_keylib(project: str, stage: str, code_key_id: str) -> int:
-    """key-holder 件落位 staging（exe 旁）+ K 锚点补丁 + key_id 配对闸门（§6.2）。
+def _stage_keylib(project: str, stage: str, code_key_id: str,
+                  platform: str = "windows") -> int:
+    """key-holder 件落位 staging + K 锚点补丁 + key_id 配对闸门（§6.2）。
 
+    windows：补丁件落 staging（exe 旁）。android：补丁后 lib_pkapp_key.so 交
+    build_apk 进 APK jniLibs（§5.5，APK 签名覆盖其完整性）。
     通用件（包内置 _vendor / 仓库 build 产物）：staging 副本上 patch_dll 改写 K
     包裹态（复用壳公钥补丁的锚点语义）；自管件（PKAPP_KEYLIB 指定，模式 B，
-    K 编译期内嵌）不补丁仅落位。补丁后 pkapp_key_id 必须与 manifest code_key_id
+    K 编译期内嵌）不补丁仅落位。补丁后 key_id 必须与 manifest code_key_id
     一致——不一致 = code.key 与 spk 不配对（K 丢失后重生成/新旧混装），闸门拦下。
+    windows 构建机可 dlopen 同平台件实测；异平台件（android .so）无法 dlopen，
+    改用 Python 镜像 key_id_hex(K) 比对（补丁锚点唯一命中已保证写入正确性）。
     返回 0 = 成功；非 0 = 失败（调用方保留 staging 现场）。
     """
-    from ..packager.keylib import KeyLib, KeyLibError, locate_dll, patch_dll, read_code_key
-    dll_path = locate_dll("windows")
+    from ..packager.keylib import (KeyLib, KeyLibError, key_id_hex, locate_dll,
+                                   patch_dll, read_code_key)
+    out_name = "pkapp_key.dll" if platform == "windows" else "lib_pkapp_key.so"
+    expect = "_vendor/keylib/windows/pkapp_key.dll" if platform == "windows" \
+        else "_vendor/keylib/android/lib_pkapp_key.so"
+    dll_path = locate_dll(platform)
     if not dll_path:
-        print("[package] spk 为加密产物（manifest 有 code_key_id）但 key-holder 件缺失——"
-              "预期 _vendor/keylib/windows/pkapp_key.dll（重装 pkapp）或设 PKAPP_KEYLIB")
+        print(f"[package] spk 为加密产物（manifest 有 code_key_id）但 key-holder 件缺失——"
+              f"预期 {expect}（重装 pkapp 或 keylib 构建后 vendor）或设 PKAPP_KEYLIB")
         return 2
-    out_dll = os.path.join(stage, "pkapp_key.dll")
+    out_dll = os.path.join(stage, out_name)
     try:
         if os.environ.get("PKAPP_KEYLIB"):
             shutil.copyfile(dll_path, out_dll)   # 模式 B：K 已编译期内嵌，不补丁
+            if platform != "windows":
+                # windows 侧 ctypes 实测件本身；异平台件无法 dlopen，闸门只验证
+                # code.key↔manifest 同源一致（对指错件失明——真机 _codekey 的
+                # key_id 闸是第二道防线，此处至少明示局限）
+                print(f"[package] 警告：模式 B {platform} 件无法在本机实测，"
+                      "key_id 闸门仅验证 code.key↔manifest 配对")
+            got = KeyLib(out_dll).key_id() if platform == "windows" \
+                else key_id_hex(read_code_key(project))
         else:
             patch_dll(dll_path, out_dll, read_code_key(project))
-        got = KeyLib(out_dll).key_id()
+            got = KeyLib(out_dll).key_id() if platform == "windows" \
+                else key_id_hex(read_code_key(project))
     except (KeyLibError, OSError, AttributeError) as e:
         # AttributeError：件缺 pkapp_* 导出符号（ctypes 属性访问，模式 B 坏件）——
         # 与其余失败路径同收敛：提示语 + rc=2 + 保留 staging 现场
@@ -129,7 +147,7 @@ def _stage_keylib(project: str, stage: str, code_key_id: str) -> int:
     if got != code_key_id:
         print(f"[package] key-holder 配对失败：件 key_id {got[:12]}… ≠ manifest "
               f"code_key_id {code_key_id[:12]}…——.pkapp/code.key 与该 spk 不配对"
-              "（恢复正确密钥文件或重新 pkapp build windows）")
+              "（恢复正确密钥文件或重新 pkapp build）")
         return 2
     print(f"[package] key-holder 已配对（key_id {got[:12]}…）")
     return 0
@@ -375,6 +393,19 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
         # 静默降级会让"快照在场但校验失败"（python_version 不一致等）伪装成缺快照，
         # 误导用户重跑 fetch——透出真实原因一行
         print(f"[package] android 运行时快照未解析: {e}")
+    # 代码加密（②）：spk manifest 带 code_key_id = 加密构建 → key-holder .so 补丁 +
+    # key_id 闸门后交 build_apk 进 APK jniLibs（§5.5）；明文产物零改动（G6）
+    code_key_id = (_spk_manifest_fields(spk) or {}).get("code_key_id", "")
+    keylib_so = None
+    keylib_stage = None
+    if code_key_id:
+        import tempfile
+        keylib_stage = tempfile.mkdtemp(prefix="pkapp-keylib-android-")
+        rc_kl = _stage_keylib(project, keylib_stage, code_key_id, "android")
+        if rc_kl != 0:
+            shutil.rmtree(keylib_stage, ignore_errors=True)
+            return rc_kl
+        keylib_so = os.path.join(keylib_stage, "lib_pkapp_key.so")
     try:
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
                              out_dir=out_dir, variant=variant,
@@ -382,10 +413,13 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
                              version=spec.version, abis=abis,
                              keystore=keystore, keystore_pass=keystore_pass,
                              keystore_alias=keystore_alias, icon=icon,
-                             runtime_dir=runtime_dir)
+                             runtime_dir=runtime_dir, keylib_so=keylib_so)
     except ApkError as e:
         print(f"[package] APK 组装失败: {e}")
         return 1
+    finally:
+        if keylib_stage:
+            shutil.rmtree(keylib_stage, ignore_errors=True)
     print(f"[package] {apk_path}  ({os.path.getsize(apk_path):,} B)")
     print(f"[package] 变体={variant}"
           f"{'（已用 keystore 签名）' if keystore else '（debug 自动签名；release 需 keystore：TOML [platforms.android].keystore + env PKAPP_KEYSTORE_PASS）'}；"

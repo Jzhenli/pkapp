@@ -121,7 +121,7 @@ def _fake_gradle(monkeypatch, tmp_path, *, with_asset, spk_bytes):
                         keystore_pass=keystore_pass, keystore_alias=keystore_alias,
                         icon_res=icon_res, abis=abis)
         out_apk = os.path.join(shell_dir, "app", "build", "outputs", "apk", variant)
-        os.makedirs(out_apk)
+        os.makedirs(out_apk, exist_ok=True)   # 同物化目录多次构建（残件清理用例）
         name = f"app-{variant}.apk"
         if variant == "release" and not keystore:
             name = f"app-{variant}-unsigned.apk"     # gradle 对未签名 release 的产物名
@@ -159,6 +159,104 @@ def test_package_android_builds_apk(tmp_path, monkeypatch, mock_android_runtime)
     assert os.path.isfile(apk_path)
     with zipfile.ZipFile(apk_path) as zf:
         assert zf.read("assets/runtime.spk") == spk_bytes
+
+
+def _write_encrypted_spk(proj, code_key_id):
+    """手造含 code_key_id 的 manifest 最小 spk（android 壳不做 spk 验签，
+    _package_android 只读 manifest 判加密态——最小容器即可驱动 keylib 链）。"""
+    from pkapp.packager import manifest as mf
+    from pkapp.packager import spk as spk_mod
+
+    fields = {k: "v" for k in mf.KEYS}
+    fields["code_key_id"] = code_key_id
+    spk_dir = os.path.join(proj, "build", "platform-android")
+    os.makedirs(spk_dir, exist_ok=True)
+    path = os.path.join(spk_dir, "runtime.spk")
+    spk_mod.write_spk(path, [(spk_mod.MANIFEST_ENTRY,
+                              mf.render(fields).encode("utf-8"))])
+    return path
+
+
+def test_package_android_encrypted_stages_keylib_so(tmp_path, monkeypatch,
+                                                    mock_android_runtime,
+                                                    android_keylib_so):
+    """加密 android 包全链（§5.5）：spk manifest 带 code_key_id → _stage_keylib
+    补丁 .so（android 件 key_id 走 Python 镜像比对）→ build_apk 拷入壳物化目录
+    jniLibs/<abi>/lib_pkapp_key.so（gradle mock，APK 组装链不受影响）。"""
+    from pkapp.packager import keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 补丁路径走文件落位
+    key = hashlib.sha256(b"pkg-and").digest()
+    proj = _make_project(tmp_path)
+    os.makedirs(os.path.join(proj, ".pkapp"))
+    with open(os.path.join(proj, ".pkapp", "code.key"), "w", encoding="ascii") as f:
+        f.write(key.hex())
+    spk_path = _write_encrypted_spk(proj, keylib.key_id_hex(key))
+    with open(spk_path, "rb") as f:
+        spk_bytes = f.read()
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=spk_bytes)
+    assert main(["package", "android", "--project", proj,
+                 "--shell-dir", _bare_template(tmp_path)]) == 0
+    # 壳物化目录（<PKAPP_CACHE>/shells/android/android-<fp12>）内 jniLibs 落位
+    from pkapp import toolchain
+    jni_hits = []
+    for dp, _dn, fns in os.walk(os.path.join(toolchain.cache_root(), "shells")):
+        for fn in fns:
+            if fn == "lib_pkapp_key.so":
+                jni_hits.append(os.path.join(dp, fn))
+    assert len(jni_hits) == 1
+    jni_so = jni_hits[0]
+    assert os.path.join("jniLibs", "arm64-v8a") in jni_so   # 单 ABI 与 spk 一致
+    with open(jni_so, "rb") as f:
+        data = f.read()
+    assert keylib.ANCHOR not in data                        # 补丁态（非通用件原样）
+    assert bytes(a ^ b for a, b in zip(key, keylib._MASK)) in data
+    # 交付物 APK 内 spk 原样在 assets（加密包不走壳验签，APK 签名承担完整性）
+    apk_path = os.path.join(proj, "release", "myapp-0.1.0-android-arm64_v8a.apk")
+    with zipfile.ZipFile(apk_path) as zf:
+        assert zf.read("assets/runtime.spk") == spk_bytes
+
+
+def test_package_android_plaintext_clears_stale_keylib(tmp_path, monkeypatch,
+                                                       mock_android_runtime,
+                                                       android_keylib_so):
+    """物化目录跨构建复用（指纹不含加密态）→ 明文构建（manifest 无 code_key_id）
+    必须清掉上一次加密构建残留在 jniLibs 的 lib_pkapp_key.so——否则上个项目的
+    K⊕MASK 随明文 APK 分发（G6 泄漏）。"""
+    from pkapp.packager import keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    key = hashlib.sha256(b"stale-k").digest()
+    proj = _make_project(tmp_path)
+    os.makedirs(os.path.join(proj, ".pkapp"))
+    with open(os.path.join(proj, ".pkapp", "code.key"), "w", encoding="ascii") as f:
+        f.write(key.hex())
+    tpl = _bare_template(tmp_path)
+
+    # ① 明文构建：物化目录建立，无 keylib 链
+    spk_path = _write_spk(proj, "android")
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True,
+                 spk_bytes=open(spk_path, "rb").read())
+    assert main(["package", "android", "--project", proj, "--shell-dir", tpl]) == 0
+    # ② 加密构建：同一物化目录 → jniLibs/<abi>/lib_pkapp_key.so 落位
+    spk_path = _write_encrypted_spk(proj, keylib.key_id_hex(key))
+    spk_bytes = open(spk_path, "rb").read()
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True, spk_bytes=spk_bytes)
+    assert main(["package", "android", "--project", proj, "--shell-dir", tpl]) == 0
+    from pkapp import toolchain
+    jni_hits = [os.path.join(dp, fn)
+                for dp, _dn, fns in os.walk(os.path.join(toolchain.cache_root(),
+                                                         "shells"))
+                for fn in fns if fn == "lib_pkapp_key.so"]
+    assert len(jni_hits) == 1                      # 残件确实落过位
+    jni_dir = os.path.dirname(jni_hits[0])
+    # ③ 明文构建（回到同一物化目录）：残件必须被清掉
+    with open(spk_path, "wb") as f:
+        f.write(b"PK" + os.urandom(64))
+    _fake_gradle(monkeypatch, tmp_path, with_asset=True,
+                 spk_bytes=open(spk_path, "rb").read())
+    assert main(["package", "android", "--project", proj, "--shell-dir", tpl]) == 0
+    assert not os.path.isfile(os.path.join(jni_dir, "lib_pkapp_key.so"))
 
 
 def test_package_android_icon_injected(tmp_path, monkeypatch, mock_android_runtime):

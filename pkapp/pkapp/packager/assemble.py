@@ -658,10 +658,6 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     必须进 spk（APK 里只放与解释器版本绑定的件）。
     runtime_hash = libpythonbundle.so 的 sha256（标识所针对的运行时 bundle）。
     """
-    if spec.code_encryption:
-        raise BuildError(
-            "android 目标暂不支持 code_encryption（②首版仅 Windows 全链；"
-            "Android 落位随 M2 jniLibs 机制接入，届时构建期判定自动生效）")
     if len(spec.android_abis) != 1:
         raise BuildError(
             f"[platforms.android].abis 须为单 ABI（当前 {list(spec.android_abis)}）："
@@ -706,13 +702,23 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
             pass
         _compile_checked_hash(os.path.join(stage, "app"), pyc_exe, snapshot.python_dll)
 
+        # 3b) 代码加密（CODE_PROTECTION_DESIGN §6.1，android 与 windows 同链）。
+        #     加密器 = 构建机本机 keylib 件（_encrypt_app_tree 恒用构建机件，密文
+        #     字节与目标平台无关）；运行期件 lib_pkapp_key.so 由 package 期锚点补丁
+        #     后进 APK jniLibs（§5.5，APK 签名覆盖其完整性）。
+        code_key_id = ""
+        if spec.code_encryption:
+            code_key_id = _encrypt_app_tree(os.path.join(stage, "app"),
+                                            snapshot.python_dll, project_dir)
+
         # 4) manifest + 签名 + spk
         bundle = os.path.join(snapshot.dir, snapshot.abis[0], "libpythonbundle.so")
         fields = _manifest_fields(spec, snapshot.python_dll,
                                   f"sha256:{_sha256_file(bundle)}",
                                   _detect_applocal(sp_dir),
                                   os.path.join(stage, "app"),
-                                  os.path.join(stage, "ui"))
+                                  os.path.join(stage, "ui"),
+                                  code_key_id=code_key_id)
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)

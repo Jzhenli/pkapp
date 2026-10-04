@@ -81,6 +81,16 @@ def main() -> int:
     shutil.copyfile(exe, os.path.join(shell_dir, "MyApp.exe"))
     shutil.copyfile(dll, os.path.join(shell_dir, "WebView2Loader.dll"))
     shutil.copyfile(keylib_dll, os.path.join(keylib_dir, "pkapp_key.dll"))
+    # android key-holder（可选件，build_android.bat 产物，需 NDK）——缺失不阻塞
+    # vendor（明文包与 windows 加密包不依赖）；加密 android 包依赖它
+    keylib_so = os.path.join(ROOT, "keylib", "build", "lib_pkapp_key.so")
+    if os.path.isfile(keylib_so):
+        akeylib_dir = os.path.join(vroot, "keylib", "android")
+        os.makedirs(akeylib_dir, exist_ok=True)
+        shutil.copyfile(keylib_so, os.path.join(akeylib_dir, "lib_pkapp_key.so"))
+    else:
+        print("[vendor] 跳过 _vendor/keylib/android（无 lib_pkapp_key.so——"
+              "加密 android 包需先 keylib 跑 build_android.bat，需 NDK）")
     _vendor_android_shell(vroot)
 
     r = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
@@ -91,6 +101,7 @@ def main() -> int:
     n = len([f for f in os.listdir(wheels_dir) if f.endswith(".whl")])
     print(f"[vendor] OK: _vendor/shell（MyApp.exe + WebView2Loader.dll）"
           f"+ _vendor/keylib/windows（key-holder 通用件）"
+          f"{'+ _vendor/keylib/android ' if os.path.isfile(keylib_so) else ''}"
           f"+ _vendor/wheels（{n} wheel）")
     return 0
 

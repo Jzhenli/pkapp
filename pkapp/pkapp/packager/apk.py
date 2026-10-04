@@ -96,7 +96,8 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
               version: str = "", abis: tuple[str, ...] = (),
               keystore: str = "", keystore_pass: str = "",
               keystore_alias: str = "pkapp", icon: str = "",
-              runtime_dir: str | None = None) -> str:
+              runtime_dir: str | None = None,
+              keylib_so: str | None = None) -> str:
     """壳模板 → 注入运行时 → spk 入壳 assets → gradle → <project>/release/<artifact_name>
     （如 HiApp-0.1.0-android-arm64_v8a.apk，★产物命名带版本/平台/架构★）。
 
@@ -111,6 +112,10 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
     icon = [platforms.android].icon（PNG 路径）：经 _stage_icon_res 生成启动器图标组
     （全密度 mipmap + anydpi-v26 自适应图标，icons.py）并注入 -PpkappIconRes +
     -PpkappIcon（manifest android:icon → @mipmap/ic_app）。
+    keylib_so = K 补丁后的 key-holder 件（仅加密构建，package.py _stage_keylib 产出）：
+    拷入壳模板 jniLibs/<abi>/lib_pkapp_key.so 随 APK 打包——jniLibs 由系统按
+    nativeLibraryDir 揭出（MYAPP_NATIVE_LIB_DIR 指向），app 数据目录 noexec
+    不能落可执行 .so，故必须走 jniLibs。
     返回 APK 路径；任何一步失败抛 ApkError（gradle 输出尾部随异常给出）。
     """
     if not app_id:
@@ -145,6 +150,19 @@ def build_apk(project: str, app_name: str, spk_path: str, *,
         with open(os.path.join(assets, "runtime.spk"), "wb") as f:
             f.write(spk_bytes)
         os.utime(assets, None)
+        # key-holder 件（仅加密构建）：补丁后 .so 进 jniLibs/<abi>/（单 ABI 约束
+        # 同 spk；touch 防增量 merge 的 mtime 盲区，同 assets 陷阱）。物化目录
+        # 跨构建复用且指纹不含加密态——明文构建必须清掉上一次加密构建的残件，
+        # 否则 K⊕MASK 随明文 APK 分发（G6 泄漏）。
+        jni = os.path.join(shell, "app", "src", "main", "jniLibs", abis[0])
+        so_dst = os.path.join(jni, "lib_pkapp_key.so")
+        if keylib_so:
+            os.makedirs(jni, exist_ok=True)
+            shutil.copyfile(keylib_so, so_dst)
+            os.utime(jni, None)
+        elif os.path.exists(so_dst):
+            os.remove(so_dst)
+            os.utime(jni, None)
 
         _run_gradle(shell, variant, app_id, app_name,
                     keystore if keystore else None,

@@ -192,6 +192,8 @@ nonce 字段定位（★v1.2★ 澄清）：对保密**零贡献**——持 K �
 
 **壳无关性**（对 M3 Linux 的关键意义）：持钥职责已从壳职责中拆出——壳有无、壳如何演进不影响本方案。Linux 无壳照样持钥解密；Android 的 Kotlin 层完全不接触 K（dex 反编译太容易，K 不进任何 JVM/ART 可达内存）。
 
+**Android 落位实现状态（★2026-10 接通★）**：build 期加密与 Windows 同链（`_encrypt_app_tree` 恒用构建机本机 keylib 件，密文与目标平台无关）；package 期 `_stage_keylib(platform="android")` 补丁 `.so` 后经 `build_apk(keylib_so=…)` 拷入壳模板 `app/src/main/jniLibs/<abi>/`。两处平台差异：①key_id 闸门在 Windows 构建机上无法 dlopen ELF 件——改用 Python 镜像 `key_id_hex(K)` 与 manifest 比对（补丁锚点唯一命中保证写入正确性）；②`.so` 必须走 jniLibs（系统按 `nativeLibraryDir` 揭出），app 数据目录 noexec 不能落可执行件。`.so` 构建：`keylib/build_android.bat`（NDK clang，api 24，单 ABI，arm64-v8a 缺省）。
+
 ## 6. 构建链改动
 
 ### 6.1 assemble.py（build 期，★v1.1★ 修订）

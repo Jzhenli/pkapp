@@ -382,6 +382,46 @@ def test_stage_keylib_mode_b_no_patch(tmp_path, monkeypatch):
     assert _stage_keylib(proj, stage2, keylib.key_id_hex(hashlib.sha256(b"X").digest())) == 2
 
 
+# ---------------------------------------------------------------- 阶段2b-android：异平台件落位
+def test_stage_keylib_android_patches_and_gates(tmp_path, monkeypatch,
+                                                android_keylib_so):
+    """android .so（构建机无法 dlopen ELF）：补丁仍走锚点字节改写，key_id 闸门
+    改用 Python 镜像 key_id_hex(K) 比对（ctypes 实测仅 windows 平台件可用）。"""
+    from pkapp.commands.package import _stage_keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 补丁路径必须走文件落位
+    key = hashlib.sha256(b"and-key").digest()
+    proj = _proj_with_key(tmp_path / "pa", key)
+    stage = str(tmp_path / "pa" / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(proj, stage, keylib.key_id_hex(key), "android") == 0
+    out = os.path.join(stage, "lib_pkapp_key.so")
+    assert os.path.isfile(out)
+    with open(out, "rb") as f:
+        data = f.read()
+    with open(android_keylib_so, "rb") as f:
+        src = f.read()
+    i = src.index(keylib.ANCHOR)
+    assert keylib.ANCHOR not in data                     # 锚点已改写（不再含原值）
+    assert data[i:i + 32] == bytes(k ^ m for k, m in zip(key, keylib._MASK))
+    assert data[:i] == src[:i] and data[i + 32:] == src[i + 32:]   # 其余字节零扰动
+
+
+def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
+                                                     android_keylib_so):
+    """android 闸门负向：code.key 与 manifest code_key_id 不配对 → rc=2
+    （补丁件保留 staging 现场供排查，同 windows 语义）。"""
+    from pkapp.commands.package import _stage_keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    ka, kb = hashlib.sha256(b"A-and").digest(), hashlib.sha256(b"B-and").digest()
+    proj = _proj_with_key(tmp_path / "pb", ka)
+    stage = str(tmp_path / "pb" / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(proj, stage, keylib.key_id_hex(kb), "android") == 2
+    assert os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
+
+
 # ---------------------------------------------------------------- 阶段2c：applocal 运行期 finder（跨包契约）
 _APPLOCAL = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "applocal")

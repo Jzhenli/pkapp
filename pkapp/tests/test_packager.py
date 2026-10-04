@@ -281,9 +281,51 @@ def test_build_code_encrypted(project, wheels_dir, tmp_path):   # §6.1 + G5 加
     assert got["code_key_id"] == fields["code_key_id"]
 
 
-def test_build_code_encryption_android_rejected(project, tmp_path):
-    """首版仅 Windows 全链：android 目标开关开启 → 构建期报错（不静默降级）。"""
+def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
+                                      tmp_path):
+    """★android 加密链★（§6.1，与 windows 同链）：加密构建 → spk 内 app/ 全 .enc
+    + index.enc、manifest 带 code_key_id；密文可用构建机 windows keylib 补丁件
+    解开（加密器恒用构建机件，密文与目标平台无关）。"""
+    import marshal
+    import types
+
+    from pkapp.packager import keylib
+
+    dll = keylib.locate_dll("windows")
+    assert dll, "keylib/build/pkapp_key.dll 未编译（先跑 keylib/build.bat）"
     _enable_code_encryption(project)
-    spec = load(os.path.join(project, "pkapp.toml"))
-    with pytest.raises(assemble.BuildError, match="android"):
-        assemble.build_spk(project, spec, "android", str(tmp_path / "a.spk"))
+    out = str(tmp_path / "enc-android.spk")
+    fields = _build_android(project, wheels_dir, out)
+    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
+        key = bytes.fromhex(f.read().strip())
+    kid = keylib.key_id_hex(key)
+    assert fields["code_key_id"] == kid                    # manifest ↔ K 配对
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    assert "app/index.enc" in names                        # 加密清单
+    app_entries = [n for n in names if n.startswith("app/")]
+    assert not any(n.endswith((".py", ".pyc")) or "__pycache__" in n
+                   for n in app_entries)                   # 删明文闸：spk 内无源码
+    assert any(n.startswith("app/") and n.endswith(".enc")
+               and n != "app/index.enc" for n in names)    # 模块 blob 在
+    assert "site-packages/applocal/__init__.py" in names   # 加密只覆盖 app/
+    assert "ui/index.html" in names                        # ui 恒存在
+    # 密文可解：windows 件补丁 K 内嵌（运行期形态）→ index + 模块 blob 全打开
+    patched = str(tmp_path / "pkapp_key.patched.dll")
+    keylib.patch_dll(dll, patched, key)
+    kl = keylib.KeyLib(patched)
+    with open(os.path.join(stage, "app", "index.enc"), "rb") as f:
+        text = kl.decrypt(keylib.INDEX_MODULE_ID, f.read()).decode("utf-8")
+    assert text.startswith(keylib.INDEX_MAGIC)
+    assert "M app.main" in text
+    with open(os.path.join(stage, "app", keylib.blob_name("app.main")), "rb") as f:
+        main_blob = f.read()
+    code = marshal.loads(kl.decrypt("app.main", main_blob))
+    assert isinstance(code, types.CodeType)
+    assert code.co_filename == "main.py"
+    # 验签链覆盖 code_key_id 扩展键
+    pub = sign.public_key_hex(os.path.join(project, ".pkapp", "sign.key"))
+    got, _ = mf.verify_spk(out, pub)
+    assert got["code_key_id"] == kid

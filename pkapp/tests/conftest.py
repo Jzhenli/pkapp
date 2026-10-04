@@ -50,6 +50,24 @@ def mock_android_runtime(pkapp_cache):
 
 
 @pytest.fixture
+def android_keylib_so(tmp_path, monkeypatch):
+    """android key-holder 件落位测试锚：locate_dll("android") 定向到 tmp 假件
+    （patch_dll 纯字节定位替换，不解析容器结构——测试契约允许伪造容器），
+    仓库树零写入（假件不进 keylib/build/，杜绝硬杀残留污染 vendor 收录）。
+    不走 PKAPP_KEYLIB env——那会被 _stage_keylib 判为模式 B 改变被测行为。"""
+    from pkapp.packager import keylib
+
+    fake = str(tmp_path / "lib_pkapp_key.so")
+    with open(fake, "wb") as f:
+        f.write(b"\x00" * 256 + keylib.ANCHOR + b"\x00" * 256)
+    real = keylib.locate_dll
+    monkeypatch.setattr(keylib, "locate_dll",
+                        lambda platform="windows": fake if platform == "android"
+                        else real(platform))
+    return fake
+
+
+@pytest.fixture
 def wheels_dir(tmp_path):
     wd = str(tmp_path / "wheels")
     os.makedirs(wd)
