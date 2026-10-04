@@ -43,6 +43,10 @@ pkapp package windows                  :: 产物：release\hiapp-*.zip
 pkapp fetch android
 pkapp build android
 pkapp package android                  :: 产物：release\hiapp-*.apk
+
+:: 双架构各出一包（--arch 覆盖 TOML abis，单 ABI；package 自动沿用最后一次 build 的 ABI）：
+pkapp build android --arch arm64-v8a  & pkapp package android
+pkapp build android --arch armeabi-v7a & pkapp package android
 ```
 
 `pkapp.toml` 的 `[platforms.android]` 段已含完整配置：`package`（applicationId，

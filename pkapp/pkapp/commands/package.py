@@ -17,6 +17,7 @@ android：spk 入壳工程 assets → gradle → APK 内 spk 字节校验 → re
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ from .. import toolchain
 from ..appspec import SpecError, load
 from ..packager import sign
 from ..packager.apk import ApkError, artifact_name, build_apk
+from ..util import sha256_file
 
 # manifest.c 出厂默认公钥（build.bat 不带第 2 参编译即此值）——补丁精确定位的首选锚点
 _SHELL_DEFAULT_PUB = "74420a2d95acd1f090719a5041f64d923a75fb37557b021f3aeeff04821ef432"
@@ -126,7 +128,11 @@ def _rcedit_apply(rcedit: str, exe: str, icon: str | None, desc: str, version: s
 def cmd_package(project: str, platform: str, *, shell: str | None = None,
                 shell_dir: str | None = None, variant: str = "debug",
                 icon: str | None = None, desc: str | None = None,
-                rcedit: str | None = None, out: str | None = None) -> int:
+                rcedit: str | None = None, out: str | None = None,
+                arch: str | None = None) -> int:
+    if arch and platform != "android":
+        print(f"[package] --arch 仅支持 android 平台（当前 {platform}）")
+        return 2
     try:
         spec = load(os.path.join(project, "pkapp.toml"))
     except SpecError as e:
@@ -137,7 +143,7 @@ def cmd_package(project: str, platform: str, *, shell: str | None = None,
                                 desc=desc, rcedit=rcedit, out=out)
     if platform == "android":
         return _package_android(project, spec, shell_dir=shell_dir,
-                                variant=variant, out=out)
+                                variant=variant, out=out, arch=arch)
     print("[package] linux 终产物（tar.gz）M3 未实现")
     return 2
 
@@ -240,10 +246,40 @@ def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
 
 
 def _package_android(project: str, spec, *, shell_dir: str | None,
-                     variant: str, out: str | None) -> int:
-    spk = os.path.join(project, "build", "platform-android", "runtime.spk")
+                     variant: str, out: str | None, arch: str | None = None) -> int:
+    spk_dir = os.path.join(project, "build", "platform-android")
+    spk = os.path.join(spk_dir, "runtime.spk")
     if not os.path.isfile(spk):
         print(f"[package] 未找到 spk: {spk}（先 pkapp build android）")
+        return 2
+    # ABI 决策链：build-meta.json（最后一次 build 记录）> TOML（旧构建兼容）。
+    # spk 按单 ABI 装配（assemble 既定约束）——package 的 ABI 必须跟随"最后一次
+    # build"而非 TOML 当前值，否则产生壳/包 ABI 错配的静默坏包（dlopen 才炸）
+    abis = spec.android_abis
+    meta_path = os.path.join(spk_dir, "build-meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            abis = tuple(meta.get("abis") or ())
+        except (ValueError, OSError) as e:
+            print(f"[package] build-meta.json 不可读: {e}（删除该文件可回退 TOML abis）")
+            return 2
+        if not abis:
+            print("[package] build-meta.json 无 abis 字段——重新 pkapp build android")
+            return 2
+        # spk 配对校验：meta 的 ABI 记录只对当时那次 spk 有效——spk 被替换
+        # （隔次构建/手动覆盖）而 meta 未跟上时，这里拦下 ABI 错配的静默坏包
+        # （android 壳不做 spk 验签，本闸门是唯一拦截点，对齐 windows 配对自检）
+        want = (meta.get("spk_sha256") or "").strip()
+        if want and want != "sha256:" + sha256_file(spk):
+            print(f"[package] build-meta.json 与 runtime.spk 不匹配（spk_sha256 不符）——"
+                  f"重新 pkapp build android 后再 package")
+            return 2
+    assert_arch = (arch or "").strip()
+    if assert_arch and list(abis) != [assert_arch]:
+        print(f"[package] --arch {assert_arch} 与 spk 构建记录不符（abis={list(abis)}）——"
+              f"重新 pkapp build android --arch {assert_arch}")
         return 2
     icon = ""
     if spec.android_icon:
@@ -266,7 +302,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
     runtime_dir = None
     try:
         from ..packager import runtime as _rt
-        runtime_dir = _rt.resolve(spec, "android", abis=spec.android_abis).dir
+        runtime_dir = _rt.resolve(spec, "android", abis=abis).dir
     except Exception as e:
         runtime_dir = None
         # 静默降级会让"快照在场但校验失败"（python_version 不一致等）伪装成缺快照，
@@ -276,7 +312,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
                              out_dir=out_dir, variant=variant,
                              app_id=spec.android_package,
-                             version=spec.version, abis=spec.android_abis,
+                             version=spec.version, abis=abis,
                              keystore=keystore, keystore_pass=keystore_pass,
                              keystore_alias=keystore_alias, icon=icon,
                              runtime_dir=runtime_dir)

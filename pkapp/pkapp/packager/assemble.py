@@ -133,11 +133,16 @@ def _zip_lib(lib_dir: str, out_path: str, pyc_tag: str | None = None) -> int:
     return n
 
 
-def _wheels_cache(platform: str) -> str:
+def _wheels_cache(platform: str, abi: str | None = None) -> str:
     """★v1.4★ wheel 托管缓存全局化：<PKAPP_CACHE|默认托管根>/wheels/<platform>——
     与工具链同源（toolchain.cache_root），跨项目复用免重复下载；platform 子目录
-    隔离标签集（windows 与 android 交叉 wheel 混判会让离线优先误命中）。平台内
-    多版本 wheel 共存无害（pip 按需求挑）；显式 --wheels-dir 仍为纯离线供应商目录语义。"""
+    隔离标签集（windows 与 android 交叉 wheel 混判会让离线优先误命中）。android
+    再按 <abi> 分层（★实测教训★：双 ABI 共缓存时，v7a 先建会把 arm32 的
+    pydantic_core 写进缓存，arm64 构建"顶层需求已缓存"短路后死路——abi 目录
+    隔离与"单 ABI 构建"约束对齐）。平台内多版本 wheel 共存无害（pip 按需求挑）；
+    显式 --wheels-dir 仍为纯离线供应商目录语义。"""
+    if abi:
+        return os.path.join(cache_root(), "wheels", platform, abi)
     return os.path.join(cache_root(), "wheels", platform)
 
 
@@ -527,11 +532,13 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     stage = tempfile.mkdtemp(prefix="pkapp-build-android-")
     try:
         # 1) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.android] 追加）
-        #    wheels_dir 缺省 → 全局托管缓存（<cache_root>/wheels/android）；交叉安装 +
-        #    平台 wheel 源（AppSpec [platforms.android].extra_index_url，如 flet 索引）
+        #    wheels_dir 缺省 → 托管缓存（<cache_root>/wheels/android/<abi>，按 abi
+        #    分层防跨 ABI 互踩）；交叉安装 + 平台 wheel 源（AppSpec
+        #    [platforms.android].extra_index_url，如 flet 索引）
         index_url, extra_index = spec.wheels_index("android")
         sp_dir = _install_site_packages(stage, spec.deps_for("android"),
-                                        wheels_dir or _wheels_cache("android"),
+                                        wheels_dir or _wheels_cache("android",
+                                                                   spec.android_abis[0]),
                                         allow_download=wheels_dir is None,
                                         pip_tags=_android_pip_tags(spec),
                                         index_url=index_url, extra_index_url=extra_index)

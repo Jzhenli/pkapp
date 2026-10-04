@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unsigned", action="store_true", help="dev/test 旁路：不签名（signature=unsigned）")
     p.add_argument("--keygen", action="store_true", help="生成 Ed25519 密钥对到 .pkapp/ 后退出")
     p.add_argument("--wheels-dir", default=None, help="离线 wheel 目录（--no-index --find-links）")
+    p.add_argument("--arch", default=None, metavar="ABI",
+                   help="android：覆盖 [platforms.android].abis（单 ABI，NDK 命名，"
+                        "如 arm64-v8a/armeabi-v7a；仅本次生效，不写回 TOML）")
 
     p = sub.add_parser("check", help="静态检查（依赖声明合规 + 路径/端口反模式扫描）")
     _add_project(p)
@@ -77,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--desc", default=None, help="windows：FileDescription/ProductName（默认 app.name）")
     p.add_argument("--rcedit", default=None, help="windows：rcedit 路径（缺省 PKAPP_RCEDIT/PATH）")
     p.add_argument("--out", default=None, help="终产物输出目录（默认 <project>/release）")
+    p.add_argument("--arch", default=None, metavar="ABI",
+                   help="android：断言与 build 记录的 ABI 一致（不符则报错；缺省自动沿用 "
+                        "最后一次 build 的 ABI）")
     return ap
 
 
@@ -97,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "build":
             return cmd_build_mod.cmd_build(args.project, platform=args.platform,
                                            key=args.key, unsigned=args.unsigned,
-                                           keygen=args.keygen, wheels_dir=args.wheels_dir)
+                                           keygen=args.keygen, wheels_dir=args.wheels_dir,
+                                           arch=args.arch)
         if args.cmd == "check":
             return cmd_check_mod.cmd_check(args.project)
         if args.cmd == "doctor":
@@ -117,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                                                shell=args.shell, shell_dir=args.shell_dir,
                                                variant=args.variant, icon=args.icon,
                                                desc=args.desc, rcedit=args.rcedit,
-                                               out=args.out)
+                                               out=args.out, arch=args.arch)
     except KeyboardInterrupt:
         return 130
     return 2

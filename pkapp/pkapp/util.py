@@ -62,3 +62,14 @@ def atomic_write(path: str, data: bytes) -> None:
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+def sha256_file(path: str) -> str:
+    """文件字节级 sha256（hexdigest）——配对闸门按磁盘字节验，与 manifest 层
+    hash（对规范内容算，如 spk_hash）语义不同，不可混用。"""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()

@@ -120,6 +120,12 @@ PINS: tuple[Pin, ...] = (
               "python-android-dart-3.12.14-arm64-v8a.tar.gz",),
         sha256="29e4d83f9f7076b42395d70b32b0d951fa514aeb8ac8b4c6381c32bdb4809eb1",
         kind="tar.gz", dest_parent="runtimes/py-android-3.12.14/arm64-v8a", rootless=True),
+    Pin(id="py-android-3.12.14-armeabi-v7a", platform="android",
+        filename="py-android-armv7.tar.gz",
+        urls=("https://github.com/flet-dev/python-build/releases/download/20260921/"
+              "python-android-dart-3.12.14-armeabi-v7a.tar.gz",),
+        sha256="9381e9537e3292d637a39f0535eb76fba6b2371dc8502fc2362297d571133ec2",
+        kind="tar.gz", dest_parent="runtimes/py-android-3.12.14/armeabi-v7a", rootless=True),
     Pin(id="py-android-3.12.14-x86_64", platform="android",
         filename="py-android-x86_64.tar.gz",
         urls=("https://github.com/flet-dev/python-build/releases/download/20260921/"
@@ -178,11 +184,11 @@ def managed_runtime_dir(platform: str, root: str | None = None) -> str:
     """平台托管运行时快照根（由 pin 常量推导——mock 测试同源，不脱钩）。
 
     windows = <cache>/runtimes/pbs-cpython-3.12.14+20260929
-    android = <cache>/runtimes/py-android-3.12.14（两 abi 共享父目录）
+    android = <cache>/runtimes/py-android-3.12.14（各 abi 共享父目录）
     """
     for p in PINS:
         if p.platform == platform and _split(p.dest_parent)[0] == "runtimes":
-            if p.rootless:   # 两 abi pin 共享父目录
+            if p.rootless:   # 各 abi pin 共享父目录
                 return os.path.join(root or cache_root(),
                                     *_split(os.path.dirname(p.dest_parent)))
             return installed_dir(p, root)
@@ -481,7 +487,7 @@ def _install(pin: Pin, dl_dir: str, base: str) -> None:
         return
     if pin.rootless:
         # tar 包根即文件本体（./libpython3.12.so …）——直接解入 <dest_parent>，
-        # snapshot.toml 写共享父目录（py-android 两 abi 同源）
+        # snapshot.toml 写共享父目录（py-android 各 abi 同源）
         dest = installed_dir(pin, base)
         snap = os.path.join(os.path.dirname(dest), "snapshot.toml")
         if os.path.isdir(dest) and _snap_has(snap, pin, sha):
