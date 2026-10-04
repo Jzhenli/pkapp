@@ -37,7 +37,8 @@ pkapp package ─► 交付容器落 <项目>/release/（zip / apk）
 pip install pkapp-*.whl      :: GitHub Release 下载；源码形态见下方「构建前提」
 
 :: 建项目 + 本地开发
-pkapp create myapp
+pkapp create myapp            :: 缺省 minimal（纯 ASGI + 占位页）；
+                              :: --template fullstack = FastAPI + Vue/Vite + lan 登录门
 cd myapp
 pkapp dev          :: 起开发服务，浏览器直连
 
@@ -74,7 +75,8 @@ pkapp fetch windows
 **最小示例**：[examples/helloworld](examples/helloworld/) —— 纯 ASGI + 一次性握手鉴权
 + 前端自检页的完整打包样例。
 **全栈示例**：[examples/hiapp](examples/hiapp/) —— Vue 3 / Vite 前端 + FastAPI 后端
-+ lan 登录门 + 固定端口 + Windows/Android 图标与安卓打包的完整样例。
++ lan 登录门 + 固定端口 + Windows/Android 图标与安卓打包的完整样例；
+即 `pkapp create --template fullstack` 的模板来源，可对照阅读。
 
 **安全模型**：spk 用 Ed25519 签名，验签公钥烧进壳；`pkapp build` 首次构建自动生成
 项目级 `.pkapp/sign.key`（已默认进 .gitignore，绝不入库）。包内置壳在 package 时

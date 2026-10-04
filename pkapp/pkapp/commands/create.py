@@ -1,123 +1,78 @@
-"""pkapp create <name>：建项目骨架 + venv + 依赖（含 applocal）+ 前端模板。"""
+"""pkapp create <name>：按模板建项目骨架 + venv + 依赖（含 applocal）+ 前端工程。
+
+模板内置于 pkapp/templates/<template>/（随 wheel 经 package-data 分发）；
+占位符替换一律 str.replace("{name}"/"{pkg}")——禁止 str.format（模板里的
+Vue {{ }} 插值、JSON 花括号会被 format 打爆）。
+"""
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 
-from ..util import atomic_write
+from ..util import atomic_write, walk_files
 
-_PkappToml = """\
-# pkapp AppSpec（协议 B B.w 校验；字段含义见 docs/PACKAGER_SPEC.md §2）
-[app]
-name = "{name}"
-version = "0.1.0"
-entry = "app.main:app"
-min_app_version = "0.1.0"      # V9 防回滚地板：低于此版本的签名包将被壳拒绝
-min_pkapp_version = "0.1.0"
-coexist = false                # 升级共存开关（默认关闭）
-
-[dependencies]
-python = [
-    "applocal>=0.1.0",         # 契约层（协议 A/C）；必装件
-    "uvicorn>=0.30",           # ASGI server（用户应用自带，applocal 惰性导入）
-]
-
-[heartbeat]                    # 壳轮询参数（SHELL_PROTOCOL §5，AppSpec 可调）
-interval_s = 5
-timeout_s = 30
-cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap 返回）
-
-[dist]
-dir = "ui"                     # 前端产物目录（恒存在；空缺时 build 生成占位页）
-
-# 平台段（参考 XAgent pyproject 设计）：依赖追加式合并（公共 + 平台），未知段名/未知键报错。
-[platforms.windows]
-python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）
-# runtime_dir = "D:/runtimes/pbs-cpython-3.12.14+20260929"   # 逃生门：显式覆盖托管快照
-# dependencies = [ "pywin32>=306", ]   # 仅 Windows 装的依赖
-# icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
-[platforms.android]
-python_version = "3.12.14"     # → pkapp fetch android（py-android 运行时同版本锁定）
-package = "com.example.{pkg}"   # applicationId（同机多应用共存，build android 必填；name 中 - 已转 _）
-# keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
-# abis = ["arm64-v8a"]
-# icon = "icons/android/xplay.png"     # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；
-                                      #  自动生成全密度 mipmap + 自适应图标，Briefcase 同式）
-# [platforms.linux]                    # M3 预留；dependencies 同样追加
-# setproctitle = true
-"""
-
-_MainPy = '''\
-"""应用入口（ASGI callable；applocal 为唯一平台接缝，用户代码不知道 pkapp 存在）。"""
-import json
-
-import applocal
+_TEMPLATES = ("minimal", "fullstack")
+_TEMPLATE_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir, "templates"))
 
 
-async def app(scope, receive, send):
-    """纯 ASGI 示例：GET /api/hello → JSON。换成 FastAPI 等 ASGI 框架亦可。"""
-    if scope["type"] != "http":
-        return
-    if scope["path"] == "/api/hello":
-        # 路径只经 applocal.paths（目录铁律 2：用户数据绝不进只读区）
-        data_dir = applocal.paths().data_dir
-        await send({"type": "http.response.start", "status": 200,
-                    "headers": [(b"content-type", b"application/json")]})
-        await send({"type": "http.response.body",
-                    "body": json.dumps({"hello": "world",
-                                        "version": applocal.runtime().version,
-                                        "data_dir": data_dir}).encode()})
-        return
-    await send({"type": "http.response.start", "status": 404,
-                "headers": [(b"content-type", b"application/json")]})
-    await send({"type": "http.response.body", "body": b\'{"error": "not found"}\'})
-'''
-
-_InitPy = '"""用户后端 import 根（packager 永不写入 app/，协议 B §1）。"""\n'
-
-_IndexHtml = """\
-<!doctype html>
-<html><head><meta charset="utf-8"><title>{name}</title></head>
-<body><h1>{name}</h1><p>前端占位页（ui 恒存在；SPA 路由兜底与 index.html no-store
-由 applocal 静态分支处理，SHELL_PROTOCOL §8）。</p></body></html>
-"""
-
-_Gitignore = """\
-.venv/
-.dev/
-build/
-release/
-install-test/
-.pkapp/
-__pycache__/
-*.pyc
-node_modules/
-ui/
-"""
+def _render_file(src: str, dst: str, name: str, pkg: str) -> None:
+    """读模板文件 → 占位符替换 → 原子落盘（保持相对路径结构）。"""
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+    atomic_write(dst, text.replace("{name}", name).replace("{pkg}", pkg).encode("utf-8"))
 
 
-def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = False) -> int:
-    import re
+def _scaffold(template: str, root: str, name: str, pkg: str) -> None:
+    tpl_dir = os.path.join(_TEMPLATE_ROOT, template)
+    for rel in walk_files(tpl_dir):
+        # 模板内 .gitignore 存为 gitignore（避免其 ui/ 等规则在仓库内误伤模板自身），
+        # 生成时还原文件名
+        parts = rel.split("/")
+        if parts[-1] == "gitignore":
+            parts[-1] = ".gitignore"
+        _render_file(os.path.join(tpl_dir, rel), os.path.join(root, *parts), name, pkg)
+
+
+def _npm_install(root: str) -> bool:
+    """fullstack 前端依赖：探测到 npm 才装；失败仅警告不中断。True=已装好。"""
+    web = os.path.join(root, "web")
+    npm = shutil.which("npm")
+    if npm is None:
+        print("[create] 未检测到 node/npm——跳过前端依赖安装"
+              "（装好 node 后在 web/ 下 npm install && npm run build）")
+        return False
+    print("[create] npm install（web/ 前端依赖）…")
+    r = subprocess.run([npm, "install"], cwd=web)
+    if r.returncode != 0:
+        print("[create] npm install 失败（仅警告，不中断）——稍后在 web/ 下手动重试")
+        return False
+    return True
+
+
+def cmd_create(name: str, target_dir: str | None = None, *,
+               template: str = "minimal", no_venv: bool = False) -> int:
     if not re.match(r"^[A-Za-z][A-Za-z0-9_-]*$", name):
         print(f"[create] name 非法（须匹配 ^[A-Za-z][A-Za-z0-9_-]*$，用作 exe/互斥键名）: {name!r}")
+        return 2
+    if template not in _TEMPLATES:
+        print(f"[create] 未知模板: {template!r}（可选 {'/'.join(_TEMPLATES)}）")
         return 2
     root = os.path.abspath(target_dir or name)
     if os.path.exists(root) and os.listdir(root):
         print(f"[create] 目录非空，拒绝覆盖: {root}")
         return 2
 
-    os.makedirs(os.path.join(root, "app"), exist_ok=True)
-    os.makedirs(os.path.join(root, "ui"), exist_ok=True)
     # 预填 applicationId 前净化：- 转 _（首字符已校验为字母，转后必过反向域名校验）
-    atomic_write(os.path.join(root, "pkapp.toml"),
-                 _PkappToml.format(name=name, pkg=name.replace("-", "_")).encode())
-    atomic_write(os.path.join(root, ".gitignore"), _Gitignore.encode())
-    atomic_write(os.path.join(root, "app", "__init__.py"), _InitPy.encode())
-    atomic_write(os.path.join(root, "app", "main.py"), _MainPy.encode())
-    atomic_write(os.path.join(root, "ui", "index.html"),
-                 _IndexHtml.format(name=name).encode())
-    print(f"[create] 项目骨架就绪: {root}")
+    pkg = name.replace("-", "_")
+    _scaffold(template, root, name, pkg)
+    print(f"[create] 项目骨架就绪（{template} 模板）: {root}")
+
+    frontend_ready = False
+    if template == "fullstack" and not no_venv:
+        frontend_ready = _npm_install(root)
 
     if not no_venv:
         venv_dir = os.path.join(root, ".venv")
@@ -127,8 +82,11 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
             print("[create] venv 创建失败（可 --no-venv 跳过）")
             return 1
         py = os.path.join(venv_dir, "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
-        print("[create] 安装依赖（applocal + uvicorn）…")
-        cmd = [py, "-m", "pip", "install", "-q", "applocal>=0.1.0", "uvicorn>=0.30"]
+        deps = ["applocal>=0.1.0", "uvicorn>=0.30"]
+        if template == "fullstack":
+            deps.append("fastapi>=0.115")
+        print(f"[create] 安装依赖（{' + '.join(d.split('>')[0] for d in deps)}）…")
+        cmd = [py, "-m", "pip", "install", "-q", *deps]
         from ..vendor import wheels_dir as vendored_wheels
         vw = vendored_wheels()
         if vw:
@@ -140,8 +98,19 @@ def cmd_create(name: str, target_dir: str | None = None, *, no_venv: bool = Fals
                   "（applocal 为非 PyPI 私有件：wheel 形态由内置 wheel 命中，"
                   "源码形态先 pip install -e <仓库>/applocal）")
             return 1
-    print("[create] 完成。下一步：\n"
-          "  1. pkapp fetch windows  # 托管运行时（唯一网络入口；--from 目录可离线导入）\n"
-          "  2. pkapp dev            # 起 dev 服务\n"
-          "  3. pkapp doctor         # 环境诊断")
+
+    if template == "minimal":
+        print("[create] 完成。下一步：\n"
+              "  1. pkapp fetch windows  # 托管运行时（唯一网络入口；--from 目录可离线导入）\n"
+              "  2. pkapp dev            # 起 dev 服务\n"
+              "  3. pkapp doctor         # 环境诊断")
+    else:
+        npm_done = frontend_ready
+        print("[create] 完成。下一步：\n"
+              + ("  1. cd web && npm run build   # 前端产物进 ui/\n"
+                 if npm_done else
+                 "  1. cd web && npm install && npm run build   # 前端产物进 ui/（需 node ≥18）\n")
+              + "  2. pkapp fetch windows  # 托管运行时（唯一网络入口；--from 目录可离线导入）\n"
+                "  3. pkapp dev            # 起 dev 服务；lan 门首启自动种子 admin/123456（登录后请改密）\n"
+                "  4. pkapp doctor         # 环境诊断")
     return 0

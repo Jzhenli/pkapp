@@ -20,5 +20,8 @@ include = ["pkapp*"]
 
 # 内置制品（scripts/vendor.py 组装，源缺失时构建照常——代码侧全部容忍缺失）：
 # _vendor/shell/MyApp.exe + WebView2Loader.dll（零编译壳）、_vendor/wheels/*.whl（applocal）
+# templates/：create --template 项目模板（minimal/fullstack，纯数据文件）
 [tool.setuptools.package-data]
-pkapp = ["_vendor/**/*"]
+# 注意：模板内 .gitignore 存为 gitignore（点开头文件会被 glob 通配符漏掉，
+# 且会误伤仓库自身忽略规则），生成项目时由 create 还原为 .gitignore
+pkapp = ["_vendor/**/*", "templates/**/*"]

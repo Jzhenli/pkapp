@@ -11,6 +11,9 @@
   自适应图标）
 - **Android 打包**：`package`（applicationId）+ `abis` + 图标全配置样例
 
+> 本目录即 `pkapp create --template fullstack` 的模板来源（模板不含 icons/，
+> pkapp.toml 的 port 与 icon 键以注释形式给出），可对照阅读。
+
 ## 跑起来
 
 ```bat

@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("create", help="建项目：骨架 + venv + 依赖（含 applocal）+ 前端模板")
     p.add_argument("name")
     p.add_argument("--dir", default=None, help="目标目录（默认 ./<name>）")
+    p.add_argument("--template", choices=["minimal", "fullstack"], default="minimal",
+                   help="minimal=纯 ASGI + 占位页（缺省）；fullstack=FastAPI + Vue/Vite + lan 登录门")
     p.add_argument("--no-venv", action="store_true", help="跳过 venv 创建与依赖安装")
 
     p = sub.add_parser("dev", help="起 dev 服务（自动注入 MYAPP_*；默认 auth=disabled）")
@@ -87,7 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.cmd == "create":
-            return cmd_create_mod.cmd_create(args.name, args.dir, no_venv=args.no_venv)
+            return cmd_create_mod.cmd_create(args.name, args.dir,
+                                             template=args.template, no_venv=args.no_venv)
         if args.cmd == "dev":
             return cmd_dev_mod.cmd_dev(args.project, strict_auth=args.strict_auth,
                                        port=args.port, python=args.python)

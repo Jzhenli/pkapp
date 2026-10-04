@@ -1,0 +1,38 @@
+# pkapp AppSpec（协议 B B.w 校验；字段含义见 docs/PACKAGER_SPEC.md §2）
+[app]
+name = "{name}"
+version = "0.1.0"
+entry = "app.main:app"
+min_app_version = "0.1.0"      # V9 防回滚地板：低于此版本的签名包将被壳拒绝
+min_pkapp_version = "0.1.0"
+coexist = false                # 升级共存开关（默认关闭）
+
+[dependencies]
+python = [
+    "applocal>=0.1.0",         # 契约层（协议 A/C）；必装件
+    "uvicorn>=0.30",           # ASGI server（用户应用自带，applocal 惰性导入）
+]
+
+[heartbeat]                    # 壳轮询参数（SHELL_PROTOCOL §5，AppSpec 可调）
+interval_s = 5
+timeout_s = 30
+cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap 返回）
+
+[dist]
+dir = "ui"                     # 前端产物目录（恒存在；空缺时 build 生成占位页）
+
+# 平台段（参考 XAgent pyproject 设计）：依赖追加式合并（公共 + 平台），未知段名/未知键报错。
+[platforms.windows]
+python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）
+# runtime_dir = "D:/runtimes/pbs-cpython-3.12.14+20260929"   # 逃生门：显式覆盖托管快照
+# dependencies = [ "pywin32>=306", ]   # 仅 Windows 装的依赖
+# icon = "assets/icon.ico"             # ship 图标默认值（--icon 参数优先）
+[platforms.android]
+python_version = "3.12.14"     # → pkapp fetch android（py-android 运行时同版本锁定）
+package = "com.example.{pkg}"   # applicationId（同机多应用共存，build android 必填；name 中 - 已转 _）
+# keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
+# abis = ["arm64-v8a"]
+# icon = "icons/android/xplay.png"     # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；
+                                      #  自动生成全密度 mipmap + 自适应图标，Briefcase 同式）
+# [platforms.linux]                    # M3 预留；dependencies 同样追加
+# setproctitle = true
