@@ -9,8 +9,15 @@
   K ^ mask。mask = SHA256(MASK_SEED ‖ ANCHOR_HEX 的 ASCII 串)——与 key.c
   pkkey_derive_mask 确定性派生同式镜像（★隐蔽化 2026-10：掩码不以明文常量
   形态存在于件内，§5.4②）。
+  ★seed 真值单源★（2026-10 防逆向强化）：件内只存 seed 的包裹态
+  （SEED_STORED = seed ⊕ SHA256(k_s1 ‖ k_s2)，运行期 unwrap 栈上还原），
+  seed 真值 MASK_SEED_HEX 只存在于本文件——构建工具侧常量，不随 dll 分发
+  （strings 捞不到）。
+  ★导出名无意义化★（2026-10）：dll 导出 pk_x1/pk_x2/pk_x3，导出面不再自述
+  语义；本文件为语义对照点：x1=encrypt（显式 K 参数，构建期）/ x2=decrypt
+  （内嵌态，运行期）/ x3=key_id（配对校验）。
   ★漂移防护★：key.h 与本文件的双份常量若失同步，package 补丁后闸门
-  （pkapp_key_id ↔ manifest code_key_id）+ test_keylib 契约测试双重拦截。
+  （pk_x3 ↔ manifest code_key_id）+ test_keylib 契约测试双重拦截。
 """
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ from ctypes import POINTER, c_char_p, c_char, c_size_t, c_int, c_ubyte
 
 # ---- 与 keylib/src/key.h 镜像的补丁契约常量（勿改动；漂移 = 闸门拦截）----
 ANCHOR_HEX = "c47f1a93e5b28d603ad9f641075ce82b961d74af30cb58e26f039ad148b725ec"
+# seed 真值（32B）：★唯二存在点之一（另一处是构建/打包期内存态）——件内只有
+# 包裹态，本常量不随 dll 分发；_MASK 派生公式与 key.c unwrap 完全同式。
 MASK_SEED_HEX = "7b1d94e0c3a26f58d0b47f19ae2c65380fe7d1a49b62c8053f47e9d1b0a6c258"
 
 BLOB_OVERHEAD = 33          # magic(4)+ver(1)+nonce(12)+tag(16)（§5.3）
@@ -215,14 +224,15 @@ class KeyLib:
         except OSError as e:
             raise KeyLibError(f"key-holder 件加载失败 {path}: {e}") from e
         lib = self._lib
-        lib.pkapp_encrypt.argtypes = [c_char_p, c_char_p, c_char_p, c_size_t,
-                                      c_char_p, c_size_t, POINTER(c_size_t)]
-        lib.pkapp_encrypt.restype = c_int
-        lib.pkapp_decrypt.argtypes = [c_char_p, c_char_p, c_size_t,
-                                      c_char_p, c_size_t, POINTER(c_size_t)]
-        lib.pkapp_decrypt.restype = c_int
-        lib.pkapp_key_id.argtypes = []
-        lib.pkapp_key_id.restype = c_char_p
+        # 导出名无意义化（2026-10）：x1=encrypt / x2=decrypt / x3=key_id
+        lib.pk_x1.argtypes = [c_char_p, c_char_p, c_char_p, c_size_t,
+                              c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.pk_x1.restype = c_int
+        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_size_t,
+                              c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.pk_x2.restype = c_int
+        lib.pk_x3.argtypes = []
+        lib.pk_x3.restype = c_char_p
 
     @staticmethod
     def _mid(module_id: str) -> bytes:
@@ -237,11 +247,11 @@ class KeyLib:
             raise KeyLibError("K 须为 32 字节")
         out = ctypes.create_string_buffer(len(payload) + BLOB_OVERHEAD)
         n = c_size_t(0)
-        rc = self._lib.pkapp_encrypt(key, mid, payload, len(payload),
-                                     out, len(payload) + BLOB_OVERHEAD,
-                                     ctypes.byref(n))
+        rc = self._lib.pk_x1(key, mid, payload, len(payload),
+                             out, len(payload) + BLOB_OVERHEAD,
+                             ctypes.byref(n))
         if rc != 0:
-            raise KeyLibError(f"pkapp_encrypt 失败({_ERRORS.get(rc, rc)}): {module_id}")
+            raise KeyLibError(f"pk_x1 失败({_ERRORS.get(rc, rc)}): {module_id}")
         return out.raw[:n.value]
 
     def decrypt(self, module_id: str, blob: bytes) -> bytes:
@@ -250,14 +260,14 @@ class KeyLib:
             raise KeyLibError(f"blob 过短（{len(blob)}B）: {module_id}")
         out = ctypes.create_string_buffer(len(blob) - BLOB_OVERHEAD)
         n = c_size_t(0)
-        rc = self._lib.pkapp_decrypt(mid, blob, len(blob),
-                                     out, len(blob) - BLOB_OVERHEAD, ctypes.byref(n))
+        rc = self._lib.pk_x2(mid, blob, len(blob),
+                             out, len(blob) - BLOB_OVERHEAD, ctypes.byref(n))
         if rc != 0:
-            raise KeyLibError(f"pkapp_decrypt 失败({_ERRORS.get(rc, rc)}): {module_id}")
+            raise KeyLibError(f"pk_x2 失败({_ERRORS.get(rc, rc)}): {module_id}")
         return out.raw[:n.value]
 
     def key_id(self) -> str:
-        return self._lib.pkapp_key_id().decode("ascii")
+        return self._lib.pk_x3().decode("ascii")
 
 
 def patch_dll(src_dll: str, out_path: str, key: bytes) -> int:

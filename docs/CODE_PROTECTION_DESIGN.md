@@ -82,9 +82,9 @@
 K 生成    首次以 code_encryption=true 构建 → 自动 keygen 生成 .pkapp/code.key（256-bit 随机，与 sign.key
           同级管理，自动入 .gitignore），同时打日志提示备份（丢失 = 无法按原 K 重建，轮换使已发包全量失效）
           （★v1.3★ Q1 决议：自动化；不提供 rotate-key 命令——轮换 = 换 key 文件 → 重新 build + package，均为既有命令）
-K 使用-构建  pkapp build：K 明文经 pkapp_encrypt(key32,...) 参数传入（内存态，不落盘）→ 加密 app/ pyc 载荷
+K 使用-构建  pkapp build：K 明文经 pk_x1(key32,...) 参数传入（内存态，不落盘）→ 加密 app/ pyc 载荷
 K 内嵌    pkapp package：K（异或包裹形态）经锚点补丁写入 key-holder 件的 .data 段
-K 使用-运行  applocal ctypes 加载 key-holder 件 → pkapp_decrypt() → K 只在件内栈上展开
+K 使用-运行  applocal ctypes 加载 key-holder 件 → pk_x2() → K 只在件内栈上展开
 K 轮换    ★v1.1★ 澄清：K 同时是加密钥与 nonce 派生钥——换 K = 重新 build（全量重加密 blobs）+ 重新 package（重打补丁），缺一不可；仅 repackage 会导致旧密文全量 code_decrypt 失败。key_id 随新 K 变化，manifest 与件配对校验（§7.3）
 ```
 
@@ -98,16 +98,20 @@ K 的存在形态（★v1.1★ 统一口径）：**K 不以明文驻留于任何
 
 | 阶段 | 形态 | 职责 |
 |---|---|---|
-| 构建/打包期 | 通用件（K 未内嵌） | `pkapp_encrypt()`：构建期加密；package 期接受锚点补丁 |
-| 运行期 | 补丁件（K 内嵌） | `pkapp_decrypt()`：内存解密；`pkapp_key_id()`：配对校验 |
+| 构建/打包期 | 通用件（K 未内嵌） | `pk_x1()`：构建期加密；package 期接受锚点补丁 |
+| 运行期 | 补丁件（K 内嵌） | `pk_x2()`：内存解密；`pk_x3()`：配对校验 |
 
 **为什么密码学必须单源化**：加密解密是同一份 C 代码 → 构建产物与运行期解密永远自洽；Python 侧（pkapp 与 applocal）一行加密代码都不写 → applocal 的 stdlib-only 纪律（_ndk.py 教训：导入链 Discipline）完全不受波及；pycryptodome 依赖及其 Android wheel 可用性风险直接消失。
 
 ### 5.2 C 接口（全部导出面 = 三个函数，★v1.1★ 修订）
 
+**★2026-10 防逆向强化：导出名无意义化★**——三个导出更名 `pk_x1/pk_x2/pk_x3`：
+导出表与 strings 不再自述"加密逻辑在这"（frida 按语义名挂钩的定位成本抬高；
+对照关系仅存于本节与 keylib.py 注释）。函数签名、blob 格式、补丁契约全部不变。
+
 ```c
 // 构建期：K 由调用方（pkapp）以参数传入——通用形态与"自管形态"通用的唯一加密入口
-PKKEY_API int pkapp_encrypt(
+PKKEY_API int pk_x1(
     const uint8_t *key32,            // 256-bit 项目密钥
     const char    *module_id,        // canonical module id，参与确定性 nonce 派生（§5.4③）
     const uint8_t *in, size_t in_len,
@@ -115,17 +119,17 @@ PKKEY_API int pkapp_encrypt(
 
 // 运行期：无 key 参数——K 从内嵌（混淆）状态栈上展开，用后可移植安全清零（§5.4②）
 // module_id 作 GCM AAD（★v1.2★）：blob 只能解成它名下的模块，防包内换位（纵深防御，零成本）
-PKKEY_API int pkapp_decrypt(
+PKKEY_API int pk_x2(
     const char    *module_id,        // 与加密时一致（canonical id）；AAD 不匹配 → code_decrypt diag
     const uint8_t *in, size_t in_len,
     uint8_t *out, size_t out_cap, size_t *out_len);
 
 // 配对校验：key_id = SHA256(K) 前 16 字节 = 32 个 hex 字符（128-bit ★v1.3★ Q6 决议：趁无兼容包袱定死；
 // manifest 同存一份）
-PKKEY_API const char *pkapp_key_id(void);
+PKKEY_API const char *pk_x3(void);
 ```
 
-**★v1.1★ 明确不提供运行时注入 K 的 API（如 `pkapp_set_key`）**：任何注入入口都是攻击者的现成钩子。模式 B（自管件）因此重定义为：**用户自行编译、K 在其构建期内嵌的另一种形态**——`pkapp_encrypt` 对两种形态通用（key 走参数），`pkapp_decrypt` 恒认内嵌态，接口面不因模式 B 扩大。
+**★v1.1★ 明确不提供运行时注入 K 的 API（如 `pkapp_set_key`）**：任何注入入口都是攻击者的现成钩子。模式 B（自管件）因此重定义为：**用户自行编译、K 在其构建期内嵌的另一种形态**——`pk_x1` 对两种形态通用（key 走参数），`pk_x2` 恒认内嵌态，接口面不因模式 B 扩大。
 
 ### 5.3 blob 格式（★v1.1★ 修订：明文形态精确定义）
 
@@ -149,7 +153,7 @@ nonce 字段定位（★v1.2★ 澄清）：对保密**零贡献**——持 K �
 ### 5.4 内部实现要点（★v1.1★ 修订）
 
 1. **算法**：vendor 公有领域 tiny-AES-c（~200 行）+ 精简 GHASH/GCM（~80 行）。选型理由：Linux 不能赌系统有 libcrypto、Android bionic 无 GCM 系统接口、OpenSSL 引入运行时依赖；tiny-AES 吞吐 ~50-100 MB/s，MB 级 app/ 代码解密 <30ms，足够。
-2. **K 的静态混淆与可移植清零**：内嵌的不是 K 本体，而是异或包裹态 `stored = K XOR mask`——★隐蔽化（2026-10）★：mask 不以明文常量存于件内，由 `mask = SHA256(seed ‖ 锚点 hex ASCII)` 确定性派生（构建期 Python 侧 hashlib 同式镜像复算；锚点补丁契约不变、二进制锚点唯一性不受扰——ASCII 形态与二进制锚点字节序列不同），32B 常量 XOR 组合的自动特征扫描失效，定位重组点须读懂派生链；`strings` 扫描不可见；`pkapp_decrypt` 调用时栈上展开、返回前**可移植安全清零**——`SecureZeroMemory` 仅 Windows，统一用 volatile 指针逐字节写零循环（编译器不可省略）或 C11 `memset_s`（可用时优先），杜绝 K 残留栈/寄存器。挡静态扫描，挡不住 IDA 级逆向——预期内（§9）；隐蔽化只抬"一次 IDA 会话"内的会话成本，不改天花板。
+2. **K 的静态混淆与可移植清零**：内嵌的不是 K 本体，而是异或包裹态 `stored = K XOR mask`——★隐蔽化（2026-10）★：mask 不以明文常量存于件内，由 `mask = SHA256(seed ‖ 锚点 hex ASCII)` 确定性派生（构建期 Python 侧 hashlib 同式镜像复算；锚点补丁契约不变、二进制锚点唯一性不受扰——ASCII 形态与二进制锚点字节序列不同），32B 常量 XOR 组合的自动特征扫描失效，定位重组点须读懂派生链；`strings` 扫描不可见；★seed 包裹态（2026-10 防逆向强化）★：seed 真值不在件内——件内只存 `SEED_STORED = seed ⊕ SHA256(k_s1 ‖ k_s2)`（k_s1/k_s2/k_seed_stored 三个字节数组空间分散、以字节形态展开，strings 连 hex 串形态也捞不到；seed 真值只存在于构建工具侧 Python 契约常量，不随 dll 分发），运行期 `pk_x2` 调用时 K1 = SHA256(k_s1 ‖ k_s2)、seed = SEED_STORED ⊕ K1 栈上展开、返回前**可移植安全清零**——`SecureZeroMemory` 仅 Windows，统一用 volatile 指针逐字节写零循环（编译器不可省略）或 C11 `memset_s`（可用时优先），杜绝 K 残留栈/寄存器。挡静态扫描，挡不住 IDA 级逆向——预期内（§9）；隐蔽化只抬"一次 IDA 会话"内的会话成本，不改天花板。
 3. **确定性 nonce 与 canonical module id（★v1.1★ 精确定义，正确性硬前置）**：
 
    ```
@@ -200,7 +204,7 @@ nonce 字段定位（★v1.2★ 澄清）：对保密**零贡献**——持 K �
 
 - 新步骤（在现 app/ 拷贝 + pyc 编译之后）：
   1. app/ 树 → 逐模块 pyc（复用 `_compile_checked_hash`，解释器 = 运行时同 minor 快照解释器，版本哨兵既有机制强制——**密文绑定 3.12 pyc magic，错 minor 解释器产出的载荷运行期 marshal 直接失败，此约束从 pyc 时代继承到密文，显式写明**）；
-  2. 剥离 16 字节 pyc 头 → `pkapp_encrypt(key32, module_id, payload)`；
+  2. 剥离 16 字节 pyc 头 → `pk_x1(key32, module_id, payload)`；
   3. 落 `app/index.enc`（加密清单：版本、canonical id 列表、Q2 资源条目预留）+ `app/<sha256(module_id)>.enc`；
   4. **顺序硬约束（★v1.1★ 新增）**：单模块流程 = 加密 → 解密回读验证（GCM 打开 + marshal.loads 成功）→ **才**删除 staging 内明文 `.py`/`.pyc`——任何一步失败即中止构建，明文不允许越过"已验证密文"这道闸；
 - **转换只发生在 staging 副本**（`tempfile.mkdtemp`，现有管线语义）：项目源码零触碰（G7）；staging 在 finally 清理，进程被硬杀的残留限于 OS 临时目录且随下次构建清场——密文态落盘无害，明文不越闸已在上一步保证；
@@ -212,8 +216,8 @@ nonce 字段定位（★v1.2★ 澄清）：对保密**零贡献**——持 K �
 ### 6.2 package 期
 
 - 锚点补丁：`_vendor/keylib/<platform>/` 通用件 → staging 副本上改写 K 包裹态（复用壳公钥补丁的锚点命中/回退/多段拒绝逻辑）；
-- 补丁后闸门：对补丁件调 `pkapp_key_id` 与 manifest `code_key_id` 比对，失败保留 staging 现场（同现有闸门语义）；
-- **模式 B（★v1.1★ 重定义）**：显式自管 key-holder 件（env/参数指定）= **用户自行编译、K 已在其编译期内嵌**的形态——pkapp 不补丁、不需要运行时注入 API（§5.2）；pkapp build 仍用 `pkapp_encrypt(key32,…)` 加密（用户向 pkapp 提供 K 与自管件，两者配对由用户自检）。
+- 补丁后闸门：对补丁件调 `pk_x3` 与 manifest `code_key_id` 比对，失败保留 staging 现场（同现有闸门语义）；
+- **模式 B（★v1.1★ 重定义）**：显式自管 key-holder 件（env/参数指定）= **用户自行编译、K 已在其编译期内嵌**的形态——pkapp 不补丁、不需要运行时注入 API（§5.2）；pkapp build 仍用 `pk_x1(key32,…)` 加密（用户向 pkapp 提供 K 与自管件，两者配对由用户自检）。
 
 ### 6.3 CI 与 vendor
 
@@ -226,10 +230,10 @@ nonce 字段定位（★v1.2★ 澄清）：对保密**零贡献**——持 K �
 
 ```
 keylib_load    → ctypes 加载 key-holder 件（路径按平台 §5.5）
-key_pair_check → 件 pkapp_key_id() 与 manifest code_key_id 比对
+key_pair_check → 件 pk_x3() 与 manifest code_key_id 比对
 finder_install → meta_path finder 插到 PathFinder 之前，独占认领 "app" / "app.*"
 import app     → finder：解 index.enc 判成员资格 → sha256(import 名) 定位 blob
-              → pkapp_decrypt(import 名作 AAD) → marshal.loads → exec
+              → pk_x2(import 名作 AAD) → marshal.loads → exec
 ```
 
 - **归属冲突解决（★v1.1★）**：现状 [_core.py#L525-L527](file:///d:/code/pack/applocal/applocal/_core.py#L525-L527) 无条件 `sys.path.append(app_dir)`——加密后 app/ 无 `.py`，PathFinder 会把 app/ 判成 namespace 包。规则改为：**`code_encryption` 生效时 bootstrap 跳过该 append，finder 为 app.* 的唯一供给方（先于 PathFinder 认领）**；不生效时行为与现状逐位一致。两个分支互斥、无竞态。
@@ -295,7 +299,7 @@ import app     → finder：解 index.enc 判成员资格 → sha256(import 名)
 | 步骤 | 动作 | 结果 | 所需技能 |
 |---|---|---|---|
 | 0 | 解包 spk/APK | 只有哈希名 `.enc` 密文与加密清单，无模块名；结构仅剩数量/体积（N4） | 会解压（到此止步者占绝大多数） |
-| 1A | **动态取载荷（低门槛路线）**：运行程序 + frida 按导出名 hook `pkapp_decrypt`，dump 返回缓冲 | 拿到该次运行实际 import 的模块载荷（可用脚本触发全量 import 补全） | 会 frida——**最低技能档的"全量可得"路线** |
+| 1A | **动态取载荷（低门槛路线）**：运行程序 + frida hook 解密导出（导出名已无意义化 `pk_x2`——按名撞语义失效，须逐个试三个导出或读调用图定位），dump 返回缓冲 | 拿到该次运行实际 import 的模块载荷（可用脚本触发全量 import 补全） | 会 frida——**最低技能档的"全量可得"路线** |
 | 1B | **静态离线（一次性路线）**：IDA 逆 key-holder 的 XOR unwrap → 还原 K → 用同一 AES-GCM 实现**离线解密全部 blobs** | **不需要运行进程、不需要 frida**，一次性拿全部载荷 | 会原生逆向（约一次 IDA 会话） |
 | 2 | 载荷 → 源码 | 注释永久丢失、docstring 保留；3.12 无成熟公开反编译器 → 只能读 dis/残缺反编译。**若启用 §13 混淆层：产物为改名/去 docstring/常量加密的混淆字节码，可读性地狱级——1B 路线的终局收益大幅打折** | 步骤 1 技能 + 耐心 |
 
@@ -311,7 +315,7 @@ import app     → finder：解 index.enc 判成员资格 → sha256(import 名)
 
 1. **保密边际（★v1.2★ 诚实化）**：K 与密文同包发布——静态逆向 key-holder（约一次 IDA 会话）即可**离线全量解密**。保密边际 = 混淆段逆向成本，**不是 AES-256**；本方案 = 混淆 + 完整性 + 结构隐藏（§1.2）。
 2. **K 不进**：env（封死进程环境读取）、Python 堆（封死纯 Python heap 扫描找钥）、manifest/spk（封死包内提取）、ART/Dex（封死 Android 高层逆向）；解密在原生层完成——这些路径仍然真实封闭，但都只是"把人往 IDA 路线上赶"。
-3. **已知弱点——导出名固定**：`pkapp_decrypt` 是标准导出符号，frida 按名挂钩的定位成本≈零——**动态路线（§9.1-1A）是最低门槛路线**。自研方案的优势在"无公开攻略"，不在隐藏导出；导出名随机化/序号导出属混淆级可选增强（首版不做，预期内）。
+3. **已知弱点——导出符号可枚举**：★2026-10 强化：导出名无意义化（`pk_x1/x2/x3`）★，strings/语义名直捞失效，frida 须逐个试导出或读调用图——按名挂钩成本抬高；但导出面仍只有三个符号，穷举定位成本仍低——**动态路线（§9.1-1A）是最低门槛路线**。自研方案的优势在"无公开攻略"，不在隐藏导出；序号导出/动态解密 stub 属混淆级可选增强（预期内残留）。
 4. **完整性与签名分工（★v1.2★ 澄清）**：防篡改由 `spk_hash` + Ed25519 负责（blobs/清单在 spk 签名域内，替换任一必卡验签）；GCM tag 的价值 = **运行时损坏检测** + AAD 模块绑定（防包内换位的纵深），不承担防篡改首责。Android key-holder 件在 APK 签名域内；**Windows key-holder dll 不具签名**（exe 旁置、补丁后无法哈希钉死）——替换它需安装目录写权限，属"运行时控制"级攻击（与内存 dump 同档，且替换件只能偷跑明文，不能离线解他人拷贝的 spk）。
 5. **结构泄漏（N4）**：blob 数量与密文体积可见；体积填充为可选增强。
 

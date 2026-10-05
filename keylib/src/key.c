@@ -16,7 +16,7 @@
 /* ---------------------------------------------------------------- 反调试三件套（可选）
  * §5.4⑤：Windows IsDebuggerPresent / CheckRemoteDebuggerPresent；
  * Linux/Android ptrace 自附加（PTRACE_TRACEME 已被占即有调试器）。
- * 命中 → pkapp_decrypt fail-closed（返回 PKKEY_E_DEBUGGER）。
+ * 命中 → pk_x2 fail-closed（返回 PKKEY_E_DEBUGGER）。
  * ★默认不编入★（AV 误杀对策，2026-10）：需要时以 /DPKAPP_ANTIDEBUG 显式开启。
  * 注记：只拦最低门槛动态路线，对静态还原 K 路线无作用（设计已诚实声明）。 */
 #ifdef PKAPP_ANTIDEBUG
@@ -66,16 +66,26 @@ static void pkkey_secure_zero(void *p, size_t n)
 
 /* ---------------------------------------------------------------- K 的内嵌
  * stored = K ^ mask；mask 不以明文常量形态存在于件内（★隐蔽化 2026-10，针对 1B
- * 静态路线，§5.4②）：mask = SHA256(k_mask_seed ‖ k_anchor_hex) 确定性派生——
+ * 静态路线，§5.4②）：mask = SHA256(seed ‖ k_anchor_hex) 确定性派生——
  * 自动特征扫描（32B 常量 XOR 组合）失效，定位重组点须读懂派生链。
- * k_stored 初始值 = 锚点（key.h，package 期补丁定位前提）；不加 static（外部链接）
- * 降低折叠面；读取走 volatile——防常量折叠把锚点烧进指令流（补丁后指令内副本
- * 不会更新）。k_anchor_hex 复用 ANCHOR 宏（单源）；ASCII 形态与二进制锚点字节
- * 序列不同，patch_dll 搜二进制锚点仍唯一命中（契约测试守护）。
- * unwrap 实现在 SHA-256 之后（mask 派生依赖）。 */
-static const uint8_t k_mask_seed[32] = {
-    0x7b,0x1d,0x94,0xe0,0xc3,0xa2,0x6f,0x58,0xd0,0xb4,0x7f,0x19,0xae,0x2c,0x65,0x38,
-    0x0f,0xe7,0xd1,0xa4,0x9b,0x62,0xc8,0x05,0x3f,0x47,0xe9,0xd1,0xb0,0xa6,0xc2,0x58
+ * ★seed 包裹态存储★（2026-10 防逆向强化，针对 strings 直捞 seed）：seed 真值
+ * 不在件内——件内只有 SEED_STORED = seed ⊕ SHA256(k_s1 ‖ k_s2)。三块输入
+ * 分置两段：k_seed_stored/k_s1 相邻在本段，k_s2 单独落在 SHA-256 实现段之后
+ * （三者均无独立语义，strings 捞不到 hex 串形态；集齐三块须通读翻译单元），
+ * 单看任一块不泄露 seed；运行期 unwrap 时栈上展开（用后清零，纪律同 K）。
+ * seed 真值只存在于 Python 侧契约常量（构建工具侧，不随 dll 分发）。
+ * k_stored 初始值 = 锚点（key.h，package 期补丁定位前提；明文定位器不属秘密）；
+ * 不加 static（外部链接）降低折叠面；读取走 volatile——防常量折叠把锚点烧进
+ * 指令流（补丁后指令内副本不会更新）。k_anchor_hex 复用 ANCHOR 宏（单源）；
+ * ASCII 形态与二进制锚点字节序列不同，patch_dll 搜二进制锚点仍唯一命中
+ * （契约测试守护）。包裹态三块以字节数组展开（非 hex 字符串宏）——strings
+ * 捞不到任何 hex 串形态的包裹输入。unwrap 实现在 SHA-256 之后（依赖）。 */
+static const uint8_t k_seed_stored[32] = {
+    0x3f,0xbe,0xdf,0x84,0x17,0x0b,0x37,0xc0,0x66,0x80,0xf4,0xb7,0x7c,0x98,0xb7,0x9c,
+    0xc5,0xbd,0x7d,0x58,0x05,0x91,0x19,0xb5,0x62,0xe7,0x9d,0x95,0x6a,0x6b,0x07,0x36
+};
+static const uint8_t k_s1[16] = {        /* 包裹态第一输入块（无独立语义） */
+    0x9e,0x3c,0x41,0xd7,0xa8,0xf2,0x5b,0x60,0xc1,0xe9,0x4a,0x73,0xd6,0x8f,0x0b,0x52
 };
 static const char k_anchor_hex[] = PKKEY_ANCHOR_HEX;
 uint8_t k_stored[32] = {
@@ -187,6 +197,13 @@ static void sha256(const void *data, size_t n, uint8_t out[32])
     sha256_final(&c, out);
 }
 
+/* k_s2：包裹态第二输入块（与 k_s1 / k_seed_stored 空间上分散——翻译单元内
+ * 相隔整个 SHA-256 段；单看无独立语义，unwrap 时才参与 K1 派生）。 */
+static const uint8_t k_s2[24] = {
+    0x47,0xa1,0xc8,0x5e,0x03,0xd6,0x9b,0xf2,0x7c,0x5a,0x41,0xe9,0x83,0x0b,0x7d,0x64,
+    0xfa,0x25,0x19,0xce,0x6b,0x80,0x3d,0x47
+};
+
 /* ---------------------------------------------------------------- HMAC-SHA256（nonce 派生） */
 static void hmac_sha256(const uint8_t *key, size_t key_len,
                         const void *msg, size_t msg_len, uint8_t out[32])
@@ -217,17 +234,35 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
 }
 
 /* ---------------------------------------------------------------- K 的展开（mask 确定性派生）
- * 双端镜像公式：pkapp/pkapp/packager/keylib.py _MASK = sha256(SEED + ANCHOR_HEX_ASCII)。 */
+ * 双端镜像公式：pkapp/pkapp/packager/keylib.py _MASK = sha256(SEED + ANCHOR_HEX_ASCII)。
+ * ★seed 包裹态★：seed 真值不在件内——先由 k_s1/k_s2 派生 K1，再从 k_seed_stored
+ * 异或还原（栈上、用后清零）；mask 派生公式与包裹化之前完全一致。 */
+static void pkkey_derive_seed(uint8_t out32[32])
+{
+    sha256_ctx c;
+    uint8_t k1[32];
+    int i;
+    sha256_init(&c);
+    sha256_update(&c, k_s1, sizeof k_s1);
+    sha256_update(&c, k_s2, sizeof k_s2);
+    sha256_final(&c, k1);                    /* K1 = SHA256(k_s1 ‖ k_s2) */
+    for (i = 0; i < 32; i++)
+        out32[i] = (uint8_t)(*(const volatile uint8_t *)&k_seed_stored[i] ^ k1[i]);
+    pkkey_secure_zero(k1, sizeof k1);
+}
+
 static void pkkey_derive_mask(uint8_t out32[32])
 {
     sha256_ctx c;
-    uint8_t d[32];
+    uint8_t seed[32], d[32];
+    pkkey_derive_seed(seed);                 /* 栈上还原 seed 真值（用后清零） */
     sha256_init(&c);
-    sha256_update(&c, k_mask_seed, sizeof k_mask_seed);
+    sha256_update(&c, seed, 32);
     sha256_update(&c, k_anchor_hex, sizeof k_anchor_hex - 1);   /* 64 字符 hex ASCII */
     sha256_final(&c, d);
     memcpy(out32, d, 32);
     pkkey_secure_zero(d, sizeof d);
+    pkkey_secure_zero(seed, sizeof seed);
 }
 
 /* 栈上展开 K（调用方用完必须 pkkey_secure_zero）。 */
@@ -469,7 +504,7 @@ static const char PKKEY_MAGIC[4] = { 'P', 'K', 'K', '1' };
 #define PKKEY_VER 1
 #define PKKEY_MID_MAX 512                      /* canonical module id 上限（防御） */
 
-PKKEY_API int pkapp_encrypt(
+PKKEY_API int pk_x1(
     const unsigned char *key32, const char *module_id,
     const unsigned char *in, unsigned long long in_len,
     unsigned char *out, unsigned long long out_cap, unsigned long long *out_len)
@@ -505,7 +540,7 @@ PKKEY_API int pkapp_encrypt(
     return PKKEY_OK;
 }
 
-PKKEY_API int pkapp_decrypt(
+PKKEY_API int pk_x2(
     const char *module_id,
     const unsigned char *in, unsigned long long in_len,
     unsigned char *out, unsigned long long out_cap, unsigned long long *out_len)
@@ -539,7 +574,7 @@ PKKEY_API int pkapp_decrypt(
     return PKKEY_OK;
 }
 
-PKKEY_API const char *pkapp_key_id(void)
+PKKEY_API const char *pk_x3(void)
 {
     static char hex[33];
     uint8_t K[32], d[32];

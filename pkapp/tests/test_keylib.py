@@ -1,12 +1,13 @@
 """keylib 契约测试（CODE_PROTECTION_DESIGN.md §5 / 阶段1 验收）。
 
-参照实现 = cryptography（OpenSSL）AESGCM + 标准库 hmac：pkapp_encrypt 产物与
+参照实现 = cryptography（OpenSSL）AESGCM + 标准库 hmac：pk_x1 产物与
 Python 侧按同规格重组的 blob 必须逐字节一致——等价于对 C 内 GCM/HMAC 全链做
 已知向量验证（nonce = HMAC-SHA256(K, module_id)[:12]、AAD = module_id、
 tag = GCM 认证标签）。解密/补丁链路用补丁后的 dll 副本驱动（package 闸门同款）。
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import hmac
 import importlib
@@ -125,6 +126,38 @@ def test_anchor_unique_in_dll():
     with open(_DLL, "rb") as f:
         data = f.read()
     assert data.count(keylib.ANCHOR) == 1
+
+
+def test_seed_not_in_dll():
+    """★2026-10 防逆向强化★：seed 真值（Python 侧契约常量）在 dll 内 0 命中——
+    件内只存包裹态（SEED_STORED = seed ⊕ SHA256(k_s1 ‖ k_s2)，字节形态存在、
+    hex 串形态不存在）。ANCHOR 明文是补丁定位器不属秘密（唯一性契约见上例）；
+    本用例 grep 防回退：有人把 seed 真值写回 key.c/key.h 即红。"""
+    with open(_DLL, "rb") as f:
+        data = f.read()
+    seed = keylib._hex_to_32(keylib.MASK_SEED_HEX)
+    assert data.count(seed) == 0                       # 真值字节 0 命中
+    assert data.count(seed.hex().encode("ascii")) == 0  # 真值 hex ASCII 0 命中
+    # 包裹态在件内但只以字节数组形态：hex 字符串 0 命中
+    stored_hex = b"3fbedf84170b37c06680f4b77c98b79cc5bd7d58059119b562e79d956a6b0736"
+    assert data.count(stored_hex) == 0
+    # 契约有效性：Python 侧镜像 mask 与件内包裹态自洽（unwrap 等价可逆）
+    k1 = hashlib.sha256(
+        bytes.fromhex("9e3c41d7a8f25b60c1e94a73d68f0b52")
+        + bytes.fromhex("47a1c85e03d69bf27c5a41e9830b7d64fa2519ce6b803d47")).digest()
+    assert bytes(s ^ k for s, k in zip(seed, k1)) == bytes.fromhex(stored_hex.decode())
+    assert data.count(bytes.fromhex(stored_hex.decode())) == 1   # 字节形态恰 1
+
+
+def test_exports_minimal():
+    """★2026-10 防逆向强化★：导出面 = {pk_x1, pk_x2, pk_x3}（语义名已移除）——
+    新名齐备由 KeyLib 构造实证（缺任一即 AttributeError）；旧语义名残留在此
+    0 命中拦截（无意义化是单向契约，PE 全表解析过重）。"""
+    lib = KeyLib(_DLL)
+    assert len(lib.key_id()) == 32
+    raw = ctypes.CDLL(_DLL)     # 独立逐名探测：残留旧导出名即红
+    for old in ("pkapp_encrypt", "pkapp_decrypt", "pkapp_key_id"):
+        assert not hasattr(raw, old)
 
 
 def test_generic_key_id_matches_python_mirror(lib):

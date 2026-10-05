@@ -65,30 +65,33 @@ def _fail(stage: str, exc: Exception, cfg) -> None:
 
 
 class _KeyLib:
-    """key-holder 件运行期 ctypes 封装——仅 decrypt + key_id（encrypt 不进运行时面）。"""
+    """key-holder 件运行期 ctypes 封装——仅 decrypt + key_id（encrypt 不进运行时面）。
+
+    导出名无意义化（2026-10）：x2=decrypt / x3=key_id（语义对照见
+    pkapp.packager.keylib.KeyLib；件内导出无自述标签）。"""
 
     def __init__(self, path: str):
         self._lib = CDLL(path)     # 缺失 / 非 PE / 依赖缺失 → OSError → keylib_load
         lib = self._lib
-        lib.pkapp_decrypt.argtypes = [c_char_p, c_char_p, c_size_t,
-                                      c_char_p, c_size_t, POINTER(c_size_t)]
-        lib.pkapp_decrypt.restype = c_int
-        lib.pkapp_key_id.argtypes = []
-        lib.pkapp_key_id.restype = c_char_p
+        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_size_t,
+                              c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.pk_x2.restype = c_int
+        lib.pk_x3.argtypes = []
+        lib.pk_x3.restype = c_char_p
 
     def decrypt(self, module_id: str, blob: bytes) -> bytes:
         if len(blob) < BLOB_OVERHEAD:
             raise ValueError(f"blob 过短（{len(blob)}B）")
         out = create_string_buffer(len(blob) - BLOB_OVERHEAD)
         n = c_size_t(0)
-        rc = self._lib.pkapp_decrypt(module_id.encode("utf-8"), blob, len(blob),
-                                     out, len(blob) - BLOB_OVERHEAD, byref(n))
+        rc = self._lib.pk_x2(module_id.encode("utf-8"), blob, len(blob),
+                             out, len(blob) - BLOB_OVERHEAD, byref(n))
         if rc != 0:
-            raise ValueError(f"pkapp_decrypt 失败({_ERRORS.get(rc, rc)}): {module_id}")
+            raise ValueError(f"pk_x2 失败({_ERRORS.get(rc, rc)}): {module_id}")
         return out.raw[:n.value]
 
     def key_id(self) -> str:
-        return self._lib.pkapp_key_id().decode("ascii")
+        return self._lib.pk_x3().decode("ascii")
 
 
 def _dll_path(cfg) -> str:

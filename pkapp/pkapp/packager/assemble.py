@@ -578,7 +578,7 @@ def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
     """代码加密主步骤（CODE_PROTECTION_DESIGN §6.1）——app/ 树 pyc → 加密 blob。
 
     流程：ensure_code_key（Q1 自动 keygen）→ 逐模块 剥 16 字节 pyc 头 →
-    pkapp_encrypt（module_id 作确定性 nonce 派生 + AAD）→ 落 <sha256(mid)>.enc →
+    件加密导出 pk_x1（module_id 作确定性 nonce 派生 + AAD）→ 落 <sha256(mid)>.enc →
     解密回读验证（GCM 打开 + marshal 成功）→ 才删该模块明文 .py/.pyc（顺序硬约束：
     明文不允许越过"已验证密文"这道闸）→ 全量完成后落加密清单 index.enc + 删明文闸。
     非 .py 资源明文保留（Q2）。返回 code_key_id（manifest 写入，§7.3 配对校验）。
@@ -603,7 +603,7 @@ def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
     # pyc 定位须用运行时解释器的 tag（_zip_lib 同款）——打包机解释器的
     # cache_from_source 可能产出不同 magic tag 名
     pyc_tag = "cpython-" + "".join(c for c in python_dll if c.isdigit())
-    # 加密/回验统一用 K 补丁后的 dll 副本：pkapp_encrypt 恒走参数 K，pkapp_decrypt
+    # 加密/回验统一用 K 补丁后的 dll 副本：pk_x1 恒走参数 K，pk_x2
     # 恒走内嵌 K——通用件的锚点 K 解不开项目密文；补丁形态与运行期逐位一致，
     # 回验才等价于运行期打开
     patch_dir = tempfile.mkdtemp(prefix="pkapp-keylib-")
