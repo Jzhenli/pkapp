@@ -127,6 +127,39 @@ def ensure_code_key(project_dir: str) -> tuple[bytes, bool]:
     return key, True
 
 
+def obf_key_path(project_dir: str) -> str:
+    return os.path.join(project_dir, ".pkapp", "obf.key")
+
+
+def ensure_obf_key(project_dir: str) -> bytes:
+    """读取/生成混淆密钥（★§13.3③ S5★ 字符串加密层；与 code.key 平行互不依赖）。
+
+    返回 32 字节 K；256-bit 随机，以 64 字符 hex 文本存 .pkapp/obf.key（幂等：
+    已有即读；损坏拒绝）。K 是构建机文件不进包——运行期 stub 内嵌的是其 XOR
+    分持包裹态（wrapped ^ mask 双常量，key32 字面量不出现）。.gitignore 规则
+    写整目录 .pkapp/（_ensure_gitignore），obf.key 天然覆盖。
+    """
+    path = obf_key_path(project_dir)
+    if os.path.isfile(path):
+        with open(path, encoding="ascii") as f:
+            text = f.read().strip()
+        if len(text) != 64:
+            raise KeyLibError(
+                f"{path} 不是 64 字符 hex（obf.key 损坏，恢复备份或删除重生成）")
+        try:
+            return bytes.fromhex(text)
+        except ValueError as e:
+            raise KeyLibError(f"{path} 不是合法 hex（obf.key 损坏）") from e
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    key = secrets.token_bytes(32)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="ascii") as f:
+        f.write(key.hex())
+    os.replace(tmp, path)
+    _ensure_gitignore(project_dir)
+    return key
+
+
 def read_code_key(project_dir: str) -> bytes:
     """只读 K（package 期专用：spk 已加密而 K 缺失 = 不可交付——此处报错而非
     keygen，新 K 与既有密文必不配对，静默生成只会掩盖密钥丢失）。"""

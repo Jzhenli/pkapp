@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import importlib.metadata
+import io
 import marshal
 import os
 import py_compile
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import types
 import zipfile
 
@@ -27,7 +29,7 @@ from . import manifest as mf
 from . import pe, runtime, sign, spk
 from .keylib import (KeyLib, KeyLibError, INDEX_FILE_NAME, INDEX_MODULE_ID,
                      blob_name, build_index_payload, ensure_code_key,
-                     locate_dll, module_id_for, patch_dll)
+                     ensure_obf_key, locate_dll, module_id_for, patch_dll)
 from .runtime import RuntimeResolveError, RuntimeSnapshot
 
 FORMAT_VERSION = "1"
@@ -311,12 +313,25 @@ def _android_pip_tags(spec: AppSpec) -> list[str]:
 
 def _compile_checked_hash(root: str, python_exe: str | None = None,
                           python_dll: str | None = None, *,
-                          unchecked: bool = False) -> None:
+                          unchecked: bool = False,
+                          obfuscate: bool = False,
+                          obf_key: bytes | None = None) -> dict:
     """B.u：hash 失效模式（源 hash 进 pyc 头，不烧 mtime → 树 hash 稳定）。
 
     unchecked=True（stdlib zip 树——pyc 进 zip 后源码缺席）：UNCHECKED_HASH 头，
     PEP 552 语义即"无源可信"；CHECKED_HASH 的契约是校验源，无源导入只是
     zipimport 对缺源的宽容行为，不作为源码式无源分发的依据。
+
+    obfuscate=True（★§13 混淆叠加层★，仅 app/）：逐模块源码经 obfuscate.transform
+    （符号改名 + docstring 剥离）后编译——source_hash 用原始源文件字节，磁盘 .py
+    不改写（staging app/ 恒保留源码，importlib checked-hash 校验对磁盘源重算哈希
+    ——自洽），traceback 行号对应原始源码行。unchecked 与 obfuscate 互斥
+    （stdlib 树不参与混淆）。
+
+    obf_key（★§13.3③ S7★）：32 字节混淆密钥——obfuscate 且 obf_key 同时给出才
+    追加字符串加密 pass（keystream 的 module_id = 包内相对路径，与 co_filename
+    同值）；obfuscate 无 obf_key = 仅改名 + 剥离。返回
+    {"renamed": R, "stripped": S, "strings": K} 混淆统计。
 
     dfile=相对路径：pyc 的 co_filename 不携带临时 staging 绝对路径——
     既保证 G1 字节级可复现（staging 路径每次不同），运行期 traceback 也显示包内相对路径。
@@ -327,11 +342,17 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
        marshal ref-memo 不确定性（实测：同进程两次 build pyc 字节漂移，G1 随机翻车）。
     mock 快照的 python.exe 是占位文本 → CreateProcess OSError → 回退打包机解释器。
     """
+    if unchecked and obfuscate:
+        raise BuildError("stdlib 树不参与混淆")
     child_mode = "unchecked" if unchecked else "checked"
+    obf_flag = "obf" if obfuscate else "plain"
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
     if python_exe and python_dll and os.path.isfile(python_exe):
         try:
             r = subprocess.run(
-                [python_exe, "-c", _COMPILE_CHILD, root, python_dll, child_mode],
+                [python_exe, "-c", _COMPILE_CHILD, root, python_dll, child_mode,
+                 obf_flag, pkg_dir]
+                + ([obf_key.hex()] if obfuscate and obf_key else []),
                 capture_output=True, text=True, timeout=600,
                 env={k: v for k, v in os.environ.items()
                      if not k.startswith("PYTHON")} |
@@ -343,24 +364,55 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
                 raise BuildError(f"快照解释器版本与 {python_dll} 不符，快照损坏:\n{r.stderr[-2000:]}")
             if r.returncode != 0 or "PYC-OK" not in r.stdout:
                 raise BuildError(f"快照解释器 pyc 编译失败:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
-            return
+            return _parse_pyc_stats(r.stdout)
     # 回退路径：打包机解释器进程内编译（pyc 版本标签可能与运行时不一致——仅 mock/测试可接受）
-    from importlib.util import cache_from_source
+    from importlib.util import cache_from_source, source_hash
+    from importlib._bootstrap_external import _code_to_hash_pyc
     from ..util import walk_files
+    from .obfuscate import compile_obfuscated
 
     mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if unchecked
             else py_compile.PycInvalidationMode.CHECKED_HASH)
+    renamed = stripped = strings = 0
     for rel in walk_files(root):
         if not rel.endswith(".py"):
             continue
         src = os.path.join(root, rel.replace("/", os.sep))
         pyc = cache_from_source(src)
         os.makedirs(os.path.dirname(pyc), exist_ok=True)
-        py_compile.compile(src, cfile=pyc, dfile=rel, doraise=True, quiet=2,
-                           invalidation_mode=mode)
+        if obfuscate:
+            with open(src, "rb") as f:
+                raw = f.read()
+            # ★OB-2★ 解码与 py_compile 同语义（BOM / coding 声明均消化），
+            # 硬 utf-8 会把带 BOM 或声明非 utf-8 编码的源码当乱码炸掉
+            enc = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
+            code, st = compile_obfuscated(raw.decode(enc), rel,
+                                          string_key=obf_key, module_id=rel)
+            with open(pyc, "wb") as f:
+                f.write(_code_to_hash_pyc(code, source_hash(raw), checked=True))
+            renamed += st["renamed"]
+            stripped += st["stripped"]
+            strings += st.get("strings", 0)
+        else:
+            py_compile.compile(src, cfile=pyc, dfile=rel, doraise=True, quiet=2,
+                               invalidation_mode=mode)
+    return {"renamed": renamed, "stripped": stripped, "strings": strings}
 
 
-# 快照解释器子进程内执行：版本哨兵 + 整树 hash 模式编译（单一进程 → 确定性）
+def _parse_pyc_stats(stdout: str) -> dict:
+    """解析子进程 PYC-OK 行尾的混淆统计（renamed=R stripped=S[ strings=K]）。"""
+    m = re.search(r"renamed=(\d+) stripped=(\d+)(?: strings=(\d+))?", stdout)
+    if not m:
+        return {"renamed": 0, "stripped": 0, "strings": 0}
+    return {"renamed": int(m.group(1)), "stripped": int(m.group(2)),
+            "strings": int(m.group(3) or 0)}
+
+
+# 快照解释器子进程内执行：版本哨兵 + 整树 hash 模式编译（单一进程 → 确定性）。
+# argv = [-c, root, python_dll, child_mode, obf_flag, pkg_dir[, obf_key_hex]]；
+# obf 分支逐模块源码混淆编译（_code_to_hash_pyc 产物与 py_compile.compile
+# (CHECKED_HASH) 逐字节相等，已实测），obf_key_hex 在位时透传字符串加密 pass
+# （keystream 的 module_id = rel 包内相对路径），普通分支原 py_compile 逻辑不变。
 _COMPILE_CHILD = """\
 import os, sys
 expected = sys.argv[2]                     # 形如 python312.dll
@@ -368,9 +420,20 @@ digits = "".join(c for c in expected if c.isdigit())
 if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     print("PYC-VERSION-MISMATCH", sys.version)
     sys.exit(2)
-import importlib.util, py_compile
-mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if sys.argv[3] == "unchecked"
-        else py_compile.PycInvalidationMode.CHECKED_HASH)
+import importlib.util
+R = S = K = 0
+key = None                                 # 混淆密钥（argv[6]，缺省 = 仅改名+剥离）
+obf = sys.argv[4] == "obf"
+if obf:
+    sys.path.insert(0, sys.argv[5])        # packager 包目录 → import obfuscate
+    import obfuscate
+    import importlib._bootstrap_external as _be
+    if len(sys.argv) > 6:
+        key = bytes.fromhex(sys.argv[6])
+else:
+    import py_compile
+    mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if sys.argv[3] == "unchecked"
+            else py_compile.PycInvalidationMode.CHECKED_HASH)
 root = sys.argv[1]
 n = 0
 for dirpath, dirnames, filenames in os.walk(root):
@@ -381,10 +444,27 @@ for dirpath, dirnames, filenames in os.walk(root):
         rel = os.path.relpath(p, root).replace(os.sep, "/")
         pyc = importlib.util.cache_from_source(p)
         os.makedirs(os.path.dirname(pyc), exist_ok=True)
-        py_compile.compile(p, cfile=pyc, dfile=rel, doraise=True, quiet=2,
-                           invalidation_mode=mode)
+        if obf:
+            with open(p, "rb") as f:
+                raw = f.read()
+            import io as _io, tokenize as _tk
+            # ★OB-2★ 解码与 py_compile 同语义（BOM / coding 声明均消化）——
+            # 与回退路径同款，硬 utf-8 会把非 utf-8 源码当乱码炸掉
+            enc = _tk.detect_encoding(_io.BytesIO(raw).readline)[0]
+            code, _st = obfuscate.compile_obfuscated(raw.decode(enc), rel,
+                                                     string_key=key, module_id=rel)
+            with open(pyc, "wb") as f:
+                f.write(_be._code_to_hash_pyc(
+                    code, importlib.util.source_hash(raw), checked=True))
+            R += _st["renamed"]
+            S += _st["stripped"]
+            K += _st.get("strings", 0)
+        else:
+            py_compile.compile(p, cfile=pyc, dfile=rel, doraise=True, quiet=2,
+                               invalidation_mode=mode)
         n += 1
-print("PYC-OK", "%d.%d.%d" % sys.version_info[:3], n)
+print("PYC-OK", "%d.%d.%d" % sys.version_info[:3], n,
+      "renamed=%d" % R, "stripped=%d" % S, "strings=%d" % K)
 """
 
 
@@ -462,7 +542,16 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         # 7) app/ checked-hash pyc（B.u）——仅 app/（★v0.7★ site-packages 恒只带 .py，
         #    目录树首启自动建 __pycache__ 缓存，零副作用；app/ 恒保留源码，用户可内省）
         app_stage = os.path.join(stage, "app")
-        _compile_checked_hash(app_stage, _snapshot_exe, snapshot.python_dll)
+        # ★§13.3③ S7★ 混淆开启 → 先取混淆密钥（.pkapp/obf.key，与 code.key 平行互不依赖）
+        obf_key = ensure_obf_key(project_dir) if spec.code_obfuscation else None
+        obf_stats = _compile_checked_hash(app_stage, _snapshot_exe,
+                                          snapshot.python_dll,
+                                          obfuscate=spec.code_obfuscation,
+                                          obf_key=obf_key)
+        if obf_stats["renamed"] + obf_stats["stripped"] + obf_stats["strings"] > 0:
+            print(f"[build] app/ 混淆：改名 {obf_stats['renamed']} 符号/"
+                  f"剥离 {obf_stats['stripped']} docstring/"
+                  f"加密 {obf_stats['strings']} 字符串")
         # 7b) 代码加密（CODE_PROTECTION_DESIGN §6.1，[app] code_encryption=true 才启用；
         #     缺省关闭 → 本步骤整体跳过，G6 零回归）
         code_key_id = ""
@@ -700,7 +789,16 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
             pyc_exe = os.path.join(win.dir, "python.exe")
         except RuntimeResolveError:
             pass
-        _compile_checked_hash(os.path.join(stage, "app"), pyc_exe, snapshot.python_dll)
+        # ★§13.3③ S7★ 混淆开启 → 先取混淆密钥（.pkapp/obf.key，与 code.key 平行互不依赖）
+        obf_key = ensure_obf_key(project_dir) if spec.code_obfuscation else None
+        obf_stats = _compile_checked_hash(os.path.join(stage, "app"), pyc_exe,
+                                          snapshot.python_dll,
+                                          obfuscate=spec.code_obfuscation,
+                                          obf_key=obf_key)
+        if obf_stats["renamed"] + obf_stats["stripped"] + obf_stats["strings"] > 0:
+            print(f"[build] app/ 混淆：改名 {obf_stats['renamed']} 符号/"
+                  f"剥离 {obf_stats['stripped']} docstring/"
+                  f"加密 {obf_stats['strings']} 字符串")
 
         # 3b) 代码加密（CODE_PROTECTION_DESIGN §6.1，android 与 windows 同链）。
         #     加密器 = 构建机本机 keylib 件（_encrypt_app_tree 恒用构建机件，密文

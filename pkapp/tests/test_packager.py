@@ -1,5 +1,6 @@
 """packager 全管线 + golden 断言（G1–G5、G7；G8/G11 属 M2/真快照项）。"""
 import os
+import types
 import zipfile
 
 import pytest
@@ -329,3 +330,277 @@ def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
     pub = sign.public_key_hex(os.path.join(project, ".pkapp", "sign.key"))
     got, _ = mf.verify_spk(out, pub)
     assert got["code_key_id"] == kid
+
+
+# ---------------------------------------------------------------- 构建期混淆层（§13 S3/S4）
+def _enable_code_obfuscation(project):
+    toml = os.path.join(project, "pkapp.toml")
+    with open(toml, encoding="utf-8") as f:
+        text = f.read()
+    assert "[app]" in text
+    with open(toml, "w", encoding="utf-8") as f:
+        f.write(text.replace("[app]\n", "[app]\ncode_obfuscation = true\n", 1))
+
+
+def _collect_local_names(code):
+    """递归收集 code 树全部局部名（varnames/cellvars/freevars；co_names 是全局/
+    属性名——模板 main.py 的 .data_dir 属性访问也在其中，故不可混入）。"""
+    out = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        out.update(c.co_varnames)
+        out.update(c.co_cellvars)
+        out.update(c.co_freevars)
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                stack.append(k)
+    return out
+
+
+def test_build_code_obfuscated(project, wheels_dir, tmp_path):   # §13 + G5 混淆态
+    import marshal
+
+    _enable_code_obfuscation(project)
+    out1, out2 = str(tmp_path / "o1.spk"), str(tmp_path / "o2.spk")
+    fields = _build(project, wheels_dir, out1)
+    with zipfile.ZipFile(out1) as zf:
+        names = zf.namelist()
+        pycs = {n: zf.read(n) for n in names
+                if n.startswith("app/") and n.endswith(".pyc")}
+    assert pycs, "app/ 编译应产出 pyc"
+    renamed_any = False
+    for n, raw in pycs.items():
+        code = marshal.loads(raw[16:])             # 剥 16 字节 pyc 头
+        assert code.co_filename.endswith(".py")
+        locals_ = _collect_local_names(code)
+        assert "data_dir" not in locals_           # 模板 app() 的局部变量已改名
+        renamed_any |= any(x.startswith("_o") for x in locals_)
+    assert renamed_any, "pyc 内应出现 _o* 改名符号"
+    # 磁盘源码恒不改写（app/ 恒保留源码 + importlib checked-hash 对磁盘源自洽）
+    assert "app/main.py" in names
+    with open(os.path.join(project, "app", "main.py"), encoding="utf-8") as f:
+        assert "data_dir" in f.read()
+    # G5：混淆构建双跑 pyc 字节级一致
+    _build(project, wheels_dir, out2)
+    with zipfile.ZipFile(out2) as zf2:
+        for n, raw in pycs.items():
+            assert zf2.read(n) == raw, f"G5: {n} 两跑不一致"
+
+
+def test_build_code_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
+    """★混淆+加密叠加★（§13）：blob 解出的 code 同样无原局部名且含 _o*。"""
+    import marshal
+
+    from pkapp.packager import keylib
+
+    dll = keylib.locate_dll("windows")
+    assert dll, "keylib/build/pkapp_key.dll 未编译（先跑 keylib/build.bat）"
+    _enable_code_obfuscation(project)
+    _enable_code_encryption(project)
+    out = str(tmp_path / "oe.spk")
+    fields = _build(project, wheels_dir, out)
+    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
+        key = bytes.fromhex(f.read().strip())
+    assert fields["code_key_id"] == keylib.key_id_hex(key)
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    # 删明文闸：混淆不改变加密链的删明文契约
+    assert not any(n.endswith((".py", ".pyc")) or "__pycache__" in n
+                   for n in names if n.startswith("app/"))
+    assert "app/index.enc" in names
+    patched = str(tmp_path / "pkapp_key.patched.dll")
+    keylib.patch_dll(dll, patched, key)
+    kl = keylib.KeyLib(patched)
+    with open(os.path.join(stage, "app", keylib.blob_name("app.main")), "rb") as f:
+        main_blob = f.read()
+    code = marshal.loads(kl.decrypt("app.main", main_blob))
+    assert isinstance(code, types.CodeType)
+    assert code.co_filename == "main.py"
+    locals_ = _collect_local_names(code)
+    assert "data_dir" not in locals_               # 混淆在加密之前已生效
+    assert any(x.startswith("_o") for x in locals_)
+
+
+# ---------------------------------------------------------------- 字符串加密构建链（§13.3③ S7）
+_TEST_MAIN = '''\
+"""entry stub."""
+import json
+
+import applocal
+
+SECRET_TOKEN = "pkapp-secret-value-0123456789"
+
+
+def deco(s):
+    def wrap(fn):
+        fn.route = s
+        return fn
+    return wrap
+
+
+@deco("/api/v1/very-long-route-path")
+async def helper(x="/default-long-value-xyz"):
+    return "helper-return-long-plain-42"
+
+
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    if scope["path"] == "/api/hello":
+        hit = helper.__name__ == "not-the-helper-name"
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body",
+                    "body": json.dumps({"token": SECRET_TOKEN[:5],
+                                        "hit": hit}).encode()})
+        return
+    await send({"type": "http.response.start", "status": 404,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": b'{"error": "not found"}'})
+'''
+
+
+def _const_strs(code):
+    """递归收集 code 树全部 str 常量（含子 code 与容器——函数默认参数以元组
+    形式存于父作用域 co_consts，不展开容器会漏判豁免串）。"""
+    out = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        items = list(c.co_consts)
+        while items:
+            v = items.pop()
+            if isinstance(v, types.CodeType):
+                stack.append(v)
+            elif isinstance(v, (tuple, frozenset, list)):
+                items.extend(v)
+            elif isinstance(v, str):
+                out.add(v)
+    return out
+
+
+def _has_stub(code):
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        if c.co_name == "_pkobf_d":
+            return True
+        stack.extend(v for v in c.co_consts if isinstance(v, types.CodeType))
+    return False
+
+
+def _const_bytes(code):
+    """递归收集 code 树全部 bytes 常量（含子 code 与容器——3.12 编译器把模块级
+    `_TBL = [b'..', ...]` 常量列表折叠成元组常量，不展开容器会漏掉全部密文）。
+    bytes 不进 intern 表，marshal 写出不受进程全局态漂移影响，是双跑密文比对的
+    稳定载体。"""
+    out = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        items = list(c.co_consts)
+        while items:
+            v = items.pop()
+            if isinstance(v, types.CodeType):
+                stack.append(v)
+            elif isinstance(v, (tuple, frozenset, list)):
+                items.extend(v)
+            elif isinstance(v, bytes):
+                out.add(v)
+    return out
+
+
+def test_build_string_obfuscated(project, wheels_dir, tmp_path):
+    """★§13.3③ S7★ 字符串加密层构建链：直值位 ≥16 长串进 _TBL 密文（原串不进
+    co_consts），豁免串（装饰器参数/默认参数/短串）原样；G5 双跑 build 密文逐字节
+    一致。
+
+    ★G5 断法（设计预埋的稳妥断法）★：硬闸门是"同 key 同源 → 密文逐字节一致"，
+    载体取 pyc 的 bytes 常量（bytes 不受 CPython intern/memo 全局态漂移影响）；
+    整 pyc 字节级一致由生产子进程每跑新进程保证（且由无混淆的 G1 全 spk 比对
+    覆盖）——进程内 fallback 连紧邻双跑也会因 rename 标识符进入全局 intern 表而
+    漂移（实测），故不断言整 pyc。另做闭合环：从 obf.key 本地按 keystream 规格推
+    算三条已知明文的期望密文，逐条在构建产物中命中。"""
+    import marshal
+
+    from pkapp.packager.obfuscate import keystream, xor_bytes
+
+    with open(os.path.join(project, "app", "main.py"), "w", encoding="utf-8") as f:
+        f.write(_TEST_MAIN)
+    _enable_code_obfuscation(project)
+    out1, out2 = str(tmp_path / "s1.spk"), str(tmp_path / "s2.spk")
+    _build(project, wheels_dir, out1)
+    _build(project, wheels_dir, out2)
+    with zipfile.ZipFile(out1) as zf, zipfile.ZipFile(out2) as zf2:
+        names = zf.namelist()
+        pycs = {n: zf.read(n) for n in names
+                if n.startswith("app/") and n.endswith(".pyc")}
+        main_pyc = [n for n in pycs if "main" in n]
+        assert len(main_pyc) == 1
+        assert "app/main.py" in names              # 磁盘源码恒保留
+        code = marshal.loads(pycs[main_pyc[0]][16:])    # 剥 16 字节 pyc 头
+        code2 = marshal.loads(zf2.read(main_pyc[0])[16:])
+        # G5①：双跑密文表（bytes 常量多重集）逐字节一致
+        assert _const_bytes(code) == _const_bytes(code2)
+    with open(os.path.join(project, "app", "main.py"), encoding="utf-8") as f:
+        assert "pkapp-secret-value-0123456789" in f.read()
+    strs = _const_strs(code)
+    assert "pkapp-secret-value-0123456789" not in strs   # Assign 直值位已加密
+    assert "helper-return-long-plain-42" not in strs     # Return 直值位已加密
+    assert "not-the-helper-name" not in strs             # Compare 比较元已加密
+    assert "/api/v1/very-long-route-path" in strs        # 装饰器参数豁免原样
+    assert "/default-long-value-xyz" in strs             # 默认参数豁免原样
+    assert "/api/hello" in strs                          # 短串（<16）原样
+    assert _has_stub(code)                               # 惰性解密 stub 已注入
+    assert any(x.startswith("_o") for x in _collect_local_names(code))
+    # G5②闭合环：obf.key + keystream(key32, module_id=co_filename, len) 规格推算
+    # 期望密文，逐条命中构建产物（keystream 独立性与 G5 双端口径同时验证）
+    obf_key = bytes.fromhex(open(os.path.join(project, ".pkapp", "obf.key"),
+                                 encoding="utf-8").read())
+    ciphers = _const_bytes(code)
+    for plain in ("pkapp-secret-value-0123456789", "helper-return-long-plain-42",
+                  "not-the-helper-name"):
+        raw = plain.encode("utf-8")
+        assert xor_bytes(raw, keystream(obf_key, code.co_filename, len(raw))) in ciphers
+
+
+def test_build_string_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
+    """★混淆 + 字符串加密 + 代码加密三重叠加★：blob 解出的 code 同样无原长串、
+    豁免串在位、stub 在位、局部名 _o*，删明文闸不回归。"""
+    import marshal
+
+    from pkapp.packager import keylib
+
+    dll = keylib.locate_dll("windows")
+    assert dll, "keylib/build/pkapp_key.dll 未编译（先跑 keylib/build.bat）"
+    with open(os.path.join(project, "app", "main.py"), "w", encoding="utf-8") as f:
+        f.write(_TEST_MAIN)
+    _enable_code_obfuscation(project)
+    _enable_code_encryption(project)
+    out = str(tmp_path / "soe.spk")
+    _build(project, wheels_dir, out)
+    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
+        key = bytes.fromhex(f.read().strip())
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    # 删明文闸：混淆/字符串加密不改变加密链的删明文契约
+    assert not any(n.endswith((".py", ".pyc")) or "__pycache__" in n
+                   for n in names if n.startswith("app/"))
+    assert "app/index.enc" in names
+    patched = str(tmp_path / "pkapp_key.patched.dll")
+    keylib.patch_dll(dll, patched, key)
+    kl = keylib.KeyLib(patched)
+    with open(os.path.join(stage, "app", keylib.blob_name("app.main")), "rb") as f:
+        main_blob = f.read()
+    code = marshal.loads(kl.decrypt("app.main", main_blob))
+    assert code.co_filename == "main.py"
+    strs = _const_strs(code)
+    assert "pkapp-secret-value-0123456789" not in strs   # 字符串加密在加密之前已生效
+    assert "/api/v1/very-long-route-path" in strs        # 路由路径合同豁免
+    assert _has_stub(code)
+    assert any(x.startswith("_o") for x in _collect_local_names(code))

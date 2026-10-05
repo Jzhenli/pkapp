@@ -179,6 +179,24 @@ def test_ensure_code_key_rejects_corrupt(tmp_path):
         keylib.ensure_code_key(str(tmp_path))
 
 
+def test_ensure_obf_key(tmp_path):
+    """★§13.3③ S5★ 混淆密钥：32 字节、幂等（已有即读）、.pkapp/ gitignore 覆盖。"""
+    key = keylib.ensure_obf_key(str(tmp_path))
+    assert len(key) == 32
+    assert (tmp_path / ".pkapp" / "obf.key").is_file()
+    assert keylib.ensure_obf_key(str(tmp_path)) == key          # 幂等
+    gi = tmp_path / ".gitignore"
+    assert gi.is_file() and ".pkapp/" in gi.read_text(encoding="utf-8")
+
+
+def test_ensure_obf_key_rejects_corrupt(tmp_path):
+    kp = tmp_path / ".pkapp" / "obf.key"
+    kp.parent.mkdir(parents=True)
+    kp.write_text("zz", encoding="ascii")
+    with pytest.raises(KeyLibError):
+        keylib.ensure_obf_key(str(tmp_path))
+
+
 # ---------------------------------------------------------------- 阶段2a：构建链集成
 def _compile_stage_app(stage_app):
     """app/ 树编译 checked-hash pyc（tag 跟随运行解释器，与 _RUNTIME_DLL 派生
@@ -286,6 +304,20 @@ def test_appspec_code_encryption_flag(tmp_path):
     (root / "pkapp.toml").write_text(
         base.replace('[app]\n', '[app]\ncode_encryption = true\n'), encoding="utf-8")
     assert load(str(root / "pkapp.toml")).code_encryption is True
+
+
+def test_appspec_code_obfuscation_flag(tmp_path):
+    """★§13 混淆叠加层★：开关在 [app] 段，缺省 false（G6 零回归）。"""
+    from pkapp.appspec import load
+
+    root = tmp_path
+    base = ('[app]\nname = "demo"\nversion = "0.1.0"\n'
+            'entry = "app.main:app"\nmin_app_version = "0.1.0"\n')
+    (root / "pkapp.toml").write_text(base, encoding="utf-8")
+    assert load(str(root / "pkapp.toml")).code_obfuscation is False
+    (root / "pkapp.toml").write_text(
+        base.replace('[app]\n', '[app]\ncode_obfuscation = true\n'), encoding="utf-8")
+    assert load(str(root / "pkapp.toml")).code_obfuscation is True
 
 
 def test_manifest_ext_key_code_key_id():

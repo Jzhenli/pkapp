@@ -369,7 +369,7 @@ import app     → finder：解 index.enc 判成员资格 → sha256(import 名)
 
 验证工具现成：`boot-timing.log` 的 `_tmark` 打点链，实现时在 finder 解密处补一个打点即可量化。
 
-## 13. 字节码/字符串混淆叠加层（★v1.4★ 新增，二期实施）
+## 13. 字节码/字符串混淆叠加层（★v1.4★ 新增，二期实施；★已实现★——构建开关 [app] code_obfuscation，缺省关闭）
 
 ### 13.1 定位：补"解密之后"的最弱漏点
 
@@ -412,6 +412,13 @@ assemble：app/ 源码 → [混淆 pass（若开启）] → AST → compile → 
 ### 13.6 实施排序与工作量
 
 **二期**——②首版全链（key.c → Windows → Android → 回归）打通后立即立项。理由：②已定稿且独立可发；混淆层设计风险最高（FastAPI 契约）需要自己的测试周期。工程量 ~400-600 行 Python + 契约测试，构建期开销毫秒级。
+
+**实现落位（★已实现★，2026-10-05）**：13.3①②③ 全部落地，统一开关 `[app] code_obfuscation`。实现形态与设计的对应：
+- 新模块 `pkapp/pkapp/packager/obfuscate.py`（纯 stdlib ast/symtable/hashlib）：symtable 驱动作用域安全改名（函数 scope 局部绑定 → `_o{n}` 首现序；参数/类体内名/global/import 绑定/dunder/模块级名**全部不改**——合同面从严）+ docstring 剥离（带装饰器函数/class/含 doctest 豁免）+ 选择性字符串加密（`len>=16` 纯 str 值位替换；装饰器参数/默认参数/注解/match case/`__all__`/f-string 从严豁免）+ stdlib-only 惰性解密 stub（`_pkobf_d`/`_TBL`，解出回写一次性缓存）；
+- 行号保留：`compile(ast_obj)` 原lineno（不落 ast.unparse 的重排行号坑）；checked-hash pyc 组装 `_code_to_hash_pyc(code, source_hash(原始源字节))` 与 py_compile 逐字节相等（实测），磁盘 .py 不改写 → importlib 校验自洽、traceback 行号即源码行（13.7 契约兑现）；
+- 确定性（G5）：改名按首现序、keystream = SHA256(obf_key‖module_id‖counter)（`.pkapp/obf.key` 与 code.key 同级管理，幂等 keygen；混淆层不依赖 K，四象限正交）；stub 内 key32 以 XOR 包裹态双常量分持，不明文内嵌；
+- 编译链：快照解释器子进程 obf 分支（`_compile_checked_hash(obfuscate=True, obf_key=...)`），embed 环境 sys.path 注入 packager 目录后 import obfuscate；进程内回退同款；PYC-OK 行带 renamed/stripped/strings 统计；
+- 变换不落盘映射表；`pkapp dev` 跑源码零参与（13.7 表）。
 
 **叠加后的对手完整成本**：逆 XOR 拿 K → 离线解密 → 再啃混淆字节码 + 需运行才能解出的字符串。对目标威胁档位为"劝退级"，工程成本远低于白盒/反调试堆叠（§5.4⑤ 取舍逻辑不变）。
 
