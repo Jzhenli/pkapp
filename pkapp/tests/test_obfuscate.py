@@ -207,6 +207,61 @@ def test_p709_inline_comprehension_target():
     assert "k" not in _locals_of(code)             # 3.12 内联：目标即外层 local，照改
 
 
+# ---------------------------------------------------------------- 认领对齐固化（M2）
+def test_genexpr_nested_claim_alignment():
+    """M2 固化：嵌套 genexpr——内外两层推导式的 symtable 块认领逐层对齐，
+    scope 栈跟随 AST 结构不串块，行为等价、目标名照改。"""
+    src = "def f(z):\n    return sum(x for x in (y for y in z))\n"
+    orig, obf, stats = _run(src, "f", [1, 2, 3])
+    assert orig == obf == 6
+    code, _ = compile_obfuscated(src, "t.py")
+    assert "x" not in _locals_of(code) and "y" not in _locals_of(code)
+
+
+def test_genexpr_sibling_claim_alignment():
+    """M2 固化：同型兄弟 genexpr ×2——第二个同型块不得误认领第一个的块
+    （异名 x/y 双双改净 = 认领逐块对齐的直接证据）。"""
+    src = ("def f(z):\n"
+           "    a = sum(x for x in z)\n"
+           "    b = sum(y for y in z)\n"
+           "    return a + b\n")
+    orig, obf, stats = _run(src, "f", [1, 2, 3])
+    assert orig == obf == 12
+    code, _ = compile_obfuscated(src, "t.py")
+    assert "x" not in _locals_of(code) and "y" not in _locals_of(code)
+
+
+def test_lambda_genexpr_claim_alignment():
+    """M2 固化：lambda + genexpr 混合——lambda 块与其内 genexpr 块两层认领，
+    参数名 s 合同不动，genexpr 目标 v（3.12 内联 = lambda 局名）照改。"""
+    src = ("def f(z):\n"
+           "    g = lambda s: sum(v for v in s)\n"
+           "    return g(z) + g(z)\n")
+    orig, obf, stats = _run(src, "f", [1, 2, 3])
+    assert orig == obf == 12
+    code, _ = compile_obfuscated(src, "t.py")
+    assert "v" not in _locals_of(code)
+    fc = [c for c in _funcs(code) if c.co_varnames[:1] == ("s",)][0]
+    assert "s" in fc.co_varnames                   # 参数名是公开合同，不动
+
+
+def test_default_arg_genexpr_claim_alignment():
+    """M2 固化：默认参位 genexpr——默认值在外层 scope 求值（def 时一次性），
+    genexpr 块认领挂到外层块（而非 def 的函数块），改名两端一致行为等价。"""
+    src = ("def make():\n"
+           "    def f(z, gen=tuple(i * 2 for i in range(3))):\n"
+           "        return list(gen) + [z]\n"
+           "    return f\n")
+    ns1 = {}
+    exec(compile(src, "t.py", "exec"), ns1)
+    assert ns1["make"]()(7) == [0, 2, 4, 7]
+    code, stats = compile_obfuscated(src, "t.py")
+    ns2 = {}
+    exec(code, ns2)
+    assert ns2["make"]()(7) == [0, 2, 4, 7]
+    assert "i" not in _locals_of(code)             # genexpr 目标照改（认领对齐）
+
+
 def test_except_as_renamed_and_implicit_del():
     src = ("def f():\n"
            "    try:\n"
@@ -574,6 +629,189 @@ def test_strings_behavior_equivalence():
     assert stats["strings"] == 3                  # 比较元 + 两个 return
     assert ns1["R"] == ns2["R"] == "yes-return-long-plain-2"
     assert ns2["check"]("other") == "no-return-long-plain-03"
+
+
+# ---------------------------------------------------------------- M1 值位递归下钻
+def test_strings_recursive_value_positions():
+    """★M1★ 递归下钻：容器元素（list/tuple/set/dict 值）、Call 实参（含
+    keyword 值与嵌套调用内层）、BinOp 拼接、Subscript 取值位——全部密文化。"""
+    src = ('L = ["list-elem-long-string-001", "list-elem-long-string-002"]\n'
+           'T = ("tuple-elem-long-string3",)\n'
+           'S = {"set-elem-long-string-004"}\n'
+           'D = {"dk-long-string-000005": "dv-long-string-00006"}\n'
+           'def log(msg, prefix=""):\n'
+           '    return prefix + msg\n'
+           'C = log("call-arg-long-string-00006", prefix="kw-value-long-str07")\n'
+           'N = log(log("nested-inner-long-str08"))\n'
+           'B = "binop-left-long-string-09" + "binop-right-long-010"\n'
+           'X = D["dk-long-string-000005"]\n'
+           'Y = D.get("dk-long-string-000005")\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 11                 # 唯一串数（key 位 3 处复用 1 条目）
+    dump = ast.dump(tree)
+    for s in ("list-elem-long-string-001", "tuple-elem-long-string3",
+              "set-elem-long-string-004", "dv-long-string-00006",
+              "call-arg-long-string-00006", "kw-value-long-str07",
+              "nested-inner-long-str08", "binop-left-long-string-09",
+              "binop-right-long-010", "dk-long-string-000005"):
+        assert s not in dump, s                   # 明文零残留（含 dict key 位）
+    ns1 = {}
+    exec(compile(src, "t.py", "exec"), ns1)
+    ns2 = {}
+    exec(compile(tree, "app/main.py", "exec"), ns2)
+    for k in ("L", "T", "S", "D", "C", "N", "B", "X", "Y"):
+        assert ns2[k] == ns1[k], k                # 行为等价（逐项同值）
+
+
+def test_strings_dict_key_and_lookup_consistency():
+    """★M1★ dict key 纳入替换：key 位与 .get/下标取值位同串同条目（counter
+    复用）→ 构建期/运行期等值域一致，查找不断裂。"""
+    src = ('TBL = {"perm-admin-users-00001": 1, "perm-audit-logs-000002": 2}\n'
+           'def check(k):\n'
+           '    return TBL.get(k, 0) + (TBL[k] if k in TBL else 0)\n'
+           'R1 = check("perm-admin-users-00001")\n'
+           'R2 = check("perm-missing-key-000003")\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 3                  # 三个唯一串（首个 key 两处复用）
+    ns1 = {}
+    exec(compile(src, "t.py", "exec"), ns1)
+    ns2 = {}
+    exec(compile(tree, "app/main.py", "exec"), ns2)
+    assert ns2["R1"] == ns1["R1"] == 2            # 命中：get + 下标双路一致
+    assert ns2["R2"] == ns1["R2"] == 0            # 未命中路径不受密文化影响
+    assert ns2["check"]("perm-audit-logs-000002") == 4   # get 2 + 下标 2，与原码一致
+
+
+def test_strings_route_perms_encrypted():
+    """★M1★ ROUTE_PERMS 型常量表（长权限串列表）已被密文化：明文零残留、
+    成员判断行为等价（调用点实参与列表元素同串复用同条目）。"""
+    perms = ["/admin/users/list/all/0001", "/audit/logs/export/x/002",
+             "/billing/invoices/download/03"]
+    src = ('ROUTE_PERMS = [\n'
+           '    "/admin/users/list/all/0001",\n'
+           '    "/audit/logs/export/x/002",\n'
+           '    "/billing/invoices/download/03",\n'
+           ']\n'
+           'def has(route):\n'
+           '    return route in ROUTE_PERMS\n'
+           'H = has("/audit/logs/export/x/002")\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 3                  # 唯一串数：实参与列表元素同串复用同条目
+    dump = ast.dump(tree)
+    for p in perms:
+        assert p not in dump                      # 密文化：明文零残留
+    ns = {}
+    exec(compile(tree, "app/main.py", "exec"), ns)
+    assert ns["ROUTE_PERMS"] == perms             # 运行期解密回原列表
+    assert ns["H"] is True
+
+
+def test_strings_forbidden_set_protection():
+    """★M1★ 禁换集：同串在豁免位（装饰器实参/默认参）与替换位（Assign/
+    Return）共存 → 替换位跳过不换（fate 一致，根除比较失败/查找断裂）。"""
+    shared = "shared-long-value-000001"
+    src = ('TAG = "shared-long-value-000001"\n'          # 替换位①：命中禁换集 → 跳过
+           'def deco(s):\n'
+           '    def w(fn):\n'
+           '        fn.tag = s\n'
+           '        return fn\n'
+           '    return w\n'
+           '@deco("shared-long-value-000001")\n'         # 豁免位①：装饰器实参
+           'def f(x="shared-long-value-000001"):\n'      # 豁免位②：默认参
+           '    return x == "shared-long-value-000001"\n'  # 替换位②：跳过
+           'R = f()\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 0                  # 唯一串全被禁换集保护
+    assert shared in ast.dump(tree)               # 替换位保持明文（fate 一致）
+    assert "_pkobf_d" not in ast.dump(tree)       # 零替换不注入 stub
+    ns = {}
+    exec(compile(tree, "app/main.py", "exec"), ns)
+    assert ns["TAG"] == shared
+    assert ns["R"] is True                        # 默认参与比较位同串同 fate
+
+
+def test_strings_counter_reuse():
+    """★M1★ counter 复用：同串两处 → 密文条目唯一（表长 = 唯一串数），两处
+    同 idx，运行期解出同值；G5 首现序确定性不受影响。"""
+    src = ('A = "reuse-same-long-string-01"\n'
+           'B = "reuse-same-long-string-01"\n'
+           'C = "other-distinct-long-str2"\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 2                  # 表长 = 唯一串数（非出现次数）
+    dump = ast.dump(tree)
+    assert "reuse-same-long-string-01" not in dump
+    calls = [n.args[0].value for n in ast.walk(tree)   # stub 取用点的 idx 分布
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_pkobf_d"]
+    assert calls.count(0) == 2 and calls.count(1) == 1   # 同串两处同 idx=0
+    ns = {}
+    exec(compile(tree, "app/main.py", "exec"), ns)
+    assert ns["A"] == ns["B"] == "reuse-same-long-string-01"
+    assert len(ns["_TBL"]) == 2                   # 密文条目唯一
+    assert ns["_TBL"][0] == "reuse-same-long-string-01"   # 首次取用即解密回写
+
+
+# ---------------------------------------------------------------- M1-FB 修复回归
+def test_strings_retained_docstring_forbidden():
+    """★M1-FB-1★ 保留 docstring（class docstring 剥离豁免）吸收进禁换集：
+    同串双位（docstring + 值位赋值）→ 值位不换、表长不含该串、
+    ``C.__doc__ is V`` 身份一致（fate 分化即 False）。"""
+    shared = "class-doc-shared-long-value"
+    src = ('V = "class-doc-shared-long-value"\n'
+           'class C:\n'
+           '    """class-doc-shared-long-value"""\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 0                  # 唯一串被禁换集保护，零条目
+    assert "_pkobf_d" not in ast.dump(tree)       # 零替换不注入 stub
+    ns = {}
+    exec(compile(tree, "app/main.py", "exec"), ns)
+    assert ns["C"].__doc__ == shared
+    assert ns["C"].__doc__ is ns["V"]             # 同串同 fate：身份一致
+
+
+def test_strings_type_params_bound_forbidden():
+    """★M1-FB-2★ PEP 695 泛型形参 bound 吸收进禁换集：同串双位
+    （bound + 值位）→ 值位不换、bound 保持明文，``__bound__ is V`` 身份一致。"""
+    shared = "type-bound-shared-long-value"
+    src = ('V = "type-bound-shared-long-value"\n'
+           'def f[T: "type-bound-shared-long-value"](x):\n'
+           '    return x\n')
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 0                  # 唯一串被禁换集保护，零条目
+    assert "_pkobf_d" not in ast.dump(tree)
+    assert shared in ast.dump(tree)               # bound 位保持明文
+    ns = {}
+    exec(compile(tree, "app/main.py", "exec"), ns)
+    assert ns["f"](3) == 3
+    assert ns["f"].__type_params__[0].__bound__ is ns["V"]   # 同串同 fate
+
+
+def test_pure_docstring_body_no_crash():
+    """★Issue 3★ 纯 docstring 函数/类：剥离后空体补 Pass → compile 不炸
+    （原实现 ValueError: empty body）、exec 行为等价（cb() 可调用、C 可实例化、
+    class docstring 保留）。"""
+    src = ('def cb():\n'
+           '    """callback-stub-only-docstring"""\n'
+           'class C:\n'
+           '    """class-with-only-docstring"""\n')
+    ns1 = {}
+    exec(compile(src, "t.py", "exec"), ns1)
+    assert ns1["cb"]() is None
+    assert isinstance(ns1["C"](), ns1["C"])
+    code, stats = compile_obfuscated(src, "app/main.py")
+    ns2 = {}
+    exec(code, ns2)
+    assert ns2["cb"]() is None                    # 剥离 docstring 后 Pass 兜底
+    assert isinstance(ns2["C"](), ns2["C"])
+    assert ns2["C"].__doc__ == "class-with-only-docstring"   # class docstring 保留
+    assert stats["stripped"] == 1                 # 仅函数 docstring 被剥离
 
 
 def test_strings_g5_deterministic():

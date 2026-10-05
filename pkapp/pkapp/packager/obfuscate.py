@@ -32,12 +32,14 @@
 - keystream：SHA256(key32 ‖ module_id ‖ counter_u32_be) 逐块（32B）拼接截断，
   counter 从 0 大端——同 (key32, module_id) → 同流（G5 确定性的唯一依据）。
 - 字符串 pass 在改名 pass 之后跑（scope 结构稳定；注入名天然不参与改名）：
-  直值位（Expr 语句 / Assign value / Return value / Compare 比较元）的 ≥16 长串
-  替换为 _pkobf_d(idx)，密文表 _TBL 与惰性解密 stub 注入模块头（docstring 与
-  __future__ import 之后）；替换点收集序 = 表序（确定）。stub 源码由本文件
-  keystream/xor_bytes 同一 Python 语义源码化生成（避免双端漂移），key32 以 XOR
-  包裹态 + mask（keystream(key32, module_id+":stubmask", 32) 自裹派生）双常量
-  分持内嵌——key32 字面量不出现，运行期 stub 先恢复 key32 再对流解密。
+  值位递归下钻——非豁免子树内所有 ≥16 纯 str Constant 全替换为 _pkobf_d(idx)
+  （容器元素 / Call 实参 / dict key 与值 / BinOp 操作数 / 比较元全覆盖，不再
+  区分直值与嵌套）；同串复用同条目（表长 = 唯一串数，首现序 = 表序 = 确定）；
+  密文表 _TBL 与惰性解密 stub 注入模块头（docstring 与 __future__ import 之后）。
+  stub 源码由本文件 keystream/xor_bytes 同一 Python 语义源码化生成（避免双端
+  漂移），key32 以 XOR 包裹态 + mask（keystream(key32, module_id+":stubmask",
+  32) 自裹派生）双常量分持内嵌——key32 字面量不出现，运行期 stub 先恢复 key32
+  再对流解密。
 - 豁免面（从严，各配测试）：装饰器参数、函数默认参数、注解（AnnAssign/arg/
   returns）、match case pattern、__all__ 赋值、JoinedStr（f-string）整体、
   bytes、短串（<16）、模块/函数/类 docstring 位置；业务源码占用 _TBL/_pkobf_d
@@ -234,16 +236,21 @@ class _Renamer(ast.NodeTransformer):
 
     # ---- docstring 剥离 ----
     def _strip_docstring(self, node) -> None:
-        """body[0] 为字符串常量 Expr → 删除（含 >>> 的 doctest 豁免）；
-        class docstring / 带装饰器函数由调用方豁免（不调用本方法）。"""
-        if not node.body:
+        """body[0] 为字符串常量 Expr → 删除；保留豁免（含 >>> 的 doctest /
+        class / 带装饰器函数）同源 _docstring_retained 判定（字符串 pass 禁换集
+        用同一函数，勿复制条件）。
+        ★Issue 3★ 纯 docstring 函数/类剥离后 body 空 → 补 ast.Pass()（空体
+        compile 直接 ValueError: empty body）；模块空体合法不补。"""
+        if not node.body or not _is_docstring_stmt(node.body[0]) \
+                or _docstring_retained(node):
             return
-        first = node.body[0]
-        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
-                and isinstance(first.value.value, str)
-                and ">>>" not in first.value.value):
-            node.body.pop(0)             # 只删节点不重排：其余语句 lineno 原样
-            self.stripped += 1
+        dropped = node.body.pop(0)   # 只删节点不重排：其余语句 lineno 原样
+        self.stripped += 1
+        if (not node.body
+                and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef))):
+            # Pass 落位在被删 docstring 原位置（copy_location 补齐行号字段）
+            node.body.append(ast.copy_location(ast.Pass(), dropped))
 
     # ---- 函数名改名 ----
     def _rename_defname(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -437,6 +444,26 @@ def _is_docstring_stmt(stmt) -> bool:
             and isinstance(stmt.value.value, str))
 
 
+def _docstring_retained(node) -> bool:
+    """docstring 保留判定（★剥离 pass 与字符串 pass 禁换集同源单一实现★，
+    两处勿复制条件）：
+    - class：一律保留（pydantic description 派生）
+    - 带 decorator 的函数：保留（FastAPI OpenAPI description）
+    - 其余（模块/裸函数）：含 >>>（doctest）→ 保留——此豁免对模块与裸函数
+      均生效（与原 _strip_docstring 行为逐位对齐，存量用例已固化）
+    保留 = 明文留在产物里 → 字符串 pass 必须把该串吸收进禁换集（同串值位
+    不换，防 ``C.__doc__ is V`` 身份分化）；未命中 → 剥离 pass 会删掉它，
+    字符串 pass 的树里根本不存在，无需吸收。"""
+    if not node.body or not _is_docstring_stmt(node.body[0]):
+        return False
+    if isinstance(node, ast.ClassDef):
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+            and node.decorator_list:
+        return True
+    return ">>>" in node.body[0].value.value
+
+
 # stub 源码模板（★源码化注入★：stub = 构建期 keystream/xor_bytes 的等价内联版，
 # 由本文件同一实现派生全部常量——避免双端漂移）。keystream 派生输入不明文内嵌：
 # key32 以 XOR 包裹态（wrapped）与其 mask（keystream(key32, module_id+":stubmask",
@@ -511,66 +538,117 @@ def _check_stub_name_conflicts(tree: ast.Module) -> None:
 class _StringCipher(ast.NodeTransformer):
     """字符串加密 pass（§13.3③ S6，在改名 pass 之后跑）。
 
-    替换面（保守，仅四类直值位）：Expr 语句值 / Assign value / Return value /
-    Compare 比较元（left 与 comparators），且 Constant(str) 且 len ≥ 16——
-    容器内/嵌套表达式内的值上下文一律不处理（从严豁免）。
-    明确不改（整子域不下降）：装饰器参数、函数默认参数与注解、AnnAssign 注解、
-    match case pattern、__all__ 赋值、JoinedStr（f-string）、docstring 位置；
-    bytes / 短串（<16）天然不命中。注入的 Call 里 Constant(idx) 是 int 不受影响。
+    替换面（★M1★ 值位递归下钻）：非豁免子树内所有"纯 str Constant 且
+    len ≥ _MIN_STR"，不再区分直值/嵌套——容器元素（list/tuple/set/dict 值）、
+    Call 实参（含 keyword 值与嵌套调用内层）、BinOp 操作数、Compare 比较元、
+    Subscript 取值位全覆盖；dict key 也纳入（key 位同为 Constant 值位，保证与
+    d[...]/.get 等值域一致，否则同串 key 位不换取值位换 → 查找断裂）。
+    禁换集（★M1★ 关键正确性约束，两遍走）：第一遍收集所有豁免子树
+    （decorator_list 整棵/defaults/kw_defaults/注解/type_params bound 与
+    default/保留 docstring（★M1-FB-1★ 剥离豁免命中，判定同源
+    _docstring_retained）/match case pattern/JoinedStr 整体/__all__）内的
+    str 常量值 → 第二遍改写时值命中禁换集的
+    跳过不换——根除"同串在豁免位与替换位 fate 不同 → 比较失败/查找断裂"。
+    区域分类两遍共用同一组 visit 方法（_collecting 开关），不存在两套遍历漂移。
+    counter 复用（★M1★）：同串首现登记 (明文→idx)，后续出现复用同条目——
+    密文条目数 = 唯一串数，运行期同串只解一次，G5 确定性照旧（按首现序）。
+    名位天然安全：keyword.arg/attr/arg/import 名是 AST str 字段非 Constant
+    节点，不触碰。docstring：被剥离的在 rename pass 已消失不参与；保留的
+    （class/带装饰器函数/含 >>> doctest，剥离豁免命中）吸收进禁换集
+    （★M1-FB-1★），head 位两遍同规豁免。豁免面从严不松；bytes/短串（<16）
+    天然不命中；注入的 Call 里 Constant(idx) 是 int 不受影响。
     """
 
     def __init__(self, key32: bytes, module_id: str):
         self._key = key32
         self._mid = module_id
-        self.table: list[bytes] = []   # 密文表（序 = 收集序 = 替换 idx 序，确定）
+        self.table: list[bytes] = []   # 密文表（序 = 首现序 = 替换 idx 序，确定）
+        self._idx_of: dict[str, int] = {}   # 明文 → 表 idx（同串复用同条目）
+        self.forbidden: set[str] = set()    # 禁换集（豁免子树内 str 值）
+        self._collecting = False            # True = 第一遍只收禁换集不改写
 
-    # ---- 直值位替换 ----
-    def _slot(self, v):
-        if (isinstance(v, ast.Constant) and isinstance(v.value, str)
-                and len(v.value) >= _MIN_STR):
-            raw = v.value.encode("utf-8")
-            idx = len(self.table)
-            self.table.append(xor_bytes(raw, keystream(self._key, self._mid,
-                                                       len(raw))))
+    # ---- 禁换集收集（★M1★ 第一遍）：豁免子树整体吸收 ----
+    def _absorb(self, subtree: ast.AST) -> None:
+        """豁免子树内所有 str 常量值计入禁换集（不做区域分类，整棵吸收）。"""
+        for nd in ast.walk(subtree):
+            if isinstance(nd, ast.Constant) and isinstance(nd.value, str):
+                self.forbidden.add(nd.value)
+
+    def _absorb_arguments(self, a: ast.arguments) -> None:
+        """函数签名豁免区吸收：defaults/kw_defaults + 全部参数注解。"""
+        for d in a.defaults + a.kw_defaults:
+            if d is not None:
+                self._absorb(d)
+        for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs,
+                    *([a.vararg] if a.vararg else []),
+                    *([a.kwarg] if a.kwarg else [])):
+            if arg.annotation is not None:
+                self._absorb(arg.annotation)
+
+    # ---- 值位替换（★M1★ 落点：递归下钻后唯二的 Constant 入口）----
+    def visit_Constant(self, node: ast.Constant):
+        v = node.value
+        if (isinstance(v, str) and len(v) >= _MIN_STR
+                and v not in self.forbidden and not self._collecting):
+            raw = v.encode("utf-8")
+            idx = self._idx_of.get(v)
+            if idx is None:                # 首现登记，后续出现复用同条目
+                idx = len(self.table)
+                self._idx_of[v] = idx
+                self.table.append(xor_bytes(
+                    raw, keystream(self._key, self._mid, len(raw))))
             return ast.copy_location(
                 ast.Call(func=ast.Name(id=_STUB_FUNC, ctx=ast.Load()),
-                         args=[ast.Constant(value=idx)], keywords=[]), v)
-        return self.visit(v)           # 非直命中 → 继续下降找嵌套直位（如 Compare）
-
-    def visit_Expr(self, node: ast.Expr) -> ast.Expr:
-        node.value = self._slot(node.value)
+                         args=[ast.Constant(value=idx)], keywords=[]), node)
         return node
 
-    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
-        if any(isinstance(t, ast.Name) and t.id == "__all__"
-               for t in node.targets):
-            return node                # __all__ 列表元素豁免（export 名是合同）
-        node.value = self._slot(node.value)
-        node.targets = [self.visit(t) for t in node.targets]
-        return node
+    # ---- 区域分类：两遍共用同一组 visit（豁免面从严不松）----
+    def _docstring_head(self, node) -> list:
+        """docstring head 两遍共用处理（★M1-FB-1★，保留判定同源
+        _docstring_retained，勿复制条件）：
+        收集遍——保留 docstring（剥离豁免命中：class/带装饰器函数/含 >>>）
+        吸收进禁换集（同串值位不换，防 ``C.__doc__ is V`` 身份分化）；被剥离
+        的 head 在 rename pass 已删，字符串 pass 的树里不存在，无需吸收。
+        改写遍——head 整体豁免不下降（返回 [head] 供 body 切分）。"""
+        if not node.body or not _is_docstring_stmt(node.body[0]):
+            return []
+        if self._collecting:
+            if _docstring_retained(node):
+                self._absorb(node.body[0])
+            return []
+        return [node.body[0]]
 
-    def visit_Return(self, node: ast.Return) -> ast.Return:
-        if node.value is not None:
-            node.value = self._slot(node.value)
-        return node
-
-    def visit_Compare(self, node: ast.Compare) -> ast.Compare:
-        node.left = self._slot(node.left)
-        node.comparators = [self._slot(c) for c in node.comparators]
-        return node
-
-    # ---- 豁免区：整体不下降或只走允许子域 ----
     def _visit_body(self, node):
         """函数/类体：body[0] docstring 位置豁免，其余语句照常下降；
-        decorator_list/bases/keywords/args/returns/type_params 全豁免。"""
-        head = [node.body[0]] if (node.body and _is_docstring_stmt(node.body[0])) \
-            else []
+        decorator_list/bases/keywords/args/returns/type_params 全豁免
+        （收集遍整体吸收计禁换集，改写遍不下降）。"""
+        if self._collecting:
+            for d in node.decorator_list:
+                self._absorb(d)
+            for b in getattr(node, "bases", []):        # ClassDef 基类表达式
+                self._absorb(b)
+            for k in getattr(node, "keywords", []):     # ClassDef metaclass=...
+                self._absorb(k.value)
+            args = getattr(node, "args", None)          # FunctionDef 签名
+            if args is not None:
+                self._absorb_arguments(args)
+            if getattr(node, "returns", None) is not None:
+                self._absorb(node.returns)
+            for tp in getattr(node, "type_params", []):  # ★M1-FB-2★ PEP 695：
+                bound = getattr(tp, "bound", None)       # bound（3.12 已有）与
+                if bound is not None:                    # default（PEP 696，3.13
+                    self._absorb(bound)                  # 属性名 default_value）
+                dflt = getattr(tp, "default_value", None)  # 一并防御吸收——注释
+                if dflt is None:                         # 既宣称"整体吸收"，对齐
+                    dflt = getattr(tp, "default", None)
+                if dflt is not None:
+                    self._absorb(dflt)
+        head = self._docstring_head(node)
         node.body = head + [self.visit(s) for s in node.body[len(head):]]
         return node
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        head = [node.body[0]] if (node.body and _is_docstring_stmt(node.body[0])) \
-            else []
+        head = self._docstring_head(node)
         node.body = head + [self.visit(s) for s in node.body[len(head):]]
         return node
 
@@ -584,38 +662,60 @@ class _StringCipher(ast.NodeTransformer):
         return self._visit_body(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
-        node.body = self.visit(node.body)   # lambda 无 docstring；defaults 豁免
+        if self._collecting:
+            self._absorb_arguments(node.args)   # lambda 默认参/注解豁免
+        node.body = self.visit(node.body)       # lambda 无 docstring
         return node
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.JoinedStr:
-        return node                    # f-string 整体及其内部豁免
+        if self._collecting:
+            self._absorb(node)                  # f-string 整体（含插值表达式）豁免
+        return node
 
     def visit_Match(self, node: ast.Match) -> ast.Match:
         node.subject = self.visit(node.subject)
         for case in node.cases:
+            if self._collecting:
+                self._absorb(case.pattern)      # pattern 豁免（编译期常量）
             if case.guard is not None:
                 case.guard = self.visit(case.guard)
-            case.body = [self.visit(s) for s in case.body]   # pattern 豁免（编译期常量）
+            case.body = [self.visit(s) for s in case.body]
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        if self._collecting and node.annotation is not None:
+            self._absorb(node.annotation)       # 注解豁免
         if node.value is not None:
-            node.value = self.visit(node.value)   # annotation 豁免；值位非直位只下降
+            node.value = self.visit(node.value)   # 值位非豁免：只下降值，不碰注解
         return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        if any(isinstance(t, ast.Name) and t.id == "__all__"
+               for t in node.targets):
+            if self._collecting:
+                self._absorb(node.value)        # __all__ 列表元素豁免（export 合同）
+            return node
+        return self.generic_visit(node)         # 值/目标递归下钻（目标无 str 常量）
 
     def visit_AugAssign(self, node: ast.AugAssign) -> ast.AugAssign:
         if isinstance(node.target, ast.Name) and node.target.id == "__all__":
-            return node                # __all__ += [...] 豁免
+            if self._collecting:
+                self._absorb(node.value)        # __all__ += [...] 豁免
+            return node
         return self.generic_visit(node)
 
 
 def _encrypt_strings(tree: ast.Module, string_key: bytes, module_id: str) -> int:
-    """字符串加密主流程：冲突检查 → 直值位替换收表 → stub 注入模块头。
-    返回加密字符串数（表长）；无命中则不注入任何内容。"""
+    """字符串加密主流程：冲突检查 → 第一遍收禁换集 → 第二遍值位替换收表
+    → stub 注入模块头。返回加密条目数（= 唯一串数，同串复用同条目）；
+    无命中则不注入任何内容。"""
     if len(string_key) != 32:
         raise ValueError("string_key 必须为 32 字节（obf.key 语义）")
     _check_stub_name_conflicts(tree)
     cipher = _StringCipher(string_key, module_id)
+    cipher._collecting = True               # ★M1★ 第一遍：只收禁换集不改写
+    cipher.visit(tree)
+    cipher._collecting = False              # ★M1★ 第二遍：值位替换（禁换集跳过）
     cipher.visit(tree)
     if cipher.table:
         ast.fix_missing_locations(tree)    # 手工构造的 Call 子树补齐位置字段
@@ -644,7 +744,8 @@ def transform(tree: ast.Module, filename: str, *,
     """AST 变换入口：返回 (变换后树, {"renamed": n, "stripped": m[, "strings": k]})。
 
     renamed = 实际改名 binding 数（逃逸豁免撤项不计）；stripped = 剥离 docstring 数；
-    strings = 加密字符串数——仅 string_key 与 module_id 同时给出才启用字符串 pass
+    strings = 加密条目数（密文表长 = 唯一串数，同串复用同条目）——仅 string_key
+    与 module_id 同时给出才启用字符串 pass
     （§13.3③ S6：改名 pass 先跑、字符串 pass 后跑；期1 调用方不传 → 行为与
     stats 形态不变）。symtable 需要源文本——用 ast.unparse 重建（结构等价 →
     作用域语义不变），原 tree 行号原样保留，symtable 仅用于作用域/候选分析。
