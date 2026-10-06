@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import hmac
 import os
 import secrets
 from ctypes import POINTER, c_char_p, c_char, c_size_t, c_int, c_ubyte
@@ -106,40 +107,125 @@ def blob_name(module_id: str) -> str:
 
 
 def code_key_path(project_dir: str) -> str:
+    """★档位1 退役★（PROTECTION_ROADMAP §3.1）：项目级 code.key 不再参与 K 供给——
+    K 恒由 K_master 现场 HKDF 派生（derive_k_app），函数仅为老项目诊断保留路径语义。"""
     return os.path.join(project_dir, ".pkapp", "code.key")
+
+
+# ---------------------------------------------------------------- 档位1：K 派生化（PROTECTION_ROADMAP §3）
+# K_master（构建机秘密）--HKDF-SHA256(salt, info=app_id)--> K_app（per-app）。
+# K_master 托管（§9 决策1）：env PKAPP_MASTER_KEY 覆盖 > 密钥文件
+# PKAPP_MASTER_KEY_FILE（默认 ~/.pkapp/master.key，600 权限位，doctor 检查）。
+MASTER_KEY_ENV = "PKAPP_MASTER_KEY"
+MASTER_KEY_FILE_ENV = "PKAPP_MASTER_KEY_FILE"
+# 默认档 salt（§3.2 ★R-2★）：固定常量 → 同 (master, app_id) 恒同 K → 密文跨构建
+# 稳定（G5 保留）。per-build 档走 appspec per_build_salt 显式 opt-in（随机 salt
+# 写 manifest code_salt，声明放弃跨构建指纹复用）。
+DEFAULT_SALT_HEX = "9f17c3e2a84b5d607e1a93c4f2b85d670aec31f94d7b2058c6e94f31a2d8b705"
+
+
+def _parse_hex_key(text: str, what: str) -> bytes:
+    t = text.strip()
+    if len(t) != 64:
+        raise KeyLibError(f"{what} 不是 64 字符 hex（密钥文件损坏，恢复备份或删除重生成）")
+    try:
+        return bytes.fromhex(t)
+    except ValueError as e:
+        raise KeyLibError(f"{what} 不是合法 hex（密钥文件损坏）") from e
+
+
+def master_key_path() -> str:
+    env = os.environ.get(MASTER_KEY_FILE_ENV)
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".pkapp", "master.key")
+
+
+def resolve_master_key(create: bool = True) -> tuple[bytes, bool]:
+    """K_master 解析（§9 决策1）：env PKAPP_MASTER_KEY（64 hex）> 密钥文件。
+
+    文件缺失且 create=True → 自动 keygen（600 权限位，~/.pkapp/ 与 sign.key 同级
+    管理哲学；doctor 检查存在性）。返回 (K_master, 新生成)。create=False 用于
+    package 期——静默生成新 master 必派生出与 spk 不配对的 K，只会掩盖 master
+    缺失（与旧 code.key 只读纪律同式）。
+    """
+    env = os.environ.get(MASTER_KEY_ENV)
+    if env:
+        return _parse_hex_key(env, f"env {MASTER_KEY_ENV}"), False
+    path = master_key_path()
+    if os.path.isfile(path):
+        with open(path, encoding="ascii") as f:
+            return _parse_hex_key(f.read(), path), False
+    if not create:
+        raise KeyLibError(
+            f"K_master 缺失（env {MASTER_KEY_ENV} 未设且 {path} 不存在）——"
+            "打包/构建机须与 build 同源 master（准入流程见 doctor）")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    key = secrets.token_bytes(32)
+    tmp = f"{path}.tmp{os.getpid()}"
+    # 0600 在 os.open 创建时即生效（umask 只收窄不放宽）——replace 原子落位后继承，
+    # 勿在此后 chmod(path)：path 尚不存在时必抛 FileNotFoundError（Windows 位语义
+    # 无 ACL 收权效果，POSIX 由本行保证 600）
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(key.hex())
+    os.replace(tmp, path)
+    return key, True
+
+
+def derive_k_app(master: bytes, app_id: str, salt: bytes | None = None) -> bytes:
+    """HKDF-SHA256 派生 per-app K（RFC 5869，L=32 单块；纯 stdlib hmac/hashlib）。
+
+    PRK = HMAC-SHA256(salt, K_master)；OKM = HMAC-SHA256(PRK, info ‖ 0x01)。
+    info = 域分离标签 b"pkapp/app\\x00" ‖ app_id（utf-8）——同 master 未来派生
+    他用途（如 per-device、备份密钥）时不与 K_app 域混用。
+    默认档 salt = DEFAULT_SALT_HEX 常量（同 master+app_id 恒同 K，G5 保留）；
+    per-build 档 salt 随机（manifest code_salt 落档）。横向隔离：每 app_id 一把 K，
+    不跨应用迁移（§1.1 防线分工）。
+    """
+    if len(master) != 32:
+        raise KeyLibError("K_master 须为 32 字节")
+    if not app_id or len(app_id.encode("utf-8")) > 512:
+        raise KeyLibError(f"app_id 非法: {app_id!r}")
+    if salt is None:
+        salt = bytes.fromhex(DEFAULT_SALT_HEX)
+    if len(salt) < 16:
+        raise KeyLibError("salt 须 ≥16 字节")
+    prk = hmac.new(salt, master, hashlib.sha256).digest()
+    info = b"pkapp/app\x00" + app_id.encode("utf-8")
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+
+def generate_kdata_c(k_app: bytes | None) -> str:
+    """kdata.c 生成器（§3.3 改动面 #2，分散+包裹形态）。
+
+    k_app=None → 通用件形态（k_stored = ANCHOR，锚点补丁退化路径前提）；
+    否则 k_stored = K_app ^ _MASK（与 key.c pkkey_unwrap 运行期展开公式逐位镜像）。
+    字节数组展开（hex 串形态 strings 捞不到）；包裹态单看不泄露 K（mask 依赖
+    key.c 内 seed 包裹链）。生成文件只进构建临时目录，不入库。
+    """
+    stored = ANCHOR if k_app is None else bytes(
+        k ^ m for k, m in zip(k_app, _MASK))
+    if len(stored) != 32:
+        raise KeyLibError("k_stored 须为 32 字节")
+    rows = ",\n    ".join(
+        ", ".join(f"0x{b:02x}" for b in stored[i:i + 8])
+        for i in range(0, 32, 8))
+    return (
+        "/* kdata.c — 由 pkapp.packager.keylib.generate_kdata_c 现场生成"
+        "（★档位1 PROTECTION_ROADMAP §3.1★）。\n"
+        " * k_stored = K 异或包裹态（mask = SHA256(seed ‖ ANCHOR_HEX ASCII)，"
+        "key.c unwrap 同式反向）；\n"
+        " * 构建临时产物，不入库不分发源形态。 */\n"
+        "#include <stdint.h>\n\n"
+        "uint8_t k_stored[32] = {\n    " + rows + "\n};\n")
 
 
 def _read_key_file(path: str) -> bytes:
     if not os.path.isfile(path):
-        raise KeyLibError(f"项目密钥缺失: {path}（先以 code_encryption=true 执行 pkapp build）")
+        raise KeyLibError(f"密钥文件缺失: {path}")
     with open(path, encoding="ascii") as f:
-        text = f.read().strip()
-    if len(text) != 64:
-        raise KeyLibError(f"{path} 不是 64 字符 hex（K 文件损坏，恢复备份或删除重生成）")
-    try:
-        return bytes.fromhex(text)
-    except ValueError as e:
-        raise KeyLibError(f"{path} 不是合法 hex（K 文件损坏）") from e
-
-
-def ensure_code_key(project_dir: str) -> tuple[bytes, bool]:
-    """读取/生成项目密钥（§4.2 Q1 决议：开关开启且缺失 → 自动 keygen）。
-
-    返回 (K, 新生成)。K 以 64 字符 hex 文本存 .pkapp/code.key（与 sign.key 同级
-    管理；模板 .gitignore 已含 .pkapp/，老项目缺则补）。丢失 = 无法按原 K 重建，
-    轮换 = 全量重加密 + 重补丁——备份提示由此处日志承担。
-    """
-    path = code_key_path(project_dir)
-    if os.path.isfile(path):
-        return _read_key_file(path), False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    key = secrets.token_bytes(32)
-    tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "w", encoding="ascii") as f:
-        f.write(key.hex())
-    os.replace(tmp, path)
-    _ensure_gitignore(project_dir)
-    return key, True
+        return _parse_hex_key(f.read(), path)
 
 
 def obf_key_path(project_dir: str) -> str:
@@ -176,8 +262,9 @@ def ensure_obf_key(project_dir: str) -> bytes:
 
 
 def read_code_key(project_dir: str) -> bytes:
-    """只读 K（package 期专用：spk 已加密而 K 缺失 = 不可交付——此处报错而非
-    keygen，新 K 与既有密文必不配对，静默生成只会掩盖密钥丢失）。"""
+    """★档位1 退役★：code.key 不再参与 K 供给。保留只读函数供老项目诊断
+    （存在则返回，缺失报错）——构建/打包链路已全部改走 resolve_master_key +
+    derive_k_app。"""
     return _read_key_file(code_key_path(project_dir))
 
 

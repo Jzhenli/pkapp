@@ -186,11 +186,10 @@ def test_package_android_encrypted_stages_keylib_so(tmp_path, monkeypatch,
     from pkapp.packager import keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 补丁路径走文件落位
-    key = hashlib.sha256(b"pkg-and").digest()
+    master = hashlib.sha256(b"pkg-and").digest()         # ★档位1★ K 现场派生（不入项目）
+    monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())
+    key = keylib.derive_k_app(master, "myapp")           # app_id 与项目名同源
     proj = _make_project(tmp_path)
-    os.makedirs(os.path.join(proj, ".pkapp"))
-    with open(os.path.join(proj, ".pkapp", "code.key"), "w", encoding="ascii") as f:
-        f.write(key.hex())
     spk_path = _write_encrypted_spk(proj, keylib.key_id_hex(key))
     with open(spk_path, "rb") as f:
         spk_bytes = f.read()
@@ -226,11 +225,10 @@ def test_package_android_plaintext_clears_stale_keylib(tmp_path, monkeypatch,
     from pkapp.packager import keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
-    key = hashlib.sha256(b"stale-k").digest()
+    master = hashlib.sha256(b"stale-k").digest()         # ★档位1★ K 现场派生
+    monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())
+    key = keylib.derive_k_app(master, "myapp")
     proj = _make_project(tmp_path)
-    os.makedirs(os.path.join(proj, ".pkapp"))
-    with open(os.path.join(proj, ".pkapp", "code.key"), "w", encoding="ascii") as f:
-        f.write(key.hex())
     tpl = _bare_template(tmp_path)
 
     # ① 明文构建：物化目录建立，无 keylib 链

@@ -188,30 +188,6 @@ def test_blob_name():
         hashlib.sha256(b"app.main").hexdigest() + ".enc"
 
 
-def test_ensure_code_key(tmp_path):
-    key, generated = keylib.ensure_code_key(str(tmp_path))
-    assert generated and len(key) == 32
-    key2, generated2 = keylib.ensure_code_key(str(tmp_path))
-    assert not generated2 and key2 == key          # 幂等：已有 K 不重生成
-    assert (tmp_path / ".pkapp" / "code.key").is_file()
-    gi = tmp_path / ".gitignore"
-    assert gi.is_file() and ".pkapp/" in gi.read_text(encoding="utf-8")
-
-
-def test_ensure_code_key_gitignore_no_duplicate(tmp_path):
-    (tmp_path / ".gitignore").write_text("build/\n.pkapp/\n", encoding="utf-8")
-    keylib.ensure_code_key(str(tmp_path))
-    assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == "build/\n.pkapp/\n"
-
-
-def test_ensure_code_key_rejects_corrupt(tmp_path):
-    kp = tmp_path / ".pkapp" / "code.key"
-    kp.parent.mkdir(parents=True)
-    kp.write_text("zz", encoding="ascii")
-    with pytest.raises(KeyLibError):
-        keylib.ensure_code_key(str(tmp_path))
-
-
 def test_ensure_obf_key(tmp_path):
     """★§13.3③ S5★ 混淆密钥：32 字节、幂等（已有即读）、.pkapp/ gitignore 覆盖。"""
     key = keylib.ensure_obf_key(str(tmp_path))
@@ -228,6 +204,144 @@ def test_ensure_obf_key_rejects_corrupt(tmp_path):
     kp.write_text("zz", encoding="ascii")
     with pytest.raises(KeyLibError):
         keylib.ensure_obf_key(str(tmp_path))
+
+
+# ------------------------------------------------- ★档位1★ K 派生化（PROTECTION_ROADMAP §3）
+_APP = "demo"     # 测试 app_id（HKDF info；与 _stage_keylib/_encrypt_app_tree 同源）
+
+
+def _set_master(monkeypatch, name: str = "stage-master") -> bytes:
+    """固定 K_master 注入 env（resolve_master_key 首选源；测试与家目录零接触）。"""
+    master = hashlib.sha256(name.encode("ascii")).digest()
+    monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())
+    return master
+
+
+def test_resolve_master_key_env_overrides(monkeypatch):
+    """env PKAPP_MASTER_KEY 恒优先（多机同源 master 的覆盖入口）。"""
+    master = _set_master(monkeypatch)
+    got, generated = keylib.resolve_master_key()
+    assert got == master and not generated
+
+
+def test_resolve_master_key_file_keygen(tmp_path, monkeypatch):
+    """文件托管：缺失即 keygen（幂等复读）；路径由 PKAPP_MASTER_KEY_FILE 定向 tmp
+    （conftest autouse 已定向——POSIX 600 权限位由 resolve 写入侧保证）。"""
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
+    path = tmp_path / "master.key"
+    monkeypatch.setenv("PKAPP_MASTER_KEY_FILE", str(path))
+    first, generated = keylib.resolve_master_key()
+    assert generated and len(first) == 32 and path.is_file()
+    assert path.read_text(encoding="ascii") == first.hex()
+    second, generated2 = keylib.resolve_master_key()
+    assert not generated2 and second == first                   # 幂等
+
+
+def test_resolve_master_key_create_false_fails_fast(tmp_path, monkeypatch):
+    """package 期纪律（create=False）：master 缺失 → 报错且绝不静默 keygen
+    （新 master 派生的 K 必不与既有 spk 配对——掩盖密钥丢失只会更糟）。"""
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
+    monkeypatch.setenv("PKAPP_MASTER_KEY_FILE", str(tmp_path / "absent.key"))
+    with pytest.raises(KeyLibError, match="K_master 缺失"):
+        keylib.resolve_master_key(create=False)
+    assert not (tmp_path / "absent.key").exists()
+
+
+def test_resolve_master_key_rejects_corrupt(tmp_path, monkeypatch):
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
+    path = tmp_path / "master.key"
+    path.write_text("zz", encoding="ascii")
+    monkeypatch.setenv("PKAPP_MASTER_KEY_FILE", str(path))
+    with pytest.raises(KeyLibError):
+        keylib.resolve_master_key(create=False)
+
+
+def _hkdf_rfc5869(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 标准 HKDF-SHA256 参照实现（完整 extract+expand，无 salt 下限——
+    官方向量 salt 均 13B 可直接喂）。derive_k_app 是它的 salt≥16B、info 固定
+    域分离标签的单块特例。"""
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm, t, i = b"", b"", 1
+    while len(okm) < length:
+        t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
+        okm += t
+        i += 1
+    return okm[:length]
+
+
+def test_hkdf_reference_impl_matches_rfc5869_vectors():
+    """参照实现先被 RFC 5869 三个官方向量（A.1–A.3）钉死——后续对拍以此为锚。"""
+    assert _hkdf_rfc5869(
+        b"\x0b" * 22, bytes.fromhex("000102030405060708090a0b0c"),
+        bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")) == bytes.fromhex(
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf")
+    # TC2：长输入（IKM/salt/info 各 80B 递增序列），L=82 → expand 多块路径全覆盖
+    assert _hkdf_rfc5869(
+        bytes(range(0x50)), bytes(range(0x60, 0xb0)),
+        bytes(range(0xb0, 0x100)), length=82) == bytes.fromhex(
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c"
+        "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71"
+        "cc30c58179ec3e87c14c01d5c1f3434f1d87")
+    assert _hkdf_rfc5869(b"\x0b" * 22, b"", b"") == bytes.fromhex(
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d")
+
+
+def test_derive_k_app_matches_reference_impl():
+    """derive_k_app ≡ 参照实现（被官方向量钉死）的单块特例：默认档 + 自定 ≥16B
+    salt 双对拍，info = 域分离标签 b"pkapp/app\\x00" ‖ app_id（与实现逐字节同源）。"""
+    master = hashlib.sha256(b"m").digest()
+    assert keylib.derive_k_app(master, "demo") == _hkdf_rfc5869(
+        master, bytes.fromhex(keylib.DEFAULT_SALT_HEX), b"pkapp/app\x00demo")
+    salt32 = bytes(range(32))      # RFC 官方向量 salt 均 13B 吃不到 API 下限，经参照实现传递
+    assert keylib.derive_k_app(master, "demo", salt32) == _hkdf_rfc5869(
+        master, salt32, b"pkapp/app\x00demo")
+
+
+def test_derive_k_app_deterministic_and_isolated():
+    """G5：同 (master, app_id, salt) 恒同 K；app_id 横向隔离（§1.1）；salt 参与
+    派生；非法入参拒绝。"""
+    master = hashlib.sha256(b"m").digest()
+    assert keylib.derive_k_app(master, _APP) == keylib.derive_k_app(master, _APP)
+    assert keylib.derive_k_app(master, _APP) != keylib.derive_k_app(master, "other")
+    assert keylib.derive_k_app(master, _APP) != \
+        keylib.derive_k_app(master, _APP, salt=b"\x01" * 16)
+    with pytest.raises(KeyLibError):
+        keylib.derive_k_app(b"short", _APP)
+    with pytest.raises(KeyLibError):
+        keylib.derive_k_app(master, "")
+    with pytest.raises(KeyLibError):
+        keylib.derive_k_app(master, _APP, salt=b"\x01" * 8)   # salt <16B
+
+
+def test_generate_kdata_c_generic_matches_repo_kdata():
+    """通用件形态：generate_kdata_c(None) ≡ 仓库 kdata.c 锚点初值（逐字节）——
+    build.bat 产物与现场生成器同源（锚点补丁退化路径的定位前提）。"""
+    import re as _re
+    repo = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "keylib", "src", "kdata.c")
+    text = open(repo, encoding="utf-8").read()
+    inited = _re.search(r"k_stored\[32\]\s*=\s*\{(.*?)\}", text, _re.S).group(1)
+    assert bytes(int(x, 16) for x in _re.findall(r"0x[0-9a-fA-F]{2}", inited)) \
+        == keylib.ANCHOR
+    gen = keylib.generate_kdata_c(None)
+    assert "uint8_t k_stored[32]" in gen
+    gen_bytes = bytes(int(x, 16) for x in _re.findall(
+        r"0x[0-9a-fA-F]{2}", gen.split("=", 1)[1]))
+    assert gen_bytes == keylib.ANCHOR
+
+
+def test_generate_kdata_c_wrapped_form():
+    """per-app 形态：k_stored = K_app ^ _MASK（key.c unwrap 运行期反向同式）；
+    异或回卷还原 K_app；K 的 hex 串形态不存在（strings 捞不到）。"""
+    import re as _re
+    k_app = hashlib.sha256(b"kdata").digest()
+    src = keylib.generate_kdata_c(k_app)
+    arr = _re.search(r"k_stored\[32\]\s*=\s*\{(.*?)\}", src, _re.S).group(1)
+    stored = bytes(int(x, 16) for x in _re.findall(r"0x[0-9a-fA-F]{2}", arr))
+    assert stored == bytes(k ^ m for k, m in zip(k_app, keylib._MASK))
+    assert bytes(s ^ m for s, m in zip(stored, keylib._MASK)) == k_app
+    assert k_app.hex().encode("ascii") not in src.encode("utf-8")
+    assert stored != keylib.ANCHOR                       # 非通用件形态
 
 
 # ---------------------------------------------------------------- 阶段2a：构建链集成
@@ -268,24 +382,22 @@ def _make_stage_app(tmp_path):
     return app
 
 
-def test_encrypt_app_tree_stage_contract(lib, tmp_path):
-    """§6.1 全契约：keygen → blob 落盘 ≡ 参照实现 → 索引 → 删明文 → 资源保留。"""
+def test_encrypt_app_tree_stage_contract(lib, tmp_path, monkeypatch):
+    """§6.1 + ★档位1★ 全契约：master→K_app 现场派生 → blob 落盘 ≡ 参照实现 →
+    索引 → 删明文 → 资源保留；件 key_id ≡ derive 镜像；K 不持久化。"""
     from pkapp.packager.assemble import _encrypt_app_tree
 
-    project, app = tmp_path / "proj", tmp_path / "app"
-    key_file = project / ".pkapp" / "code.key"
+    app = tmp_path / "app"
     _make_stage_app(tmp_path)
-    # 预置固定 K（keygen 路径已由 test_ensure_code_key 覆盖）
-    key = hashlib.sha256(b"stage-key").digest()
-    key_file.parent.mkdir(parents=True)
-    key_file.write_text(key.hex(), encoding="ascii")
+    master = _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(master, _APP)
 
-    kid = _encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, str(project))
-    assert kid == keylib.key_id_hex(key)               # manifest code_key_id 配对值
+    kid = _encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, _APP)
+    assert kid == keylib.key_id_hex(k_app)             # manifest code_key_id 配对值
 
-    # 逐 blob：补丁件（K 内嵌 = 运行期形态）解密 → marshal 载荷合法 + co_filename 归一
+    # 逐 blob：K_app 内嵌件（运行期形态）解密 → marshal 载荷合法 + co_filename 归一
     (tmp_path / "patchwork").mkdir()
-    patched = KeyLib(_patched_copy(tmp_path / "patchwork", key))
+    patched = KeyLib(_patched_copy(tmp_path / "patchwork", k_app))
     rel_of = {"app": "__init__.py", "app.main": "main.py",
               "app.sub": "sub/__init__.py", "app.sub.x": "sub/x.py"}
     for mid, rel in rel_of.items():
@@ -316,8 +428,8 @@ def test_encrypt_app_tree_stage_contract(lib, tmp_path):
                                             ck_blob.read_bytes()))
     assert isinstance(ck_code, types.CodeType)
     assert ck_code.co_filename == "applocal/_codekey.py"
-    # K 文件未被触碰（读取路径不重生成）
-    assert key_file.read_text(encoding="ascii") == key.hex()
+    # ★档位1★ K 不持久化：派生全程零落盘（master 文件未被 keygen）
+    assert not (tmp_path / "master.key").exists()
 
 
 def _walk_all(root):
@@ -328,16 +440,20 @@ def _walk_all(root):
     return out
 
 
-def test_encrypt_app_tree_missing_dll(tmp_path, monkeypatch):
-    """构建期判定（§8）：key-holder 件缺失 → 构建报错，不做静默降级。"""
+def test_encrypt_app_tree_keylib_unavailable(tmp_path, monkeypatch):
+    """构建期判定（§8）：keylib 件产出不可得（编译失败 × 预制件缺失）→ 构建
+    报错，不做静默降级。"""
     from pkapp.packager import assemble
 
     _make_stage_app(tmp_path)
-    monkeypatch.setattr(assemble, "locate_dll", lambda p: None)
-    (tmp_path / ".pkapp").mkdir()
+    _set_master(monkeypatch)
+
+    def boom(*_a, **_k):
+        raise KeyLibError("key-holder 件缺失")
+
+    monkeypatch.setattr(assemble, "produce_keylib", boom)
     with pytest.raises(assemble.BuildError, match="key-holder"):
-        assemble._encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL,
-                                   str(tmp_path))
+        assemble._encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, _APP)
 
 
 def test_appspec_code_encryption_flag(tmp_path):
@@ -383,98 +499,150 @@ def test_manifest_ext_key_code_key_id():
     assert "code_key_id" in mf.canonical_bytes(text).decode("utf-8")
 
 
-# ---------------------------------------------------------------- 阶段2b：package 补丁与闸门
-def _proj_with_key(tmp_path, key: bytes):
-    proj = tmp_path / "proj"
-    (proj / ".pkapp").mkdir(parents=True)
-    (proj / ".pkapp" / "code.key").write_text(key.hex(), encoding="ascii")
-    return str(proj)
+def test_appspec_per_build_salt_flag(tmp_path):
+    """★档位1 §3.2 R-2★：per-build salt 档为 [app] 显式 opt-in，缺省 false
+    （默认档 = 固定 salt 常量，G5 跨构建稳定保留）。"""
+    from pkapp.appspec import load
+
+    root = tmp_path
+    base = ('[app]\nname = "demo"\nversion = "0.1.0"\n'
+            'entry = "app.main:app"\nmin_app_version = "0.1.0"\n')
+    (root / "pkapp.toml").write_text(base, encoding="utf-8")
+    assert load(str(root / "pkapp.toml")).per_build_salt is False
+    (root / "pkapp.toml").write_text(
+        base.replace('[app]\n', '[app]\nper_build_salt = true\n'), encoding="utf-8")
+    assert load(str(root / "pkapp.toml")).per_build_salt is True
 
 
-def test_stage_keylib_patches_and_gates(tmp_path, monkeypatch):
-    """§6.2 正向：通用件 staging 副本补 K 包裹态 → 件 key_id ≡ manifest 配对值；
-    补丁件按运行期形态打开 K 加密的 blob。"""
+def test_manifest_ext_key_code_salt():
+    """★档位1★ code_salt 可选扩展键：默认档无此键；per-build 档写入且被签名
+    正文覆盖（canonical_bytes 保留；壳 C 解析器按未知键忽略）。"""
+    from pkapp.packager import manifest as mf
+
+    fields = {k: "v" for k in mf.KEYS}
+    assert "code_salt" not in mf.render(fields)
+    fields["code_salt"] = "ab" * 32
+    text = mf.render(fields)
+    assert f"code_salt = {'ab' * 32}" in text
+    assert mf.parse(text)["code_salt"] == "ab" * 32
+    assert "code_salt" in mf.canonical_bytes(text).decode("utf-8")
+
+
+# ---------------------------------------------------------------- 阶段2b：package 派生与闸门
+def test_stage_keylib_derives_and_gates(tmp_path, monkeypatch):
+    """★档位1★ 正向：master 派生 K_app → 现场产出专属件 → key_id ≡ manifest
+    配对值；产出件按运行期形态打开 K_app 加密的 blob。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
-    key = hashlib.sha256(b"pkg-key").digest()
-    proj = _proj_with_key(tmp_path / "p1", key)
-    stage = str(tmp_path / "p1" / "stage")
+    master = _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(master, _APP)
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, keylib.key_id_hex(key)) == 0
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), app_id=_APP) == 0
     out = os.path.join(stage, "pkapp_key.dll")
     assert os.path.isfile(out)
     kl = KeyLib(out)
-    assert kl.key_id() == keylib.key_id_hex(key)
-    blob = kl.encrypt(key, "app.main", b"payload")       # encrypt 恒走参数 K
-    assert kl.decrypt("app.main", blob) == b"payload"    # decrypt 走内嵌 K（运行期同构）
-    # 分发原件零触碰（补丁只在 staging 副本上）
+    assert kl.key_id() == keylib.key_id_hex(k_app)
+    blob = kl.encrypt(k_app, "app.main", b"payload")       # encrypt 恒走参数 K
+    assert kl.decrypt("app.main", blob) == b"payload"      # decrypt 走内嵌 K（运行期同构）
+    # 分发原件零触碰（编译/补丁都只写 staging 副本）
     assert open(out, "rb").read() != open(_DLL, "rb").read()
 
 
-def test_stage_keylib_rejects_mismatched_key(tmp_path, monkeypatch):
-    """跨 key 闸门：code.key 与 manifest code_key_id 不配对（K 丢失重生成/新旧
-    混装）→ package 拒绝（返回 2）。"""
+def test_stage_keylib_salt_roundtrip(tmp_path, monkeypatch):
+    """per_build_salt 档：manifest code_salt hex → 同 master 同 salt 派生同 K；
+    丢 salt（按默认档派生）→ 异 K 被闸门拦下。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
-    ka, kb = hashlib.sha256(b"A").digest(), hashlib.sha256(b"B").digest()
-    proj = _proj_with_key(tmp_path / "p2", ka)
-    stage = str(tmp_path / "p2" / "stage")
+    master = _set_master(monkeypatch)
+    salt = os.urandom(32)
+    k_app = keylib.derive_k_app(master, _APP, salt)
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, keylib.key_id_hex(kb)) == 2
-    # 失败保留 staging 现场（同壳公钥闸门语义）：补丁件在场供排查，但不出货
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), app_id=_APP,
+                         salt_hex=salt.hex()) == 0
+    stage2 = str(tmp_path / "stage2")
+    os.makedirs(stage2)
+    assert _stage_keylib(stage2, keylib.key_id_hex(k_app), app_id=_APP) == 2
+
+
+def test_stage_keylib_rejects_corrupt_salt(tmp_path, monkeypatch):
+    """★review 修复回归★：manifest code_salt 损坏（非法 hex）→ 闸门 rc=2（打印
+    原因），不 traceback 崩溃——与其余失败路径同收敛（保留 staging 现场）。"""
+    from pkapp.commands.package import _stage_keylib
+
+    _set_master(monkeypatch)
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(stage, "0" * 32, app_id=_APP, salt_hex="not-hex!") == 2
+
+
+def test_stage_keylib_rejects_mismatched_key(tmp_path, monkeypatch):
+    """跨 key 闸门：manifest code_key_id 与 master 派生值不配对（master 更换/
+    丢失重生成/新旧混装）→ package 拒绝（返回 2），失败保留 staging 现场。"""
+    from pkapp.commands.package import _stage_keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    _set_master(monkeypatch)
+    kb = hashlib.sha256(b"B").digest()
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(stage, keylib.key_id_hex(kb), app_id=_APP) == 2
     assert os.path.isfile(os.path.join(stage, "pkapp_key.dll"))
 
 
-def test_stage_keylib_missing_key(tmp_path, monkeypatch):
-    """spk 已加密而 code.key 缺失 = 不可交付：报错且不 keygen（新 K 必不配对，
-    静默生成只会掩盖密钥丢失）。"""
+def test_stage_keylib_missing_master(tmp_path, monkeypatch):
+    """spk 已加密而 K_master 缺失 = 不可交付：报错且不 keygen（新 master 必不
+    配对，静默生成只会掩盖密钥丢失）。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
-    proj = str(tmp_path / "p3")
-    os.makedirs(proj)
-    stage = str(tmp_path / "p3" / "stage")
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)   # 覆盖 autouse 隔离位
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, "0" * 32) == 2
-    assert not os.path.isfile(os.path.join(proj, ".pkapp", "code.key"))
+    assert _stage_keylib(stage, "0" * 32, app_id=_APP) == 2
+    assert not os.path.isfile(os.path.join(tmp_path, "master.key"))  # 未静默 keygen
 
 
 def test_stage_keylib_mode_b_no_patch(tmp_path, monkeypatch):
     """模式 B（PKAPP_KEYLIB 自管件，K 编译期内嵌）：不补丁仅落位，闸门仍生效。"""
     from pkapp.commands.package import _stage_keylib
 
-    key = hashlib.sha256(b"mode-b").digest()
+    master = _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(master, _APP)
     own = tmp_path / "own" / "pkapp_key.dll"
     own.parent.mkdir(parents=True)
-    keylib.patch_dll(_DLL, str(own), key)
+    keylib.patch_dll(_DLL, str(own), k_app)
     before = own.read_bytes()
     monkeypatch.setenv("PKAPP_KEYLIB", str(own))
-    proj = _proj_with_key(tmp_path / "p4", key)          # 模式 B 不读项目 K
-    stage = str(tmp_path / "p4" / "stage")
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, keylib.key_id_hex(key)) == 0
-    assert (tmp_path / "p4" / "stage" / "pkapp_key.dll").read_bytes() == before  # 逐字节未改写
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), app_id=_APP) == 0
+    assert (tmp_path / "stage" / "pkapp_key.dll").read_bytes() == before  # 逐字节未改写
     # 自管件 key_id 与 manifest 不符同样被闸门拦下
-    stage2 = str(tmp_path / "p4" / "stage2")
+    stage2 = str(tmp_path / "stage2")
     os.makedirs(stage2)
-    assert _stage_keylib(proj, stage2, keylib.key_id_hex(hashlib.sha256(b"X").digest())) == 2
+    assert _stage_keylib(stage2, keylib.key_id_hex(hashlib.sha256(b"X").digest()),
+                         app_id=_APP) == 2
 
 
 # ---------------------------------------------------------------- 阶段2b-android：异平台件落位
 def test_stage_keylib_android_patches_and_gates(tmp_path, monkeypatch,
                                                 android_keylib_so):
-    """android .so（构建机无法 dlopen ELF）：补丁仍走锚点字节改写，key_id 闸门
-    改用 Python 镜像 key_id_hex(K) 比对（ctypes 实测仅 windows 平台件可用）。"""
+    """android .so（构建机无法 dlopen ELF）：强制现场编译失手走锚点补丁（conftest
+    fixture），key_id 闸门用 Python 镜像 key_id_hex(K_app) 比对（ctypes 实测仅
+    windows 平台件可用）。"""
     from pkapp.commands.package import _stage_keylib
 
-    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 补丁路径必须走文件落位
-    key = hashlib.sha256(b"and-key").digest()
-    proj = _proj_with_key(tmp_path / "pa", key)
-    stage = str(tmp_path / "pa" / "stage")
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    master = _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(master, _APP)
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, keylib.key_id_hex(key), "android") == 0
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), "android",
+                         app_id=_APP) == 0
     out = os.path.join(stage, "lib_pkapp_key.so")
     assert os.path.isfile(out)
     with open(out, "rb") as f:
@@ -483,22 +651,23 @@ def test_stage_keylib_android_patches_and_gates(tmp_path, monkeypatch,
         src = f.read()
     i = src.index(keylib.ANCHOR)
     assert keylib.ANCHOR not in data                     # 锚点已改写（不再含原值）
-    assert data[i:i + 32] == bytes(k ^ m for k, m in zip(key, keylib._MASK))
+    assert data[i:i + 32] == bytes(k ^ m for k, m in zip(k_app, keylib._MASK))
     assert data[:i] == src[:i] and data[i + 32:] == src[i + 32:]   # 其余字节零扰动
 
 
 def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
                                                      android_keylib_so):
-    """android 闸门负向：code.key 与 manifest code_key_id 不配对 → rc=2
+    """android 闸门负向：manifest code_key_id 与 master 派生值不配对 → rc=2
     （补丁件保留 staging 现场供排查，同 windows 语义）。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
-    ka, kb = hashlib.sha256(b"A-and").digest(), hashlib.sha256(b"B-and").digest()
-    proj = _proj_with_key(tmp_path / "pb", ka)
-    stage = str(tmp_path / "pb" / "stage")
+    _set_master(monkeypatch)
+    kb = hashlib.sha256(b"B-and").digest()
+    stage = str(tmp_path / "stage")
     os.makedirs(stage)
-    assert _stage_keylib(proj, stage, keylib.key_id_hex(kb), "android") == 2
+    assert _stage_keylib(stage, keylib.key_id_hex(kb), "android",
+                         app_id=_APP) == 2
     assert os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
 
 
@@ -557,16 +726,16 @@ def _write_manifest(base, kid: str):
         f"code_key_id = {kid}\n", encoding="utf-8")
 
 
-def _encrypted_deploy(base, tmp_path, key: bytes) -> str:
-    """把 stage app 加密成运行态部署（blob + index.enc + 明文资源），返回补丁件路径。"""
+def _encrypted_deploy(base, tmp_path, monkeypatch, master: bytes) -> str:
+    """把 stage app 加密成运行态部署（blob + index.enc + 明文资源），返回 K_app
+    内嵌件路径（运行期形态）。app_id 恒 _APP——与构建侧同源派生。"""
     _make_stage_app(base / "runtime")                    # app/ 树 → <runtime>/app
-    project = tmp_path / "proj"
-    (project / ".pkapp").mkdir(parents=True)
-    (project / ".pkapp" / "code.key").write_text(key.hex(), encoding="ascii")
+    monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())  # 构建侧 master 注入
     from pkapp.packager.assemble import _encrypt_app_tree
-    _encrypt_app_tree(str(base / "runtime"), None, _RUNTIME_DLL, str(project))
+    _encrypt_app_tree(str(base / "runtime"), None, _RUNTIME_DLL, _APP)
+    k_app = keylib.derive_k_app(master, _APP)
     (tmp_path / "patchwork").mkdir(exist_ok=True)
-    return _patched_copy(tmp_path / "patchwork", key)    # 运行期形态 = K 内嵌
+    return _patched_copy(tmp_path / "patchwork", k_app)  # 运行期形态 = K 内嵌
 
 
 def _read_diag(base):
@@ -588,9 +757,10 @@ def test_codekey_finder_serves_app_imports(shell_env, tmp_path, monkeypatch,
     """§7.1 全链：install 三 stage 全过 → meta_path finder 独占供给 app.* 导入
     （marshal-exec、包语义、子包相对导入链、blob 起源）。"""
     ck, _env = _codekey_mods()
-    key = hashlib.sha256(b"shell-key").digest()
-    kid = keylib.key_id_hex(key)
-    patched = _encrypted_deploy(shell_env, tmp_path, key)
+    master = hashlib.sha256(b"shell-key").digest()
+    k_app = keylib.derive_k_app(master, _APP)
+    kid = keylib.key_id_hex(k_app)
+    patched = _encrypted_deploy(shell_env, tmp_path, monkeypatch, master)
     _write_manifest(shell_env, kid)
     monkeypatch.setattr(ck, "_dll_path", lambda cfg: patched)   # exe 旁路径 → 测试补丁件
 
@@ -608,11 +778,11 @@ def test_codekey_non_member_falls_through(shell_env, tmp_path, monkeypatch,
                                           finder_clean):
     """成员资格判定（§7.1）：不在册 app.* 回退 PathFinder → ModuleNotFoundError。"""
     ck, _env = _codekey_mods()
-    key = hashlib.sha256(b"shell-key").digest()
-    patched = _encrypted_deploy(shell_env, tmp_path, key)
-    _write_manifest(shell_env, keylib.key_id_hex(key))
+    master = hashlib.sha256(b"shell-key").digest()
+    patched = _encrypted_deploy(shell_env, tmp_path, monkeypatch, master)
+    _write_manifest(shell_env, keylib.key_id_hex(keylib.derive_k_app(master, _APP)))
     monkeypatch.setattr(ck, "_dll_path", lambda cfg: patched)
-    ck.install(_env.load_env(refresh=True), keylib.key_id_hex(key))
+    ck.install(_env.load_env(refresh=True), keylib.key_id_hex(keylib.derive_k_app(master, _APP)))
     with pytest.raises(ImportError):
         importlib.import_module("app.nope")
 
@@ -652,12 +822,13 @@ def test_codekey_decrypt_corrupt_blob(shell_env, tmp_path, monkeypatch,
                                       finder_clean):
     """§7.3 stage=code_decrypt：blob 损坏 → import 期写中性 diag（GCM 认证失败）。"""
     ck, _env = _codekey_mods()
-    key = hashlib.sha256(b"shell-key").digest()
-    patched = _encrypted_deploy(shell_env, tmp_path, key)
-    _write_manifest(shell_env, keylib.key_id_hex(key))
+    master = hashlib.sha256(b"shell-key").digest()
+    k_app = keylib.derive_k_app(master, _APP)
+    patched = _encrypted_deploy(shell_env, tmp_path, monkeypatch, master)
+    _write_manifest(shell_env, keylib.key_id_hex(k_app))
     monkeypatch.setattr(ck, "_dll_path", lambda cfg: patched)
     cfg = _env.load_env(refresh=True)
-    ck.install(cfg, keylib.key_id_hex(key))
+    ck.install(cfg, keylib.key_id_hex(k_app))
     bp = shell_env / "runtime" / "app" / keylib.blob_name("app.main")
     data = bytearray(bp.read_bytes())
     data[40] ^= 0x01                                     # 密文任一字节翻转
@@ -674,15 +845,16 @@ def test_codekey_index_missing_is_code_decrypt(shell_env, tmp_path, monkeypatch,
                                                finder_clean):
     """清单缺失（安装包被裁剪）→ install 阶段即 code_decrypt，中性文案。"""
     ck, _env = _codekey_mods()
-    key = hashlib.sha256(b"shell-key").digest()
-    _encrypted_deploy(shell_env, tmp_path, key)
+    master = hashlib.sha256(b"shell-key").digest()
+    k_app = keylib.derive_k_app(master, _APP)
+    _encrypted_deploy(shell_env, tmp_path, monkeypatch, master)
     (shell_env / "runtime" / "app" / "index.enc").unlink()
-    _write_manifest(shell_env, keylib.key_id_hex(key))
+    _write_manifest(shell_env, keylib.key_id_hex(k_app))
     monkeypatch.setattr(ck, "_dll_path",
                         lambda cfg: str(shell_env / "patched.dll"))
-    keylib.patch_dll(_DLL, str(shell_env / "patched.dll"), key)
+    keylib.patch_dll(_DLL, str(shell_env / "patched.dll"), k_app)
     with pytest.raises(ck.CodeProtectError):
-        ck.install(_env.load_env(refresh=True), keylib.key_id_hex(key))
+        ck.install(_env.load_env(refresh=True), keylib.key_id_hex(k_app))
     d = _read_diag(shell_env)
     assert d["stage"] == "code_decrypt"
     assert d["error"] == ck.NEUTRAL
@@ -796,3 +968,167 @@ def test_ensure_same_runtime_version():
     assemble._ensure_same_runtime_version("3.12.14", "3.12.7")   # minor 同 → 放行
     with pytest.raises(assemble.BuildError, match="minor 版本一致"):
         assemble._ensure_same_runtime_version("3.12.14", "3.13.1")
+
+
+# ------------------------------------------------- ★档位1 补充防线★（keybuild / 隔离对拍 / app_hash）
+
+def _pyc_tag() -> str:
+    """运行解释器同源 pyc tag（assemble windows 流 pyc_tag 派生式同构）。"""
+    return f"cpython-{sys.version_info.major}{sys.version_info.minor}"
+
+
+def test_compile_keylib_windows_burns_k(tmp_path):
+    """现场定制编译（MSVC 在位时）：产物无锚点常量（§3.1 每包一破模型），
+    key_id ≡ derive 镜像，K_app 内嵌 roundtrip（encrypt 走参数、decrypt 走内嵌）。
+    ★这是档位1 主路径的实地验证——CI 镜像须装 VS2022 BuildTools C++ 工具集，
+    否则本用例 skip = 现场编译零验证（fallback 单测不能替代烧 K 断言）。"""
+    from pkapp.packager import keybuild
+
+    if keybuild._find_vcvars64() is None:
+        pytest.skip("MSVC 未就位——档位1 主路径（现场编译烧 K）本跑零验证，"
+                    "CI/构建机需安装 VS2022 BuildTools C++ 工具集")
+    k_app = hashlib.sha256(b"burn-k").digest()
+    out = str(tmp_path / "pkapp_key.dll")
+    keybuild.compile_keylib("windows", k_app, out)
+    with open(out, "rb") as f:
+        assert keylib.ANCHOR not in f.read()             # 专属件无锚点标记
+    kl = KeyLib(out)
+    assert kl.key_id() == keylib.key_id_hex(k_app)
+    payload = b"marshal payload \x00\x01"
+    blob = kl.encrypt(k_app, "app.main", payload)
+    assert kl.decrypt("app.main", blob) == payload
+
+
+def test_keybuild_vendored_path_aligned_with_locate_dll():
+    """★review 修复回归★：keybuild wheel 分支与 locate_dll 的 _vendor 定位必须
+    同指包根（keybuild here 已是目录只剥一层 dirname；错一层 = wheel 形态现场
+    编译恒找不到 _vendor/keylib/src → 静默退化为锚点补丁）。"""
+    from pkapp.packager import keybuild, keylib
+
+    here = os.path.dirname(os.path.abspath(keybuild.__file__))       # .../pkapp/packager
+    vendored = os.path.join(os.path.dirname(here), "_vendor", "keylib", "src")
+    anchor = os.path.dirname(os.path.dirname(os.path.abspath(keylib.__file__)))
+    assert os.path.dirname(vendored) == os.path.join(anchor, "_vendor", "keylib")
+
+
+def test_keylib_source_dir_env_takes_priority(tmp_path, monkeypatch):
+    """keylib_source_dir 定位序：PKAPP_KEYLIB_SRC 恒最优先（自管源码覆盖）。"""
+    from pkapp.packager import keybuild
+
+    env_dir = tmp_path / "src"
+    env_dir.mkdir()
+    (env_dir / "key.c").write_text("/* fake */", encoding="utf-8")
+    monkeypatch.setenv("PKAPP_KEYLIB_SRC", str(env_dir))
+    assert keybuild.keylib_source_dir() == str(env_dir)
+
+
+def test_find_ndk_env_and_version_order(tmp_path, monkeypatch):
+    """NDK 定位：ANDROID_NDK_HOME 恒直返；标准 SDK 位多版本取最新（版本号数值
+    排序非字典序）；全缺失 → None（toolchain 探测异常注入 + LOCALAPPDATA 定向
+    tmp，任何构建机布局下结果恒定）。"""
+    from pkapp.packager import keybuild
+
+    direct = tmp_path / "my-ndk"
+    direct.mkdir()
+    monkeypatch.setenv("ANDROID_NDK_HOME", str(direct))
+    assert keybuild._find_ndk() == str(direct)                       # env 直返
+
+    monkeypatch.delenv("ANDROID_NDK_HOME")
+    la = tmp_path / "la"
+    ndk_root = la / "Android" / "Sdk" / "ndk"
+    for v in ("25.1.8937393", "26.1.10909125", "9.9.9"):
+        (ndk_root / v).mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    monkeypatch.setattr("pkapp.toolchain.android_paths",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("测试隔离")))
+    assert keybuild._find_ndk() == str(ndk_root / "26.1.10909125")   # 数值序取最新
+
+    import shutil as _sh
+    _sh.rmtree(ndk_root)
+    monkeypatch.delenv("LOCALAPPDATA")
+    monkeypatch.delenv("ANDROID_NDK_HOME", raising=False)
+    assert keybuild._find_ndk() is None                              # 全缺失
+
+
+def test_produce_keylib_fallback_matches_compiled_key_id(tmp_path, monkeypatch):
+    """退化路径语义等价（§3.3）：编译失手 → 预制件锚点补丁，产物 key_id 仍 ≡
+    SHA256(K_app)[:16]——闸门语义零差异，两条路径 key_id 可互换比对。"""
+    from pkapp.packager import keybuild
+
+    def boom(*_a, **_k):
+        raise KeyLibError("测试强制：编译不可得")
+
+    monkeypatch.setattr(keybuild, "compile_keylib", boom)
+    k_app = hashlib.sha256(b"fallback-k").digest()
+    out = str(tmp_path / "pkapp_key.dll")
+    assert keybuild.produce_keylib("windows", k_app, out) == "fallback"
+    assert KeyLib(out).key_id() == keylib.key_id_hex(k_app)
+
+
+def test_produce_keylib_double_failure(tmp_path, monkeypatch):
+    """双失败负例：现场编译不可得 × 预制件缺失 → 明示报错（不静默、无空产物）。"""
+    from pkapp.packager import keybuild
+
+    def boom(*_a, **_k):
+        raise KeyLibError("测试强制：编译不可得")
+
+    monkeypatch.setattr(keybuild, "compile_keylib", boom)
+    monkeypatch.setattr(keybuild, "locate_dll", lambda _p: None)
+    with pytest.raises(KeyLibError, match="预制件缺失"):
+        keybuild.produce_keylib("windows", b"\x01" * 32,
+                                str(tmp_path / "pkapp_key.dll"))
+
+
+def test_cross_app_isolation(tmp_path):
+    """§1.1 横向隔离：同 master 异 app_id → 异 K；A 件解 B 包 blob 必败、B 件
+    自开；件级 key_id 互异（跨包闸门在件形态下成立）。"""
+    master = hashlib.sha256(b"shared-master").digest()
+    ka = keylib.derive_k_app(master, "app-a")
+    kb = keylib.derive_k_app(master, "app-b")
+    assert ka != kb
+    assert keylib.key_id_hex(ka) != keylib.key_id_hex(kb)
+    da, db = tmp_path / "a", tmp_path / "b"
+    da.mkdir()
+    db.mkdir()
+    pa, pb = _patched_copy(da, ka), _patched_copy(db, kb)
+    blob_b = KeyLib(pb).encrypt(kb, "app.main", b"payload-b")
+    assert KeyLib(pb).decrypt("app.main", blob_b) == b"payload-b"
+    with pytest.raises(KeyLibError):
+        KeyLib(pa).decrypt("app.main", blob_b)
+
+
+def test_app_hash_plaintext_contract(tmp_path):
+    """§3.2 app_hash 新语义契约（加密前明文摘要）：确定性（G5）+ 重编译稳定 +
+    源码变化敏感 + 资源原文变化敏感 + 缺 pyc fail-fast。"""
+    from pkapp.packager.assemble import _app_hash_plaintext
+
+    app = tmp_path / "app"
+    _make_stage_app(tmp_path)
+    tag = _pyc_tag()
+    h1 = _app_hash_plaintext(str(app), tag)
+    assert len(h1) == 64
+    assert _app_hash_plaintext(str(app), tag) == h1     # 同输入恒同哈希
+    _compile_stage_app(str(app))                        # 同源重编 → 载荷同 → 哈希同
+    assert _app_hash_plaintext(str(app), tag) == h1
+    (app / "main.py").write_text("from .sub import x\nVALUE = x.N + 1\n",
+                                 encoding="utf-8")      # 源码变化 → 重编 → 敏感
+    _compile_stage_app(str(app))
+    h2 = _app_hash_plaintext(str(app), tag)
+    assert h2 != h1
+    (app / "data.bin").write_bytes(b"\x00\x01CHANGED")  # 非 .py 资源原文进摘要
+    assert _app_hash_plaintext(str(app), tag) != h2
+    (app / "__pycache__" / f"__init__.{tag}.pyc").unlink()
+    with pytest.raises(assemble.BuildError, match="app_hash 缺 pyc"):
+        _app_hash_plaintext(str(app), tag)
+
+
+def test_app_hash_plaintext_master_independent(tmp_path, monkeypatch):
+    """app_hash 与 K_master 零耦合：无 master 环境照常工作且不触发 keygen
+    （摘要在加密步骤之前算，派生链不参与——master 文件 0 落盘）。"""
+    from pkapp.packager.assemble import _app_hash_plaintext
+
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
+    _make_stage_app(tmp_path)
+    h = _app_hash_plaintext(str(tmp_path / "app"), _pyc_tag())
+    assert len(h) == 64
+    assert not (tmp_path / "master.key").exists()       # 未触碰 master 解析

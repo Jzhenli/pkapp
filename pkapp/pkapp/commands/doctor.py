@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob
 import os
+import stat as stat_mod
 import subprocess
 import sys
 
@@ -88,6 +89,42 @@ def cmd_doctor(project: str) -> int:
           f"{'set' if os.environ.get('ANDROID_SDK_ROOT') else 'unset（M2 Android 才需要）'}")
     print(f"[doctor] 私钥: "
           f"{'found' if (os.environ.get('PKAPP_SIGN_KEY') or os.path.isfile(os.path.join(project, '.pkapp', 'sign.key'))) else 'missing（build 前先 pkapp build --keygen 或设 PKAPP_SIGN_KEY）'}")
+
+    # K_master 托管（★档位1 §3.1/§9 决策1★）：仅加密构建需要；env 覆盖 > 密钥文件
+    #（默认 ~/.pkapp/master.key，POSIX 600 权限位；missing 只提示不阻断明文构建）
+    if spec is not None and spec.code_encryption:
+        from ..packager.keylib import (MASTER_KEY_ENV, MASTER_KEY_FILE_ENV,
+                                       master_key_path)
+        if os.environ.get(MASTER_KEY_ENV):
+            print(f"[doctor] K_master: env {MASTER_KEY_ENV}（覆盖文件托管）")
+        elif not os.path.isfile(master_key_path()):
+            print(f"[doctor] K_master: missing（{master_key_path()} 不存在且 "
+                  f"{MASTER_KEY_ENV} 未设）——加密构建前先跑一次 pkapp build 触发 "
+                  f"keygen，或设 {MASTER_KEY_ENV}；多机构建须同源 master")
+            problems += 1
+        else:
+            path = master_key_path()
+            try:
+                with open(path, encoding="ascii") as f:
+                    raw = bytes.fromhex(f.read().strip())
+                ok = len(raw) == 32
+            except (ValueError, OSError):
+                ok = False
+            mode = stat_mod.S_IMODE(os.stat(path).st_mode)
+            # "过宽"判定仅 POSIX（Windows 位语义恒 0666 常态，chmod 无 ACL 收权效果）
+            wide = os.name == "posix" and bool(mode & 0o077)
+            perm = f"，权限 {mode:04o}" + ("（过宽，建议 600）" if wide else "")
+            if not ok:
+                print(f"[doctor] K_master: {path} 不是 64 字符 hex（文件损坏，"
+                      "恢复备份或删除重生成——重生成将无法解密既有 spk）")
+                problems += 1
+            elif wide:
+                print(f"[doctor] K_master: found @ {path}{perm}——POSIX 权限过宽"
+                      "（组/其他可读），chmod 600 收权")
+                problems += 1
+            else:
+                print(f"[doctor] K_master: found @ {path}{perm}"
+                      f"（{MASTER_KEY_FILE_ENV} 可覆盖路径）")
     return 1 if problems else 0
 
 

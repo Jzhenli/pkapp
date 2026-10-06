@@ -48,7 +48,7 @@ rem -fPIC + -shared: jniLibs shared lib; no CRT deps (bionic); same
 rem single-file source as windows build (platform #ifdefs only)
 "%CC%" -target %TRIPLE% -O2 -shared -fPIC -std=c17 ^
   -Wall -Wextra -Werror ^
-  src\key.c -o build\lib_pkapp_key.so
+  src\key.c src\kdata.c -o build\lib_pkapp_key.so
 if errorlevel 1 exit /b 1
 
 echo [keylib-android] OK: build\lib_pkapp_key.so  (abi=%ABI%)

@@ -49,21 +49,39 @@ def mock_android_runtime(pkapp_cache):
     return root
 
 
+@pytest.fixture(autouse=True)
+def _master_key_isolation(tmp_path, monkeypatch):
+    """★档位1★ K_master 测试隔离：env 未显式设 PKAPP_MASTER_KEY 的用例绝不触碰
+    真实 ~/.pkapp/——master 文件读写定向到 tmp（防测试 keygen 污染构建机家目录）。"""
+    monkeypatch.setenv("PKAPP_MASTER_KEY_FILE", str(tmp_path / "master.key"))
+    monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
+
+
 @pytest.fixture
 def android_keylib_so(tmp_path, monkeypatch):
     """android key-holder 件落位测试锚：locate_dll("android") 定向到 tmp 假件
     （patch_dll 纯字节定位替换，不解析容器结构——测试契约允许伪造容器），
     仓库树零写入（假件不进 keylib/build/，杜绝硬杀残留污染 vendor 收录）。
-    不走 PKAPP_KEYLIB env——那会被 _stage_keylib 判为模式 B 改变被测行为。"""
-    from pkapp.packager import keylib
+    不走 PKAPP_KEYLIB env——那会被 _stage_keylib 判为模式 B 改变被测行为。
+    ★档位1★ 同时强制现场编译失手（keybuild.compile_keylib）——NDK 在位与否
+    不改变被测路径，fallback 锚点补丁链（假件字节对拍）恒定可断言。"""
+    from pkapp.packager import keybuild, keylib
 
     fake = str(tmp_path / "lib_pkapp_key.so")
     with open(fake, "wb") as f:
         f.write(b"\x00" * 256 + keylib.ANCHOR + b"\x00" * 256)
     real = keylib.locate_dll
-    monkeypatch.setattr(keylib, "locate_dll",
-                        lambda platform="windows": fake if platform == "android"
-                        else real(platform))
+
+    def _locate(platform="windows"):
+        return fake if platform == "android" else real(platform)
+
+    monkeypatch.setattr(keylib, "locate_dll", _locate)
+    monkeypatch.setattr(keybuild, "locate_dll", _locate)   # produce_keylib 回退定位
+
+    def _no_compile(*_a, **_k):
+        raise keylib.KeyLibError("测试强制：现场编译不可得（android fallback 路径）")
+
+    monkeypatch.setattr(keybuild, "compile_keylib", _no_compile)
     return fake
 
 

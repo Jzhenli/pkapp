@@ -91,6 +91,17 @@ def main() -> int:
     else:
         print("[vendor] 跳过 _vendor/keylib/android（无 lib_pkapp_key.so——"
               "加密 android 包需先 keylib 跑 build_android.bat，需 NDK）")
+    # keylib C 源码（★档位1 §3.3★：现场定制编译的 wheel 形态供给，keybuild.py
+    # keylib_source_dir() 的 _vendor 回退位——kdata.c 恒现场生成，不入 vendor；
+    # build.bat 不需要。缺失仅影响 wheel 形态的现场编译，锚点补丁退化路径兜底）
+    ksrc_dest = os.path.join(vroot, "keylib", "src")
+    os.makedirs(ksrc_dest, exist_ok=True)
+    for fn in ("key.c", "key.h"):
+        src_fn = os.path.join(ROOT, "keylib", "src", fn)
+        if os.path.isfile(src_fn):
+            shutil.copyfile(src_fn, os.path.join(ksrc_dest, fn))
+        else:
+            print(f"[vendor] 缺 {src_fn}——wheel 形态现场编译将退化为锚点补丁")
     _vendor_android_shell(vroot)
 
     r = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
@@ -102,6 +113,7 @@ def main() -> int:
     print(f"[vendor] OK: _vendor/shell（MyApp.exe + WebView2Loader.dll）"
           f"+ _vendor/keylib/windows（key-holder 通用件）"
           f"{'+ _vendor/keylib/android ' if os.path.isfile(keylib_so) else ''}"
+          f"+ _vendor/keylib/src（现场定制编译源）"
           f"+ _vendor/wheels（{n} wheel）")
     return 0
 

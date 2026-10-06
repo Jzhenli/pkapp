@@ -27,7 +27,7 @@ if errorlevel 1 (
 
 if not exist build mkdir build
 
-cl /nologo /W4 /O2 /MT /utf-8 /std:c17 /LD src\key.c /Fe:build\pkapp_key.dll /Fo:build\
+cl /nologo /W4 /O2 /MT /utf-8 /std:c17 /LD src\key.c src\kdata.c /Fe:build\pkapp_key.dll /Fo:build\
 if errorlevel 1 exit /b 1
 
 echo [keylib] OK: build\pkapp_key.dll

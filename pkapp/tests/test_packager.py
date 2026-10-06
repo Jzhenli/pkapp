@@ -1,4 +1,5 @@
 """packager 全管线 + golden 断言（G1–G5、G7；G8/G11 属 M2/真快照项）。"""
+import hashlib
 import os
 import types
 import zipfile
@@ -256,14 +257,47 @@ def _enable_code_encryption(project):
         f.write(text.replace("[app]\n", "[app]\ncode_encryption = true\n", 1))
 
 
-def test_build_code_encrypted(project, wheels_dir, tmp_path):   # §6.1 + G5 加密态
+def _set_master(monkeypatch) -> bytes:
+    """★档位1★ 固定 K_master 注入 env（构建侧 resolve 首选源；测试与家目录
+    零接触）——K 不再持久化，派生即用（app_id 与 project fixture 同源 "demo"）。"""
+    master = hashlib.sha256(b"packager-master").digest()
+    monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())
+    return master
+
+
+def _enable_per_build_salt(project):
+    toml = os.path.join(project, "pkapp.toml")
+    with open(toml, encoding="utf-8") as f:
+        text = f.read()
+    assert "[app]" in text
+    with open(toml, "w", encoding="utf-8") as f:
+        f.write(text.replace("[app]\n", "[app]\nper_build_salt = true\n", 1))
+
+
+def test_build_per_build_salt(tmp_path, project, wheels_dir, monkeypatch):
+    """★档位1 §3.2 R-2 per-build 档端到端★（build 期接缝）：salt 随机 → 两次构建
+    code_salt/code_key_id 互异（K 变 → 密文变，spk 不一致）；app_hash 跨构建恒同
+    （明文 marshal 解耦——指纹语义与 K 彻底分离的核心承诺）。package 期按 manifest
+    code_salt 重派生的闸门接缝由 test_keylib salt_roundtrip/corrupt_salt 覆盖。"""
+    _enable_code_encryption(project)
+    _enable_per_build_salt(project)
+    _set_master(monkeypatch)
+    f1 = _build(project, wheels_dir, str(tmp_path / "p1.spk"))
+    f2 = _build(project, wheels_dir, str(tmp_path / "p2.spk"))
+    assert f1["code_salt"] and f2["code_salt"] \
+        and f1["code_salt"] != f2["code_salt"]                 # salt 每构建刷新
+    assert f1["code_key_id"] != f2["code_key_id"]              # K 随 salt 漂移
+    assert f1["app_hash"] == f2["app_hash"]                    # 指纹与 K 解耦
+    bytes.fromhex(f1["code_salt"])                             # 64 hex 可读回（package 期契约）
+
+
+def test_build_code_encrypted(project, wheels_dir, tmp_path, monkeypatch):   # §6.1 + G5 加密态
     from pkapp.packager import keylib
 
     _enable_code_encryption(project)
+    key = keylib.derive_k_app(_set_master(monkeypatch), "demo")
     out1, out2 = str(tmp_path / "e1.spk"), str(tmp_path / "e2.spk")
     fields = _build(project, wheels_dir, out1)
-    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
-        key = bytes.fromhex(f.read().strip())
     assert fields["code_key_id"] == keylib.key_id_hex(key)     # manifest ↔ K 配对
     with zipfile.ZipFile(out1) as zf:
         names = zf.namelist()
@@ -283,7 +317,7 @@ def test_build_code_encrypted(project, wheels_dir, tmp_path):   # §6.1 + G5 加
 
 
 def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
-                                      tmp_path):
+                                      tmp_path, monkeypatch):
     """★android 加密链★（§6.1，与 windows 同链）：加密构建 → spk 内 app/ 全 .enc
     + index.enc、manifest 带 code_key_id；密文可用构建机 windows keylib 补丁件
     解开（加密器恒用构建机件，密文与目标平台无关）。"""
@@ -296,9 +330,8 @@ def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
     assert dll, "keylib/build/pkapp_key.dll 未编译（先跑 keylib/build.bat）"
     _enable_code_encryption(project)
     out = str(tmp_path / "enc-android.spk")
+    key = keylib.derive_k_app(_set_master(monkeypatch), "demo")
     fields = _build_android(project, wheels_dir, out)
-    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
-        key = bytes.fromhex(f.read().strip())
     kid = keylib.key_id_hex(key)
     assert fields["code_key_id"] == kid                    # manifest ↔ K 配对
     with zipfile.ZipFile(out) as zf:
@@ -388,7 +421,8 @@ def test_build_code_obfuscated(project, wheels_dir, tmp_path):   # §13 + G5 混
             assert zf2.read(n) == raw, f"G5: {n} 两跑不一致"
 
 
-def test_build_code_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
+def test_build_code_obfuscated_and_encrypted(project, wheels_dir, tmp_path,
+                                             monkeypatch):
     """★混淆+加密叠加★（§13）：blob 解出的 code 同样无原局部名且含 _o*。"""
     import marshal
 
@@ -399,9 +433,8 @@ def test_build_code_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
     _enable_code_obfuscation(project)
     _enable_code_encryption(project)
     out = str(tmp_path / "oe.spk")
+    key = keylib.derive_k_app(_set_master(monkeypatch), "demo")
     fields = _build(project, wheels_dir, out)
-    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
-        key = bytes.fromhex(f.read().strip())
     assert fields["code_key_id"] == keylib.key_id_hex(key)
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
@@ -567,7 +600,8 @@ def test_build_string_obfuscated(project, wheels_dir, tmp_path):
         assert xor_bytes(raw, keystream(obf_key, code.co_filename, len(raw))) in ciphers
 
 
-def test_build_string_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
+def test_build_string_obfuscated_and_encrypted(project, wheels_dir, tmp_path,
+                                               monkeypatch):
     """★混淆 + 字符串加密 + 代码加密三重叠加★：blob 解出的 code 同样无原长串、
     豁免串在位、stub 在位、局部名 _o*，删明文闸不回归。"""
     import marshal
@@ -581,9 +615,8 @@ def test_build_string_obfuscated_and_encrypted(project, wheels_dir, tmp_path):
     _enable_code_obfuscation(project)
     _enable_code_encryption(project)
     out = str(tmp_path / "soe.spk")
+    key = keylib.derive_k_app(_set_master(monkeypatch), "demo")
     _build(project, wheels_dir, out)
-    with open(os.path.join(project, ".pkapp", "code.key"), encoding="ascii") as f:
-        key = bytes.fromhex(f.read().strip())
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
         stage = str(tmp_path / "stage")

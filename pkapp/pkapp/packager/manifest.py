@@ -15,7 +15,9 @@ REQUIRED_NONEMPTY = KEYS + ("signature",)  # G2：全键非空
 # 可选扩展键（CODE_PROTECTION_DESIGN §7.3）：加密构建才写入 code_key_id（128-bit，
 # 与 key-holder 件配对校验）；不进 REQUIRED_NONEMPTY（明文构建无此键），壳 C 解析器
 # 按未知键忽略——明文包/老壳零回归。canonical_bytes 原样保留 → Ed25519 签名覆盖。
-EXT_KEYS = ("code_key_id",)
+# code_salt（★档位1 §3.2 R-2★）：仅 per_build_salt 档写入（64 hex），壳忽略未知键，
+# package 期 _stage_keylib 读它重派生 K_app。
+EXT_KEYS = ("code_key_id", "code_salt")
 
 
 def render(fields: dict, signature: str | None = None) -> str:

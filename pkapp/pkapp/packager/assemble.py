@@ -14,6 +14,7 @@ import marshal
 import os
 import py_compile
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -24,13 +25,14 @@ import zipfile
 
 from ..appspec import AppSpec
 from ..toolchain import cache_root
-from ..util import SPK_DATE, atomic_write, copy_tree, tree_hash
+from ..util import (SPK_DATE, atomic_write, copy_tree, tree_hash, walk_files)
 from . import manifest as mf
 from . import pe, runtime, sign, spk
+from .keybuild import produce_keylib
 from .keylib import (KeyLib, KeyLibError, APPLOCAL_BOOT_MID, INDEX_FILE_NAME,
-                     INDEX_MODULE_ID,
-                     blob_name, build_index_payload, ensure_code_key,
-                     ensure_obf_key, locate_dll, module_id_for, patch_dll)
+                     INDEX_MODULE_ID, blob_name, build_index_payload,
+                     derive_k_app, ensure_obf_key, module_id_for,
+                     resolve_master_key)
 from .runtime import RuntimeResolveError, RuntimeSnapshot
 
 FORMAT_VERSION = "1"
@@ -640,12 +642,21 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
             print(f"[build] app/ 混淆：改名 {obf_stats['renamed']} 符号/"
                   f"剥离 {obf_stats['stripped']} docstring/"
                   f"加密 {obf_stats['strings']} 字符串")
-        # 7b) 代码加密（CODE_PROTECTION_DESIGN §6.1，[app] code_encryption=true 才启用；
-        #     缺省关闭 → 本步骤整体跳过，G6 零回归）
+        # 7b) app_hash（★档位1 §3.2 解耦★：加密前明文 marshal 载荷哈希——与 K
+        #     彻底解耦，换 keylib 形态/换 master 均不改变 app_hash；必须在 7c 前）
+        pyc_tag = "cpython-" + "".join(c for c in snapshot.python_dll if c.isdigit())
+        app_hash = _app_hash_plaintext(app_stage, pyc_tag)
+        # 7c) 代码加密（CODE_PROTECTION_DESIGN §6.1 + ★档位1 §3 K 派生化★，
+        #     [app] code_encryption=true 才启用；缺省关闭 → 本步骤整体跳过，G6 零回归）
         code_key_id = ""
+        code_salt = ""
         if spec.code_encryption:
+            salt = secrets.token_bytes(32) if spec.per_build_salt else None
+            if salt is not None:
+                code_salt = salt.hex()     # manifest code_salt（R-2 per-build 档）
             code_key_id = _encrypt_app_tree(stage, _snapshot_exe,
-                                            snapshot.python_dll, project_dir)
+                                            snapshot.python_dll,
+                                            spec.name, salt)
 
         # 8) 树哈希 + manifest + 签名 + spk（闭包自检扫描域含 app/，Q5）
         check_closure(stage, snapshot.python_dll, extra_dirs=(app_stage,))
@@ -653,68 +664,109 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         fields = _manifest_fields(spec, snapshot.python_dll,
                                   f"sha256:{runtime_hash}",
                                   _detect_applocal(sp_dir),
-                                  app_stage,
+                                  app_hash,
                                   os.path.join(stage, "ui"),
-                                  code_key_id=code_key_id)
+                                  code_key_id=code_key_id, code_salt=code_salt)
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
         shutil.rmtree(lib_work, ignore_errors=True)
 
 
-def _encrypt_app_tree(stage: str, python_exe: str | None, python_dll: str,
-                      project_dir: str) -> str:
-    """代码加密主步骤（CODE_PROTECTION_DESIGN §6.1）——app/ 树 pyc → 加密 blob。
+def _app_hash_plaintext(app_dir: str, pyc_tag: str) -> str:
+    """★档位1 §3.2 app_hash 解耦★：加密前的明文载荷树哈希。
 
-    流程：ensure_code_key（Q1 自动 keygen）→ 逐模块 剥 16 字节 pyc 头 →
-    件加密导出 pk_x1（module_id 作确定性 nonce 派生 + AAD）→ 落 <sha256(mid)>.enc →
-    解密回读验证（GCM 打开 + marshal 成功）→ 才删该模块明文 .py/.pyc（顺序硬约束：
-    明文不允许越过"已验证密文"这道闸）→ 全量完成后落加密清单 index.enc + 删明文闸。
+    旧语义 app_hash = staging app/ 树哈希（加密后执行 = 密文哈希，随 K 漂移）；
+    新语义 = 加密前逐文件摘要：.py → 编译产物 checked-hash pyc 剥 16B 头的
+    marshal 载荷（PYTHONHASHSEED=0 子进程代编 + dfile=rel，跨构建确定性）；
+    非 .py 资源 → 原文。喂序 "rel\\0sha256hex\\n"（walk_files 固定 UTF-8 序，G5）。
+    __pycache__ 段（构建副产物 pyc）排除——载荷已按 .py 间接计入，原始字节
+    重复计入既虚增输入面又与"明文载荷哈希"语义不符。
+    消费点核实：壳侧仅 manifest.c 键表存在该键（指纹缓存走 spk_hash）——输入
+    语义切换零回归。
+    """
+    import hashlib
+    parts: list[str] = []
+    for rel in walk_files(app_dir):
+        if "__pycache__" in rel.split("/"):
+            continue                       # pyc 构建副产物不进哈希（载荷按 .py 计）
+        if rel.endswith(".py"):
+            d, base = os.path.split(rel)
+            pyc = os.path.join(app_dir, d.replace("/", os.sep), "__pycache__",
+                               f"{base[:-3]}.{pyc_tag}.pyc")
+            if not os.path.isfile(pyc):
+                raise BuildError(f"app_hash 缺 pyc（编译步骤未产出）: {rel}")
+            with open(pyc, "rb") as f:
+                raw = f.read()
+            if len(raw) <= 16:
+                raise BuildError(f"pyc 过短（不足 16 字节头）: {rel}")
+            digest = hashlib.sha256(raw[16:]).hexdigest()
+        else:
+            with open(os.path.join(app_dir, rel.replace("/", os.sep)), "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+        parts.append(f"{rel}\0{digest}\n")
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
+
+
+def _encrypt_app_tree(stage: str, python_exe: str | None, python_dll: str,
+                      app_id: str, salt: bytes | None = None) -> str:
+    """代码加密主步骤（CODE_PROTECTION_DESIGN §6.1 + ★档位1 §3 K 派生化★）。
+
+    流程：resolve_master_key（env > ~/.pkapp/master.key；构建期缺失即 keygen）→
+    derive_k_app(master, app_id, salt)（HKDF-SHA256；K_master 永不入包）→
+    produce_keylib 现场定制编译专属件（kdata.c 烧件；编译不可得退化为预制件
+    锚点补丁）→ 逐模块 剥 16 字节 pyc 头 → 件加密导出 pk_x1（module_id 作
+    确定性 nonce 派生 + AAD）→ 落 <sha256(mid)>.enc → 解密回读验证（GCM 打开 +
+    marshal 成功）→ 才删该模块明文 .py/.pyc（顺序硬约束：明文不允许越过"已验证
+    密文"这道闸）→ 全量完成后落加密清单 index.enc + 删明文闸。
     非 .py 资源明文保留（Q2）。返回 code_key_id（manifest 写入，§7.3 配对校验）。
 
+    ★档位1★ code.key 退役：K 恒现场派生、不持久化——同 (master, app_id, salt)
+    恒同 K（G5 默认档）；横向隔离由 HKDF info=app_id 承担（§1.1 防线分工）。
+    加密器恒为构建机本平台件（密文字节与目标平台无关，android 构建同此路径）。
+
     尾部追加 ★期1 S2：_codekey 密文化★（解密根出 Python 明文面，§5.6）——
-    同一补丁件 kl / 同一 K 加密 site-packages/applocal/_codekey.py 为引导 blob，
+    同一件 kl / 同一 K_app 加密 site-packages/applocal/_codekey.py 为引导 blob，
     运行期壳经 keylib pk_x4 装载（装载语义归壳，keylib 停在 marshal.loads 之前）。
 
     G5 依赖链：pyc 载荷（PYTHONHASHSEED=0 子进程编译 + dfile=rel）与 nonce
-    （HMAC(K, mid)）双确定性 → 密文字节跨构建稳定 → app_hash 不变。
+    （HMAC(K, mid)）双确定性 → 密文字节跨构建稳定（默认 salt 档）。
     """
     stage_app = os.path.join(stage, "app")
-    dll_path = locate_dll("windows")
-    if not dll_path:
-        raise BuildError(
-            "code_encryption=true 但 key-holder 件缺失（预期 keylib/build/"
-            "pkapp_key.dll 或 _vendor/keylib/windows/，可设 PKAPP_KEYLIB 指定）——"
-            "构建期即定局，运行期不可能凭空有件（§8）")
-    key, generated = ensure_code_key(project_dir)
+    master, generated = resolve_master_key(create=True)
     if generated:
-        print("[build] .pkapp/code.key 已自动生成（256-bit）——请务必备份："
-              "丢失 = 无法按原 K 重建；轮换 = 全量重加密 + 重打包")
+        print("[build] K_master 已自动生成（~/.pkapp/master.key）——请务必备份："
+              "丢失 = 该构建机无法再派生与既有 spk 配对的 K（全量重加密/重打包）")
+    k_app = derive_k_app(master, app_id, salt)
+    work = tempfile.mkdtemp(prefix="pkapp-keylib-")
     try:
-        KeyLib(dll_path)                       # 加载健全性检查（缺失/坏 PE 早炸）
-    except KeyLibError as e:
-        raise BuildError(str(e)) from e
-    # pyc 定位须用运行时解释器的 tag（_zip_lib 同款）——打包机解释器的
-    # cache_from_source 可能产出不同 magic tag 名
-    pyc_tag = "cpython-" + "".join(c for c in python_dll if c.isdigit())
-    # 加密/回验统一用 K 补丁后的 dll 副本：pk_x1 恒走参数 K，pk_x2
-    # 恒走内嵌 K——通用件的锚点 K 解不开项目密文；补丁形态与运行期逐位一致，
-    # 回验才等价于运行期打开
-    patch_dir = tempfile.mkdtemp(prefix="pkapp-keylib-")
-    try:
-        patched = os.path.join(patch_dir, "pkapp_key.dll")
+        dll_path = os.path.join(work, "pkapp_key.dll")
+        # 加密器件平台 = 构建机本平台（密文字节与目标平台无关，android 构建同此路径）；
+        # 构建机矩阵 = windows/linux（mac 不在支持面）——非 Windows 构建机走 linux
+        # 编译器链（keybuild._compile_linux）+ ctypes 加载本平台 .so
+        host = "windows" if os.name == "nt" else "linux"
         try:
-            patch_dll(dll_path, patched, key)
-            kl = KeyLib(patched)
+            mode = produce_keylib(host, k_app, dll_path)
+        except KeyLibError as e:
+            raise BuildError(f"key-holder 件产出不可得（§8 构建期判定，"
+                             f"不静默降级）: {e}") from e
+        if mode == "fallback":
+            print("[build] 警告：keylib 现场编译不可得，退化为预制件锚点补丁"
+                  "（件内保留锚点标记，保护面降级——PROTECTION_ROADMAP §3.3）")
+        try:
+            kl = KeyLib(dll_path)              # 加载健全性检查（缺失/坏 PE 早炸）
         except KeyLibError as e:
             raise BuildError(str(e)) from e
-        code_key_id = _encrypt_app_tree_inner(stage_app, kl, key, pyc_tag)
+        # pyc 定位须用运行时解释器的 tag（_zip_lib 同款）——打包机解释器的
+        # cache_from_source 可能产出不同 magic tag 名
+        pyc_tag = "cpython-" + "".join(c for c in python_dll if c.isdigit())
+        code_key_id = _encrypt_app_tree_inner(stage_app, kl, k_app, pyc_tag)
         # ★期1 S2★ 解密器自身密文化（同一 kl/同一 K；applocal 引导 blob 独立
         # 于 app/ 清单，壳侧 pk_x4 按固定 mid 定位）
-        _encrypt_applocal_boot(stage, kl, key, python_exe, python_dll)
+        _encrypt_applocal_boot(stage, kl, k_app, python_exe, python_dll)
         return code_key_id
     finally:
-        shutil.rmtree(patch_dir, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
@@ -771,8 +823,7 @@ def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
 
 def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
                             pyc_tag: str) -> str:
-    """加密执行体（kl = K 补丁件副本；加密走参数 K、回验走内嵌 K）。"""
-    from ..util import walk_files
+    """加密执行体（kl = K_app 烧件/补丁件；加密走参数 K、回验走内嵌 K）。"""
     mids: list[str] = []
     for rel in walk_files(stage_app):
         if not rel.endswith(".py"):
@@ -838,8 +889,8 @@ def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
 
 
 def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
-                     applocal_version: str, app_dir: str, ui_dir: str,
-                     code_key_id: str = "") -> dict:
+                     applocal_version: str, app_hash: str, ui_dir: str,
+                     code_key_id: str = "", code_salt: str = "") -> dict:
     fields = {
         "format_version": FORMAT_VERSION,
         "app_version": spec.version,
@@ -848,11 +899,14 @@ def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
         "python_dll": python_dll,
         "entry": spec.entry,
         "runtime_hash": runtime_hash,
-        "app_hash": f"sha256:{tree_hash(app_dir)}",
+        # ★档位1 §3.2★ app_hash = 加密前明文载荷哈希（_app_hash_plaintext），与 K 解耦
+        "app_hash": f"sha256:{app_hash}",
         "ui_hash": f"sha256:{tree_hash(ui_dir)}",
     }
     if code_key_id:
         fields["code_key_id"] = code_key_id    # 可选扩展键（§7.3；明文构建无此键）
+    if code_salt:
+        fields["code_salt"] = code_salt        # per_build_salt 档（壳忽略未知键）
     fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
     return fields
 
@@ -956,23 +1010,33 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
                   f"剥离 {obf_stats['stripped']} docstring/"
                   f"加密 {obf_stats['strings']} 字符串")
 
-        # 3b) 代码加密（CODE_PROTECTION_DESIGN §6.1，android 与 windows 同链）。
-        #     加密器 = 构建机本机 keylib 件（_encrypt_app_tree 恒用构建机件，密文
-        #     字节与目标平台无关）；运行期件 lib_pkapp_key.so 由 package 期锚点补丁
-        #     后进 APK jniLibs（§5.5，APK 签名覆盖其完整性）。
+        # 3a) app_hash（★档位1 §3.2 解耦★）——必须在 3b 加密前（加密删明文）
+        pyc_tag = "cpython-" + "".join(c for c in snapshot.python_dll if c.isdigit())
+        app_hash = _app_hash_plaintext(os.path.join(stage, "app"), pyc_tag)
+
+        # 3b) 代码加密（CODE_PROTECTION_DESIGN §6.1 + ★档位1 §3 K 派生化★，
+        #     android 与 windows 同链）。加密器 = 构建机本机 keylib 件
+        #     （_encrypt_app_tree 恒用构建机件，密文字节与目标平台无关）；
+        #     运行期件 lib_pkapp_key.so 由 package 期现场派生/补丁后进 APK
+        #     jniLibs（§5.5，APK 签名覆盖其完整性）。
         code_key_id = ""
+        code_salt = ""
         if spec.code_encryption:
+            salt = secrets.token_bytes(32) if spec.per_build_salt else None
+            if salt is not None:
+                code_salt = salt.hex()     # manifest code_salt（R-2 per-build 档）
             code_key_id = _encrypt_app_tree(stage, pyc_exe,
-                                            snapshot.python_dll, project_dir)
+                                            snapshot.python_dll,
+                                            spec.name, salt)
 
         # 4) manifest + 签名 + spk
         bundle = os.path.join(snapshot.dir, snapshot.abis[0], "libpythonbundle.so")
         fields = _manifest_fields(spec, snapshot.python_dll,
                                   f"sha256:{_sha256_file(bundle)}",
                                   _detect_applocal(sp_dir),
-                                  os.path.join(stage, "app"),
+                                  app_hash,
                                   os.path.join(stage, "ui"),
-                                  code_key_id=code_key_id)
+                                  code_key_id=code_key_id, code_salt=code_salt)
         return _emit_spk(stage, fields, out_path, private_key)
     finally:
         shutil.rmtree(stage, ignore_errors=True)

@@ -74,6 +74,7 @@ class AppSpec:
     coexist: bool = False
     code_encryption: bool = False        # [app] code_encryption（★②加密+壳持钥★ §8；缺省关闭 G6）
     code_obfuscation: bool = False       # [app] code_obfuscation（★§13 混淆叠加层★；缺省关闭 G6）
+    per_build_salt: bool = False         # [app] per_build_salt（★档位1 §3.2 R-2★：HKDF per-build 档 opt-in）
     min_pkapp_version: str = "0.1.0"
     dist_dir: str = "dist"
     app_dir: str = "app"
@@ -259,6 +260,7 @@ def load(path: str) -> AppSpec:
         coexist=bool(app.get("coexist", False)),
         code_encryption=bool(app.get("code_encryption", False)),
         code_obfuscation=bool(app.get("code_obfuscation", False)),
+        per_build_salt=bool(app.get("per_build_salt", False)),
         min_pkapp_version=str(app.get("min_pkapp_version", "0.1.0")),
         dist_dir=str(dist.get("dir", "dist")),
         app_dir=str(dist.get("app_dir", "app")),
