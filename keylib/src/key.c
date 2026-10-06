@@ -9,9 +9,20 @@
  */
 #include "key.h"
 
+/* pk_x4 用可移植 fopen/ftell（POSIX/NDK 同源）；MSVC 的 C4996 是 ISO C 标准函数
+ * 防误用提示，非缺陷——锁类型安全替代 fopen_s 是 Windows 专属 API，会破坏三端一致。
+ * 只影响本翻译单元。 */
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>                         /* pk_x4：CP_UTF8 路径转宽（_wfopen） */
+#endif
 
 /* ---------------------------------------------------------------- 反调试三件套（可选）
  * §5.4⑤：Windows IsDebuggerPresent / CheckRemoteDebuggerPresent；
@@ -86,6 +97,13 @@ static const uint8_t k_seed_stored[32] = {
 };
 static const uint8_t k_s1[16] = {        /* 包裹态第一输入块（无独立语义） */
     0x9e,0x3c,0x41,0xd7,0xa8,0xf2,0x5b,0x60,0xc1,0xe9,0x4a,0x73,0xd6,0x8f,0x0b,0x52
+};
+/* k_m1：引导装载 mid 前段（pk_x4 专用，与 k_m2 分置两段；无独立语义）。
+ * ★偏置存储★（针对 strings 直捞片段拼接）：存储值 = 真实字节 ⊕ 0x5A，运行时
+ * 逐字节还原——真实片段 "applocal." 全可打印，明文存储会以可读串形态落在
+ * strings 里；偏置后为无语义串（且与 k_m2 不相邻、无提示关联）。 */
+static const uint8_t k_m1[9] = {
+    0x3b,0x2a,0x2a,0x36,0x35,0x39,0x3b,0x36,0x74
 };
 static const char k_anchor_hex[] = PKKEY_ANCHOR_HEX;
 uint8_t k_stored[32] = {
@@ -203,6 +221,15 @@ static const uint8_t k_s2[24] = {
     0x47,0xa1,0xc8,0x5e,0x03,0xd6,0x9b,0xf2,0x7c,0x5a,0x41,0xe9,0x83,0x0b,0x7d,0x64,
     0xfa,0x25,0x19,0xce,0x6b,0x80,0x3d,0x47
 };
+
+/* k_m2：引导装载 mid 后段（pk_x4 专用，与 k_m1 空间分散——相隔 HMAC/GCM/
+ * AES 段；blob 文件名 = sha256(mid 拼装) hex + ".enc"，全程栈上，不落静态）。
+ * 偏置存储同 k_m1（⊕ 0x5A，还原前含控制字节，strings 不可见）。 */
+static const uint8_t k_m2[8] = {
+    0x05,0x39,0x35,0x3e,0x3f,0x31,0x3f,0x23
+};
+
+#define PKKEY_MID_BIAS 0x5A                    /* mid 片段偏置（还原异或，见 k_m1 注释） */
 
 /* ---------------------------------------------------------------- HMAC-SHA256（nonce 派生） */
 static void hmac_sha256(const uint8_t *key, size_t key_len,
@@ -589,4 +616,106 @@ PKKEY_API const char *pk_x3(void)
     }
     hex[32] = 0;
     return hex;
+}
+
+/* ---------------------------------------------------------------- applocal 引导装载（pk_x4）
+ * 停在 marshal.loads 之前（2026-10 架构决议）：本函数只做"定位 + 读文件 + 复用
+ * pk_x2 解密"，输出裸 marshal 字节；解释器侧装载（marshal/exec/注入 sys.modules）
+ * 归壳——件内不引用任何 Python API，零依赖独立件纪律与 Android 可构建性保住。
+ * 协议知识单点收敛：mid（两块分散常量栈上拼装）/blob 文件名（sha256(mid) hex
+ * + ".enc"）/目录布局（"<root>/site-packages/applocal/"）。
+ * 缓冲两段式（跨 CRT 堆规避：件内 malloc 的读文件缓冲件内 free，永不出界）；
+ * NOBLOB 是明文包常态而非错误（壳静默跳过）；加密包 blob 缺失不降级——明文
+ * _codekey.py 已删，Python 侧 import 必失败（fail-closed，§5.4 同纪律）。 */
+PKKEY_API int pk_x4(
+    const char *runtime_root,
+    unsigned char *out, unsigned long long out_cap,
+    unsigned long long *out_len)
+{
+    char mid[18], blobname[69], path[1024];
+    unsigned char *buf;
+    unsigned long long payload;
+    uint8_t d[32];
+    FILE *f;
+    long fsize;
+    size_t rl;
+    static const char HEXD[] = "0123456789abcdef";
+    int rc;
+    if (!runtime_root || !out_len)
+        return PKKEY_E_ARGS;
+    rl = strlen(runtime_root);
+    if (rl == 0 || rl + 93 > sizeof path)    /* 24(目录) + 68(blob 名) + NUL */
+        return PKKEY_E_ARGS;
+    /* mid 栈上拼装 + 偏置还原（k_m1 ‖ k_m2，见分散常量注释）；blob 文件名 = sha256(mid) hex。
+     * ★volatile 读取★：static const 片段 ⊕ 常量的循环会被优化器常量折叠——
+     * 还原后的完整 mid 明文烧进 .rdata（strings 直捞命中，实测 0x15c50）；
+     * volatile 强制从内存读、折叠失效（纪律同 k_stored 锚点读取）。 */
+    {
+        size_t i;
+        for (i = 0; i < sizeof k_m1; i++)
+            mid[i] = (char)(*(const volatile uint8_t *)&k_m1[i] ^ PKKEY_MID_BIAS);
+        for (i = 0; i < sizeof k_m2; i++)
+            mid[sizeof k_m1 + i] = (char)(*(const volatile uint8_t *)&k_m2[i] ^ PKKEY_MID_BIAS);
+    }
+    mid[sizeof mid - 1] = 0;
+    sha256(mid, sizeof k_m1 + sizeof k_m2, d);
+    {
+        size_t i;
+        for (i = 0; i < 32; i++) {
+            blobname[2 * i] = HEXD[d[i] >> 4];
+            blobname[2 * i + 1] = HEXD[d[i] & 0x0f];
+        }
+    }
+    memcpy(blobname + 64, ".enc", 5);
+    memcpy(path, runtime_root, rl);
+    memcpy(path + rl, "/site-packages/applocal/", 24);
+    memcpy(path + rl + 24, blobname, 69);
+    pkkey_secure_zero(d, sizeof d);
+#ifdef _WIN32
+    /* ★review 修复①★ fopen 在 MSVC 是 ANSI（CP_ACP）语义——壳传来的 UTF-8
+     * 字节路径在中文系统（GBK 代码页）被误读，含中文用户名的安装路径必挂。
+     * 转宽字符走 _wfopen（仅本函数，Windows 专属 API 不入 POSIX 分支）。 */
+    {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        wchar_t wpath[1024];
+        if (wn > 0 && wn <= (int)(sizeof wpath / sizeof wpath[0]) &&
+            MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn) == wn)
+            f = _wfopen(wpath, L"rb");
+        else
+            f = NULL;
+    }
+#else
+    f = fopen(path, "rb");
+#endif
+    if (!f)
+        return PKKEY_E_NOBLOB;               /* 明文包常态 / 加密包损坏（不降级） */
+    if (fseek(f, 0, SEEK_END) != 0 || (fsize = ftell(f)) < 0 ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return PKKEY_E_INTERNAL;
+    }
+    if (fsize < PKKEY_OVER || (unsigned long long)fsize > 0x7fffffffULL) {
+        fclose(f);
+        return PKKEY_E_FORMAT;
+    }
+    payload = (unsigned long long)fsize - PKKEY_OVER;
+    if (out_cap < payload) {
+        *out_len = payload;                  /* ★review 修复②★ 探测遍：cap 在
+                                              * 整读之前判定（fsize 即知载荷
+                                              * 大小），免 malloc+fread 空转 */
+        fclose(f);
+        return PKKEY_E_CAP;
+    }
+    buf = (unsigned char *)malloc((size_t)fsize);
+    if (!buf || fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) {
+        free(buf);
+        fclose(f);
+        return PKKEY_E_INTERNAL;
+    }
+    fclose(f);
+    rc = pk_x2(mid, buf, (unsigned long long)fsize, out, out_cap, out_len);
+    pkkey_secure_zero(mid, sizeof mid);      /* 解密完（AAD 用毕）再清零 */
+    pkkey_secure_zero(buf, (size_t)fsize);   /* 密文缓冲亦清零（纪律一致） */
+    free(buf);
+    return rc;
 }

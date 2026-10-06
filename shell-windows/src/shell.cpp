@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #include <time.h>
 
 #include "ed25519.h"
@@ -1041,6 +1042,182 @@ typedef int (*fn_Py_IsInitialized)(void);
 typedef int (*fn_PyRun_SimpleString)(const char *);
 typedef void *(*fn_PyEval_SaveThread)(void);
 
+static int boot_load_codekey(HMODULE py, const std::wstring &runtime_root,
+                             const char *code_key_id, char *err, size_t cap);
+static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
+                       const char *app_version, const char *spk_hash_hex,
+                       const char *code_key_id, char *err, size_t cap);
+
+/* ★期1 S3★ 引导装载（applocal 解密器密文化，§5.6）：keylib pk_x4 停在
+   marshal.loads 之前——壳承接"通用 Python 嵌入动作"（marshal/exec/注入），
+   协议知识（mid/blob 名/目录布局/AAD）全部在 keylib 内部，壳零协议实现。
+   错误码与 keylib/src/key.h 同步：0 成功 / -2 CAP（*out_len 回填）/
+   -7 NOBLOB（明文包常态）/ -4 AUTH（K 不配对或损坏）。 */
+typedef int (*fn_pk_x4)(const char *, unsigned char *, unsigned long long,
+                        unsigned long long *);
+typedef void *(*fn_PyImport_ImportModule)(const char *);
+typedef void *(*fn_PyImport_AddModule)(const char *);
+typedef void *(*fn_PyModule_GetDict)(void *);
+typedef void *(*fn_PyObject_GetAttrString)(void *, const char *);
+typedef void *(*fn_PyObject_CallObject)(void *, void *);
+typedef void *(*fn_PyTuple_Pack)(size_t, ...);
+typedef void *(*fn_PyBytes_FromStringAndSize)(const char *, long long);
+typedef void *(*fn_PyEval_EvalCode)(void *, void *, void *);
+typedef int (*fn_PyObject_SetAttrString)(void *, const char *, void *);
+typedef void (*fn_Py_DecRef)(void *);
+typedef void *(*fn_PyErr_Occurred)(void);
+typedef void (*fn_PyErr_Clear)(void);
+
+#define PKKEY_BOOT_MAX (64ull * 1024 * 1024)   /* blob 大小防御上限 */
+
+/* keylib 件缺失统一出口（diag 已写；fail-closed 由调用方 return -1 传导） */
+static int boot_keylib_fail(char *err, size_t cap, const char *msg) {
+    _snprintf(err, cap - 1, "%s", msg);
+    err[cap - 1] = 0;
+    diag_write("keylib_load", err, "", FALSE);
+    return -1;
+}
+
+/* 返回 0 已注入 / 1 跳过（明文包或无 blob，静默）/ -1 失败（已写 diag）。
+   跳过判定 manifest 驱动（协议禁硬编码）：无 code_key_id = 明文包，连 keylib
+   都不加载（明文包 exe 旁本就无 key-holder 件）。fail-closed：加密包任何
+   装载失败都终止 bootstrap（NEUTRAL 错误页）——删 blob/删 dll 不构成降级
+   路线（site-packages 里明文 _codekey.py 已不存在，Python 侧 ImportError 兜底）。 */
+static int boot_load_codekey(HMODULE py, const std::wstring &runtime_root,
+                             const char *code_key_id, char *err, size_t cap) {
+    if (!code_key_id || !*code_key_id) return 1;       /* 明文包：零动作 */
+    /* key-holder 件：exe 旁（§5.6 落位纪律，与 applocal 运行期同源） */
+    wchar_t exe_w[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe_w, MAX_PATH))
+        return boot_keylib_fail(err, cap, "key-holder 件定位失败（exe 路径）");
+    {
+        std::wstring kl_w(exe_w);
+        size_t slash = kl_w.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+            return boot_keylib_fail(err, cap, "key-holder 件定位失败（exe 路径）");
+        kl_w = kl_w.substr(0, slash + 1) + L"pkapp_key.dll";
+        HMODULE kl = LoadLibraryW(kl_w.c_str());
+        if (!kl)
+            return boot_keylib_fail(err, cap, "key-holder 件缺失（pkapp_key.dll）");
+        fn_pk_x4 px4 = (fn_pk_x4)(void *)GetProcAddress(kl, "pk_x4");
+        if (!px4)
+            return boot_keylib_fail(err, cap, "key-holder 件导出不完整（pk_x4）");
+
+        fn_PyImport_ImportModule pImport =
+            (fn_PyImport_ImportModule)(void *)GetProcAddress(py, "PyImport_ImportModule");
+        fn_PyImport_AddModule pAddMod =
+            (fn_PyImport_AddModule)(void *)GetProcAddress(py, "PyImport_AddModule");
+        fn_PyModule_GetDict pGetDict =
+            (fn_PyModule_GetDict)(void *)GetProcAddress(py, "PyModule_GetDict");
+        fn_PyObject_GetAttrString pGetAttr =
+            (fn_PyObject_GetAttrString)(void *)GetProcAddress(py, "PyObject_GetAttrString");
+        fn_PyObject_CallObject pCallObj =
+            (fn_PyObject_CallObject)(void *)GetProcAddress(py, "PyObject_CallObject");
+        fn_PyTuple_Pack pTuplePack =
+            (fn_PyTuple_Pack)(void *)GetProcAddress(py, "PyTuple_Pack");
+        fn_PyBytes_FromStringAndSize pBytes =
+            (fn_PyBytes_FromStringAndSize)(void *)GetProcAddress(py, "PyBytes_FromStringAndSize");
+        fn_PyEval_EvalCode pEval =
+            (fn_PyEval_EvalCode)(void *)GetProcAddress(py, "PyEval_EvalCode");
+        fn_PyObject_SetAttrString pSetAttr =
+            (fn_PyObject_SetAttrString)(void *)GetProcAddress(py, "PyObject_SetAttrString");
+        fn_Py_DecRef pDecRef = (fn_Py_DecRef)(void *)GetProcAddress(py, "Py_DecRef");
+        fn_PyErr_Occurred pErrOcc = (fn_PyErr_Occurred)(void *)GetProcAddress(py, "PyErr_Occurred");
+        fn_PyErr_Clear pErrClear = (fn_PyErr_Clear)(void *)GetProcAddress(py, "PyErr_Clear");
+        if (!pImport || !pAddMod || !pGetDict || !pGetAttr || !pCallObj ||
+            !pTuplePack || !pBytes || !pEval || !pSetAttr || !pDecRef ||
+            !pErrOcc || !pErrClear) {
+            _snprintf(err, cap - 1, "解释器导出缺失（引导装载）");
+            err[cap - 1] = 0;
+            diag_write("load", err, "", FALSE);
+            return -1;
+        }
+
+        /* runtime_root wstring → UTF-8（pk_x4 收窄字节路径，/ 分隔可移植） */
+        int na = WideCharToMultiByte(CP_UTF8, 0, runtime_root.c_str(), -1,
+                                     NULL, 0, NULL, NULL);
+        std::string root_a(na > 0 ? na : 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, runtime_root.c_str(), -1,
+                            &root_a[0], na, NULL, NULL);
+
+        /* 两段式：先探大小（NOBLOB = 明文包常态 → 静默跳过），再装载 */
+        unsigned long long need = 0;
+        int rc = px4(root_a.c_str(), NULL, 0, &need);
+        if (rc == -7) return 1;
+        if (rc == -2 && need > 0 && need <= PKKEY_BOOT_MAX) {
+            std::vector<unsigned char> buf((size_t)need);
+            rc = px4(root_a.c_str(), &buf[0], need, &need);
+            if (rc == 0) {
+                /* marshal.loads → exec → sys.modules 注入 → 打标记
+                   （PyImport_AddModule 返回值已自动入 sys.modules） */
+                void *mmod = pImport("marshal");
+                void *loads = mmod ? pGetAttr(mmod, "loads") : NULL;
+                void *bobj = loads ? pBytes((const char *)&buf[0], (long long)need) : NULL;
+                /* ★review 修复⑤★ 明文载荷即用即清（bytes 已持副本）——密文/明文
+                   缓冲清零纪律与 key.c pk_x4、Android engine.c 三端对齐（§7.2/G7） */
+                SecureZeroMemory(&buf[0], (size_t)need);
+                void *args = bobj ? pTuplePack((size_t)1, bobj) : NULL;
+                void *code = args ? pCallObj(loads, args) : NULL;
+                if (!code || pErrOcc()) {
+                    if (pErrOcc()) pErrClear();
+                    /* ★review 修复④b★ marshal 本身不可用 ≠ 载荷非法，文案分段 */
+                    _snprintf(err, cap - 1, "%s",
+                              (mmod && loads) ? "引导模块载荷非法"
+                                              : "解释器 marshal 不可用");
+                    err[cap - 1] = 0;
+                    diag_write("code_decrypt", err, "", FALSE);
+                    if (code) pDecRef(code);
+                    if (args) pDecRef(args);
+                    if (bobj) pDecRef(bobj);
+                    if (loads) pDecRef(loads);
+                    if (mmod) pDecRef(mmod);
+                    return -1;
+                }
+                void *mod = pAddMod("applocal._codekey");
+                void *dict = mod ? pGetDict(mod) : NULL;
+                void *bmod = pImport("builtins");
+                void *ttrue = bmod ? pGetAttr(bmod, "True") : NULL;
+                /* ★review 修复③★ PyEval_EvalCode 返回新引用（模块级 exec 结果，
+                   通常 Py_None）——接住并 DecRef，引用计数纪律与上文一致 */
+                void *eres = (dict && ttrue) ? pEval(code, dict, dict) : NULL;
+                int exec_ok = dict && ttrue && !pErrOcc();
+                if (eres) pDecRef(eres);
+                if (!exec_ok && pErrOcc()) pErrClear();
+                /* __pk_booted__ = 纯诊断标记（运行期无消费者，§5.6 文档记账）：
+                   调试器/日志可据此确认壳侧装载成功，SetAttr 失败不影响注入 */
+                if (exec_ok) pSetAttr(mod, "__pk_booted__", ttrue);
+                if (ttrue) pDecRef(ttrue);
+                if (bmod) pDecRef(bmod);
+                pDecRef(code);
+                pDecRef(args);
+                pDecRef(bobj);
+                pDecRef(loads);
+                pDecRef(mmod);
+                if (!exec_ok) {
+                    _snprintf(err, cap - 1, "引导模块执行失败");
+                    err[cap - 1] = 0;
+                    diag_write("code_decrypt", err, "", FALSE);
+                    return -1;
+                }
+                slog("codekey blob injected");
+                return 0;
+            }
+            /* ★review 修复⑤★ px4 第二遍失败路径：密文/部分数据缓冲亦清零后析构
+               （三端清零纪律对齐；成功路径的明文清零已提前到 pBytes 之后） */
+            SecureZeroMemory(&buf[0], (size_t)need);
+        }
+        /* pk_x4 失败语义映射（★review 修复④c★ CAP 超防御上限 ≠ 密文损坏；
+           AUTH = K 不配对/损坏；FORMAT/INTERNAL 同类。NOBLOB 正常路径已提前
+           返回，不可达分支已删） */
+        _snprintf(err, cap - 1, "引导模块解密失败（%s）",
+                  rc == -4 ? "密钥不配对" :
+                  rc == -2 ? "引导模块超限" : "密文损坏");
+        err[cap - 1] = 0;
+        diag_write("code_decrypt", err, "", FALSE);
+        return -1;
+    }
+}
+
 static void py_escape_entry(const char *in, char *out, size_t cap) {
     size_t o = 0;
     for (const char *p = in; *p && o + 2 < cap; p++) {
@@ -1053,7 +1230,7 @@ static void py_escape_entry(const char *in, char *out, size_t cap) {
 /* 返回 0 成功；失败返回 -1（已写 diag）。步骤 6/7/8 严格按协议顺序。 */
 static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
                        const char *app_version, const char *spk_hash_hex,
-                       char *err, size_t cap) {
+                       const char *code_key_id, char *err, size_t cap) {
     fn_Py_Initialize pInit;
     fn_Py_IsInitialized pIsInit;
     fn_PyRun_SimpleString pRun;
@@ -1106,6 +1283,17 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
     }
     slog("Py_Initialize ok");
     set_splash("正在初始化应用…");
+
+    /* ★期1 S3★ 引导装载：applocal/_codekey blob → sys.modules
+       （manifest 无 code_key_id = 明文包 → 零动作；-1 = 已写 diag，fail-closed） */
+    {
+        int brc = boot_load_codekey(py, g_runtime, code_key_id, err, cap);
+        if (brc < 0) return -1;
+        if (brc == 1)
+            slog("codekey boot skipped (plain or absent blob)");
+        else
+            set_splash("正在解密应用组件…");   /* ★review 修复④d★ 仅真装载才提示 */
+    }
 
     /* 步骤 8：entry 经 manifest.entry 传递（协议禁硬编码） */
     py_escape_entry(entry_utf8, entry_esc, sizeof(entry_esc));
@@ -1537,11 +1725,12 @@ static int run_shell(void) {
     ensure_window();
     slog("window up");
 
-    /* 步骤 6/7/8：LoadLibrary → 记账 → bootstrap → SaveThread */
+    /* 步骤 6/7/8：LoadLibrary → 记账 → 引导装载 → bootstrap → SaveThread */
     g_boot_start = GetTickCount();
     if (boot_python(doc.python_dll, doc.entry, doc.app_version,
                     strncmp(doc.spk_hash, "sha256:", 7) == 0 ? doc.spk_hash + 7
                                                              : doc.spk_hash,
+                    manifest_get(&doc, "code_key_id"),
                     err, sizeof(err)) != 0) {
         show_error_ui_at_startup(err, TRUE);
         return 2;

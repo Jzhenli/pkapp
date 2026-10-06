@@ -8,4 +8,5 @@ set_target_properties(libpython PROPERTIES
     IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libpython3.12.so)
 
 add_library(engine SHARED engine.c)
-target_link_libraries(engine log libpython)
+# dl：dlopen/dlsym（期2 引导装载 key-holder 件 lib_pkapp_key.so）
+target_link_libraries(engine log libpython dl)

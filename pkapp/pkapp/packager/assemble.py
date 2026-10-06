@@ -27,7 +27,8 @@ from ..toolchain import cache_root
 from ..util import SPK_DATE, atomic_write, copy_tree, tree_hash
 from . import manifest as mf
 from . import pe, runtime, sign, spk
-from .keylib import (KeyLib, KeyLibError, INDEX_FILE_NAME, INDEX_MODULE_ID,
+from .keylib import (KeyLib, KeyLibError, APPLOCAL_BOOT_MID, INDEX_FILE_NAME,
+                     INDEX_MODULE_ID,
                      blob_name, build_index_payload, ensure_code_key,
                      ensure_obf_key, locate_dll, module_id_for, patch_dll)
 from .runtime import RuntimeResolveError, RuntimeSnapshot
@@ -467,6 +468,93 @@ print("PYC-OK", "%d.%d.%d" % sys.version_info[:3], n,
       "renamed=%d" % R, "stripped=%d" % S, "strings=%d" % K)
 """
 
+# 单文件 pyc 编译子进程（_codekey blob 化专用；G5 纪律同 _COMPILE_CHILD——
+# 快照解释器 + PYTHONHASHSEED=0，子进程隔离 marshal ref-memo 不确定性）。
+# argv[1..4] = python_dll, src, out_pyc, dfile_rel。UNCHECKED_HASH 与
+# CHECKED_HASH 头在剥 16 字节后不参与任何语义（壳/finder 只吃 marshal 载荷）。
+_COMPILE_ONE = """\
+import sys, os, py_compile
+expected = os.path.basename(sys.argv[1])
+digits = "".join(c for c in expected if c.isdigit())
+if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
+    sys.exit(2)
+py_compile.compile(sys.argv[2], cfile=sys.argv[3], dfile=sys.argv[4],
+                   doraise=True, quiet=2,
+                   invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+"""
+
+
+def _dll_version_pair(python_dll: str) -> tuple[int, int]:
+    """从解释器本体文件名抽 (major, minor)：python312.dll / libpython3.12.so → (3,12)。
+
+    ★只对 basename 抽取★——完整路径里的目录数字（如 runtimes\\3.12\\）会污染
+    结果。文件名不足 3 位版本数字 → (0, 0)（形态未知的命名，调用方跳过校验）。
+    """
+    digits = "".join(c for c in os.path.basename(python_dll) if c.isdigit())
+    if len(digits) < 3:
+        return (0, 0)
+    return (int(digits[:-2]), int(digits[-2:]))
+
+
+def _ensure_same_runtime_version(win_version: str, android_version: str) -> None:
+    """加密 blob 的 pyc 版本绑定运行时 minor（marshal/bytecode 随 minor 变）——
+    Windows 快照解释器代编 Android 的 pyc，两端快照 minor 必须一致。
+
+    resolve 已各自锁"快照↔声明"；本函数锁"两端互等"。比较粒度 = major.minor
+    （marshal 兼容粒度；patchlevel 差异无碍）。不符直接 BuildError（fail-fast，
+    防静默产出运行期才炸的载荷）。
+    """
+    def minor(v: str) -> tuple[int, int]:
+        parts = (v.split(".") + ["0", "0"])[:2]
+        return (int(parts[0]), int(parts[1]))
+
+    if minor(win_version) != minor(android_version):
+        raise BuildError(
+            f"代码加密要求两端运行时 Python minor 版本一致：Windows 快照 "
+            f"{win_version} ≠ Android 快照 {android_version}——统一"
+            f" [platforms.*].python_version 后重新 fetch 快照")
+
+
+def _compile_one_pyc(python_exe: str | None, python_dll: str,
+                     src: str, out_pyc: str, dfile_rel: str) -> None:
+    """单文件 pyc 编译：快照解释器子进程优先，mock 快照回退打包机解释器。
+
+    site-packages 恒只带 .py（★v0.7★）——不能走整树编译（__pycache__ 副产物
+    污染 site-packages），_codekey blob 化前单独编这一个文件到临时区。
+    """
+    if python_exe and python_dll and os.path.isfile(python_exe):
+        try:
+            r = subprocess.run(
+                [python_exe, "-c", _COMPILE_ONE, python_dll, src, out_pyc,
+                 dfile_rel],
+                capture_output=True, text=True, timeout=120,
+                env={k: v for k, v in os.environ.items()
+                     if not k.startswith("PYTHON")} |
+                    {"PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1"})
+        except OSError:            # mock 占位 python.exe：不可执行 → 回退
+            r = None
+        if r is not None:
+            if r.returncode == 2:
+                raise BuildError(f"快照解释器版本与 {python_dll} 不符，快照损坏:"
+                                 f"\n{r.stderr[-2000:]}")
+            if r.returncode != 0:
+                raise BuildError(f"_codekey pyc 编译失败:\n"
+                                 f"{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+            return
+    # ★review 后补防线 B★ 回退打包机解释器：打包机版本必须与 python_dll 名
+    # 一致（子进程比对不再兜底）——否则静默编出运行期才炸的 marshal 载荷。
+    # 文件名形态未知（抽不出版本）则维持旧行为不阻塞。
+    if python_dll:
+        pair = _dll_version_pair(python_dll)
+        if pair != (0, 0) and pair != sys.version_info[:2]:
+            raise BuildError(
+                f"打包机解释器 {sys.version_info[:2]} 与运行时 {python_dll} "
+                f"版本不符（{_dll_version_pair(python_dll)}）——注册匹配快照"
+                f"或改用打包机同版运行时，避免产出运行期不兼容的 pyc 载荷")
+    py_compile.compile(src, cfile=out_pyc, dfile=dfile_rel, doraise=True,
+                       quiet=2,
+                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+
 
 def _placeholder_ui(ui_dir: str) -> None:
     os.makedirs(ui_dir, exist_ok=True)
@@ -556,8 +644,8 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         #     缺省关闭 → 本步骤整体跳过，G6 零回归）
         code_key_id = ""
         if spec.code_encryption:
-            code_key_id = _encrypt_app_tree(app_stage, snapshot.python_dll,
-                                            project_dir)
+            code_key_id = _encrypt_app_tree(stage, _snapshot_exe,
+                                            snapshot.python_dll, project_dir)
 
         # 8) 树哈希 + manifest + 签名 + spk（闭包自检扫描域含 app/，Q5）
         check_closure(stage, snapshot.python_dll, extra_dirs=(app_stage,))
@@ -574,7 +662,8 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         shutil.rmtree(lib_work, ignore_errors=True)
 
 
-def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
+def _encrypt_app_tree(stage: str, python_exe: str | None, python_dll: str,
+                      project_dir: str) -> str:
     """代码加密主步骤（CODE_PROTECTION_DESIGN §6.1）——app/ 树 pyc → 加密 blob。
 
     流程：ensure_code_key（Q1 自动 keygen）→ 逐模块 剥 16 字节 pyc 头 →
@@ -583,9 +672,14 @@ def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
     明文不允许越过"已验证密文"这道闸）→ 全量完成后落加密清单 index.enc + 删明文闸。
     非 .py 资源明文保留（Q2）。返回 code_key_id（manifest 写入，§7.3 配对校验）。
 
+    尾部追加 ★期1 S2：_codekey 密文化★（解密根出 Python 明文面，§5.6）——
+    同一补丁件 kl / 同一 K 加密 site-packages/applocal/_codekey.py 为引导 blob，
+    运行期壳经 keylib pk_x4 装载（装载语义归壳，keylib 停在 marshal.loads 之前）。
+
     G5 依赖链：pyc 载荷（PYTHONHASHSEED=0 子进程编译 + dfile=rel）与 nonce
     （HMAC(K, mid)）双确定性 → 密文字节跨构建稳定 → app_hash 不变。
     """
+    stage_app = os.path.join(stage, "app")
     dll_path = locate_dll("windows")
     if not dll_path:
         raise BuildError(
@@ -614,9 +708,65 @@ def _encrypt_app_tree(stage_app: str, python_dll: str, project_dir: str) -> str:
             kl = KeyLib(patched)
         except KeyLibError as e:
             raise BuildError(str(e)) from e
-        return _encrypt_app_tree_inner(stage_app, kl, key, pyc_tag)
+        code_key_id = _encrypt_app_tree_inner(stage_app, kl, key, pyc_tag)
+        # ★期1 S2★ 解密器自身密文化（同一 kl/同一 K；applocal 引导 blob 独立
+        # 于 app/ 清单，壳侧 pk_x4 按固定 mid 定位）
+        _encrypt_applocal_boot(stage, kl, key, python_exe, python_dll)
+        return code_key_id
     finally:
         shutil.rmtree(patch_dir, ignore_errors=True)
+
+
+def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
+                           python_exe: str | None, python_dll: str) -> None:
+    """★期1 S2★ applocal 解密器密文化——解密根出 Python 明文面（§5.6）。
+
+    _codekey.py → 快照解释器单文件 pyc（UNCHECKED_HASH，剥头后无语义差别）→
+    剥 16 字节头 → pk_x1(K, APPLOCAL_BOOT_MID) 加密 → 回验闸（解密回读一致 +
+    marshal 载荷为 code object，纪律同 app/ 加密）→ 落
+    site-packages/applocal/<blob_name(mid)> → 才删明文 _codekey.py。
+    运行期：壳调 keylib pk_x4 定位并解密（停在 marshal.loads 之前）→ 壳 C 层
+    marshal/exec 注入 sys.modules。mid/blob 名公式与 key.c 逐位一致（k_m1/k_m2
+    偏置拼装 + sha256），漂移由 test_keylib blob_name 对拍拦截。
+    明文包（code_encryption=false）不走本函数——壳侧 pk_x4 NOBLOB 静默跳过，
+    Python 侧常规 wheel 装入的明文 _codekey 照常工作（双形态兼容）。
+    """
+    sp_applocal = os.path.join(stage, "site-packages", "applocal")
+    src = os.path.join(sp_applocal, "_codekey.py")
+    if not os.path.isfile(src):
+        raise BuildError("applocal 缺 _codekey.py（解密器密文化无从进行）——"
+                         "applocal wheel 缺失或版本不符，请检查依赖收集")
+    with tempfile.TemporaryDirectory(prefix="pkapp-ckey-") as td:
+        pyc = os.path.join(td, "codekey.pyc")
+        _compile_one_pyc(python_exe, python_dll, src, pyc,
+                         "applocal/_codekey.py")
+        with open(pyc, "rb") as f:
+            raw = f.read()
+    if len(raw) <= 16:
+        raise BuildError("_codekey pyc 过短（不足 16 字节头）")
+    payload = raw[16:]                          # 剥 pyc 头 = marshal 载荷（§5.3）
+    try:
+        blob = kl.encrypt(key, APPLOCAL_BOOT_MID, payload)
+    except KeyLibError as e:
+        raise BuildError(f"_codekey 加密失败: {e}") from e
+    # 回验闸：GCM 打开 + marshal 载荷合法，才允许删明文（顺序硬约束同 app/）
+    try:
+        back = kl.decrypt(APPLOCAL_BOOT_MID, blob)
+    except KeyLibError as e:
+        raise BuildError(f"_codekey 加密回验解密失败: {e}") from e
+    if back != payload:
+        raise BuildError("_codekey 加密回验不一致（密文与明文不符）")
+    try:
+        code = marshal.loads(back)
+    except Exception as e:
+        raise BuildError(f"_codekey 载荷 marshal 校验失败: {e}") from e
+    if not isinstance(code, types.CodeType):
+        raise BuildError("_codekey 载荷非 code object")
+    with open(os.path.join(sp_applocal, blob_name(APPLOCAL_BOOT_MID)), "wb") as f:
+        f.write(blob)
+    os.remove(src)
+    print(f"[build] applocal/_codekey 已密文化（解密根出明文面，"
+          f"{len(payload)}B → {blob_name(APPLOCAL_BOOT_MID)}）")
 
 
 def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
@@ -781,12 +931,18 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
             _placeholder_ui(os.path.join(stage, "ui"))
         # 3) app/ checked-hash pyc（B.u）。android 快照无 python.exe——借用 windows 快照解释器
         #   （版本哨兵按 python_dll 名校验 3.12 == 3.12，pyc 字节与平台无关）；
-        #   项目未注册 windows 快照时回退打包机解释器（pyc 版本标签可能与运行时不符）。
+        #   两端快照版本互等由防线 A 锁定；未注册 windows 快照时回退打包机解释器，
+        #   版本比对由防线 B 锁定（不符 BuildError，不再静默）。
         #   site-packages 恒只带 .py（★v0.7★：目录树首启自动建 __pycache__，零副作用）。
         pyc_exe = None
         try:
             win = runtime.resolve(spec, "windows")
             pyc_exe = os.path.join(win.dir, "python.exe")
+            # ★review 后补防线 A★ Windows 快照代编 Android 的 pyc——两端快照
+            # 版本互等（resolve 已各自锁"快照↔声明"，这里锁两端）。
+            if spec.code_encryption:
+                _ensure_same_runtime_version(win.python_version,
+                                             snapshot.python_version)
         except RuntimeResolveError:
             pass
         # ★§13.3③ S7★ 混淆开启 → 先取混淆密钥（.pkapp/obf.key，与 code.key 平行互不依赖）
@@ -806,7 +962,7 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         #     后进 APK jniLibs（§5.5，APK 签名覆盖其完整性）。
         code_key_id = ""
         if spec.code_encryption:
-            code_key_id = _encrypt_app_tree(os.path.join(stage, "app"),
+            code_key_id = _encrypt_app_tree(stage, pyc_exe,
                                             snapshot.python_dll, project_dir)
 
         # 4) manifest + 签名 + spk

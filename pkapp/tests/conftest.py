@@ -73,6 +73,9 @@ def wheels_dir(tmp_path):
     os.makedirs(wd)
     make_wheel(wd, "applocal", "0.1.0", {
         "applocal/__init__.py": '__version__ = "0.1.0"\n',
+        # ★期1 S2★ 解密器密文化的输入位（_encrypt_applocal_boot 契约：
+        # code_encryption=true 时 site-packages/applocal/_codekey.py 必在）
+        "applocal/_codekey.py": '"""code-key boot (test stub)."""\nSTUB = 1\n',
     })
     make_wheel(wd, "certifi", "2024.1.1", {
         "certifi/__init__.py": "from .core import where\n",

@@ -4,8 +4,15 @@
  *   构建/打包期 通用件（K 未内嵌）：pk_x1() 以显式 key32 参数加密（构建工具 ctypes 调用）；
  *   运行期     补丁件（K 内嵌）：package 期把 K 的异或包裹态经锚点补丁写入 g_stored，
  *              pk_x2() 栈上展开使用、用后清零；pk_x3() 做配对校验。
- * ★导出名无意义化★（2026-10 防逆向强化）：x1/x2/x3 不再自述"加密逻辑在这"，
+ * ★导出名无意义化★（2026-10 防逆向强化）：x1/x2/x3/x4 不再自述"加密逻辑在这"，
  *   strings/导出表扫不出语义；语义对照仅存于本注释与设计文档 §5.2。
+ *
+ * pk_x4（2026-10，applocal 引导装载，★停在 marshal.loads 之前★）：
+ *   运行期壳/启动器调用——从 runtime_root 定位 applocal 解密器 blob（文件名 =
+ *   sha256(mid) hex + ".enc"，mid 不落明文：两块分散常量运行时栈上拼装），
+ *   读取后复用 pk_x2 解密，输出裸 marshal 字节。装载语义（marshal/exec/注入
+ *   sys.modules）归壳——keylib 不碰解释器 API，保持零依赖独立件与 Android
+ *   可构建性；协议知识（mid/AAD/blob 布局/路径）单点收敛在此。
  *
  * blob 格式（§5.3，共 +33 字节/blob）：
  *   magic(4)='PKK1' | ver(1) | nonce(12) | ciphertext | tag(16)
@@ -60,6 +67,19 @@ PKKEY_API int pk_x2(
  * 导出名 pk_x3：无语义标签（2026-10 改名）。 */
 PKKEY_API const char *pk_x3(void);
 
+/* applocal 引导装载（停在 marshal.loads 之前）：从 runtime_root 定位
+ * "<root>/site-packages/applocal/<sha256(mid) hex>.enc"（mid 见 key.c 分散常量），
+ * 读文件 → 复用 pk_x2 解密（AAD 绑定 mid）→ 输出裸 marshal 字节。
+ * 两段式：第一遍 out_cap=0（out 可 NULL）→ 返回 PKKEY_E_CAP 且 *out_len 回填
+ * 必需大小；调用方分配后第二遍真装载。
+ * 返回 PKKEY_E_NOBLOB = blob 不可得（明文包常态，壳应静默跳过；加密包删 blob
+ * 不构成降级——明文 _codekey.py 已从包中移除，Python import 必失败 fail-closed）。
+ * 导出名 pk_x4：无语义标签（2026-10 命名纪律同 x1/x2/x3）。 */
+PKKEY_API int pk_x4(
+    const char *runtime_root,
+    unsigned char *out, unsigned long long out_cap,
+    unsigned long long *out_len);
+
 #ifdef __cplusplus
 }
 #endif
@@ -78,7 +98,8 @@ PKKEY_API const char *pk_x3(void);
 #define PKKEY_E_FORMAT      (-3)   /* blob 头非法（magic/ver/长度） */
 #define PKKEY_E_AUTH        (-4)   /* GCM 认证失败（损坏 / AAD 不符 / K 不配对） */
 #define PKKEY_E_DEBUGGER    (-5)   /* 反调试命中（§5.4⑤；默认构建不编入，仅 /DPKAPP_ANTIDEBUG 开启后可能返回） */
-#define PKKEY_E_INTERNAL    (-6)   /* 内部不变量违例 */
+#define PKKEY_E_INTERNAL    (-6)   /* 内部不变量违例（读文件/内存失败等） */
+#define PKKEY_E_NOBLOB      (-7)   /* blob 不可得（明文包常态；壳据此静默跳过，勿作错误上报） */
 
 /* k_s2：包裹态第二输入块（key.c 内单独落在 SHA-256 实现段之后，与
  * k_seed_stored/k_s1 所在的 K 内嵌段分离，抬高集齐三块的通读成本；

@@ -34,6 +34,12 @@ ANCHOR_HEX = "c47f1a93e5b28d603ad9f641075ce82b961d74af30cb58e26f039ad148b725ec"
 MASK_SEED_HEX = "7b1d94e0c3a26f58d0b47f19ae2c65380fe7d1a49b62c8053f47e9d1b0a6c258"
 
 BLOB_OVERHEAD = 33          # magic(4)+ver(1)+nonce(12)+tag(16)（§5.3）
+
+# applocal 解密器 blob 的 module id（期1 S2：解密根出 Python 明文面）。
+# 单源契约：构建侧（_encrypt_applocal_boot 加密/回验）与壳侧 keylib pk_x4
+# （key.c k_m1/k_m2 偏置分散存储、运行时栈上拼装）共用——C 侧不含明文，
+# 漂移由 test_keylib 的 blob_name 对拍 + mid strings 0 命中断言双重拦截。
+APPLOCAL_BOOT_MID = "applocal._codekey"
 INDEX_MODULE_ID = "app.__index__"   # 加密清单的 AAD 身份（finder 以它开清单）
 INDEX_FILE_NAME = "index.enc"       # 清单落盘名（§6.1 step3；finder 同名开清单）
 INDEX_MAGIC = "PKIDX1"

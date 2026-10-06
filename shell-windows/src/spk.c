@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ---------- 小端读取 ---------- */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -18,7 +21,21 @@ static uint32_t rd32(const uint8_t *p) {
 
 /* ---------- 文件读入 ---------- */
 static uint8_t *read_all(const char *path, size_t *out_len, const char **err) {
-    FILE *f = fopen(path, "rb");
+    FILE *f;
+#ifdef _WIN32
+    /* ★review 修复①延伸★ fopen 在 MSVC 是 ANSI（CP_ACP）语义——壳把宽路径
+     * 转成 UTF-8 窄字节传来，中文安装路径（GBK 代码页）被误读必挂；
+     * 转回宽字符走 _wfopen（与 keylib pk_x4 同一纪律）。 */
+    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    wchar_t wpath[1024];
+    if (wn > 0 && wn <= (int)(sizeof wpath / sizeof wpath[0]) &&
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn) == wn)
+        f = _wfopen(wpath, L"rb");
+    else
+        f = NULL;
+#else
+    f = fopen(path, "rb");
+#endif
     uint8_t *buf;
     long sz;
     if (!f) { *err = "spk 无法打开"; return NULL; }

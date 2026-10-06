@@ -90,7 +90,14 @@ class MainActivity : Activity() {
         logFile = File(logDir, "$appName-${java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())}.log")
 
         buildUi()
-        startService(Intent(this, BootService::class.java))
+        // BootService 本身 startForeground（通知栏保活）——startForegroundService 才是
+        // 与其实现匹配的启动方式；Android 12+ 后台启动限制下 startService 直接抛
+        // BackgroundServiceStartNotAllowedException 炸掉 onCreate（实测 Motorola adb
+        // 后台启动必炸）。前台/豁免场景恒成功；异常兜底仅损失保活通知，不阻断引导。
+        try {
+            startForegroundService(Intent(this, BootService::class.java))
+        } catch (_: Exception) {
+        }
         Thread { boot() }.start()
     }
 
@@ -224,6 +231,11 @@ class MainActivity : Activity() {
                 // MYAPP_PORT 不注入（★v1.2★）：端口偏好走 manifest network_port（打包期 [network].port）
                 "MYAPP_VERSION=${mf.version}",
                 "MYAPP_MANIFEST_PATH=${File(runtimeDir, "manifest")}",
+                // ★期2★ 引导装载通道：runtime 根（pk_x4 定位 <root>/site-packages/applocal/
+                // 的 .enc blob）+ code_key_id（manifest 驱动跳过——C 层不重复解析
+                // manifest，MainActivity 是 Android 壳的 manifest 读取点；空 = 明文包）
+                "MYAPP_RUNTIME_DIR=$runtimeDir",
+                "MYAPP_CODE_KEY_ID=${mf.codeKey}",
                 "MYAPP_NATIVE_LIB_DIR=${applicationInfo.nativeLibraryDir}",
                 "MYAPP_STRICT_AUTH=1",
                 "MYAPP_HANDSHAKE_FILE=$handshakeFile",
@@ -388,7 +400,8 @@ class MainActivity : Activity() {
             version = map["app_version"] ?: "",
             entry = map["entry"] ?: throw IllegalStateException("manifest 缺 entry"),
             spkHash = (map["spk_hash"] ?: "").removePrefix("sha256:"),
-            minVersion = map["min_app_version"] ?: "")
+            minVersion = map["min_app_version"] ?: "",
+            codeKey = map["code_key_id"] ?: "")   // ★期2★ 可选扩展键（明文构建无此键）
     }
 
     private fun readFingerprint(): Pair<String, String>? = try {
@@ -497,7 +510,8 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- 工具
     private data class ReadyInfo(val ready: Boolean, val port: Long, val seq: Long)
     private data class ManifestInfo(
-        val version: String, val entry: String, val spkHash: String, val minVersion: String)
+        val version: String, val entry: String, val spkHash: String,
+        val minVersion: String, val codeKey: String)
 
     /** 迷你解析；文件不存在/解析失败按"未就绪/序列不变"处理（项目硬约束）。 */
     private fun readReady(): ReadyInfo? = try {

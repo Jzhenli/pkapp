@@ -20,7 +20,7 @@ import types
 
 import pytest
 
-from pkapp.packager import keylib
+from pkapp.packager import assemble, keylib
 from pkapp.packager.keylib import KeyLib, KeyLibError
 
 _DLL = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -259,6 +259,12 @@ def _make_stage_app(tmp_path):
     (app / "sub" / "x.py").write_text("N = 42\n", encoding="utf-8")
     (app / "data.bin").write_bytes(b"\x00\x01plaintext-resource")   # 非 .py 明文保留
     _compile_stage_app(str(app))
+    # ★期1 S2★ _codekey 密文化的输入位（staging site-packages/applocal；
+    # 最小合法源码即可——回验只校验 marshal 载荷合法性，不关心内容）
+    ck = tmp_path / "site-packages" / "applocal"
+    ck.mkdir(parents=True)
+    (ck / "_codekey.py").write_text(
+        '"""pkapp code-key boot (stage stub)."""\nSTUB = 1\n', encoding="utf-8")
     return app
 
 
@@ -274,7 +280,7 @@ def test_encrypt_app_tree_stage_contract(lib, tmp_path):
     key_file.parent.mkdir(parents=True)
     key_file.write_text(key.hex(), encoding="ascii")
 
-    kid = _encrypt_app_tree(str(app), _RUNTIME_DLL, str(project))
+    kid = _encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, str(project))
     assert kid == keylib.key_id_hex(key)               # manifest code_key_id 配对值
 
     # 逐 blob：补丁件（K 内嵌 = 运行期形态）解密 → marshal 载荷合法 + co_filename 归一
@@ -301,6 +307,15 @@ def test_encrypt_app_tree_stage_contract(lib, tmp_path):
     assert (app / "data.bin").read_bytes() == b"\x00\x01plaintext-resource"
     assert not any(os.path.basename(dp) == "__pycache__" and os.listdir(dp)
                    for dp, _dn, _fn in os.walk(str(app)))
+    # ★期1 S2★ _codekey 密文化：明文已删、引导 blob 落位、补丁件可开
+    sp_ck = tmp_path / "site-packages" / "applocal"
+    ck_blob = sp_ck / keylib.blob_name(keylib.APPLOCAL_BOOT_MID)
+    assert ck_blob.is_file()
+    assert not (sp_ck / "_codekey.py").exists()
+    ck_code = marshal.loads(patched.decrypt(keylib.APPLOCAL_BOOT_MID,
+                                            ck_blob.read_bytes()))
+    assert isinstance(ck_code, types.CodeType)
+    assert ck_code.co_filename == "applocal/_codekey.py"
     # K 文件未被触碰（读取路径不重生成）
     assert key_file.read_text(encoding="ascii") == key.hex()
 
@@ -321,7 +336,7 @@ def test_encrypt_app_tree_missing_dll(tmp_path, monkeypatch):
     monkeypatch.setattr(assemble, "locate_dll", lambda p: None)
     (tmp_path / ".pkapp").mkdir()
     with pytest.raises(assemble.BuildError, match="key-holder"):
-        assemble._encrypt_app_tree(str(tmp_path / "app"), _RUNTIME_DLL,
+        assemble._encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL,
                                    str(tmp_path))
 
 
@@ -549,7 +564,7 @@ def _encrypted_deploy(base, tmp_path, key: bytes) -> str:
     (project / ".pkapp").mkdir(parents=True)
     (project / ".pkapp" / "code.key").write_text(key.hex(), encoding="ascii")
     from pkapp.packager.assemble import _encrypt_app_tree
-    _encrypt_app_tree(str(base / "runtime" / "app"), _RUNTIME_DLL, str(project))
+    _encrypt_app_tree(str(base / "runtime"), None, _RUNTIME_DLL, str(project))
     (tmp_path / "patchwork").mkdir(exist_ok=True)
     return _patched_copy(tmp_path / "patchwork", key)    # 运行期形态 = K 内嵌
 
@@ -671,3 +686,113 @@ def test_codekey_index_missing_is_code_decrypt(shell_env, tmp_path, monkeypatch,
     d = _read_diag(shell_env)
     assert d["stage"] == "code_decrypt"
     assert d["error"] == ck.NEUTRAL
+
+
+# ---------------------------------------------------------------- ★期1 S5★
+# pk_x4 引导装载契约（keylib 停在 marshal.loads 之前；壳侧消费方见 shell.cpp
+# boot_load_codekey）——ctypes 直调补丁件，无解释器依赖，锁定双端协议。
+
+
+def _px4(patched: str):
+    """pk_x4 ctypes 绑定：返回 (dll, call(runtime_root, buf_or_None, cap) -> (rc, need, out))。"""
+    dll = ctypes.CDLL(patched)
+    dll.pk_x4.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_ubyte),
+                          ctypes.c_ulonglong,
+                          ctypes.POINTER(ctypes.c_ulonglong)]
+    dll.pk_x4.restype = ctypes.c_int
+
+    def call(root: str, cap: int | None):
+        need = ctypes.c_ulonglong(0)
+        buf = (ctypes.c_ubyte * cap)() if cap else None
+        rc = dll.pk_x4(root.encode("utf-8"), buf, cap or 0, ctypes.byref(need))
+        out = bytes(bytearray(buf))[:need.value] if (buf and rc == 0) else None
+        return rc, need.value, out
+
+    return dll, call
+
+
+def test_pk_x4_boot_contract(tmp_path):
+    """pk_x4 两段式装载 ≡ pk_x1 原载荷（同补丁件 K 内嵌同源）+ 三负例路径 +
+    blob 名公式 Python↔C 对拍（key.c sha256(mid) 定位漂移在此拦截）。"""
+    key = hashlib.sha256(b"boot-key").digest()
+    patched = _patched_copy(tmp_path, key)
+    kl = KeyLib(patched)
+    mid = keylib.APPLOCAL_BOOT_MID
+    payload = marshal.dumps(compile("X = 1\n", "applocal/_codekey.py", "exec"))
+    blob = kl.encrypt(key, mid, payload)
+
+    # blob 名公式：C 侧定位（k_m1‖k_m2 还原 mid → sha256 hex + .enc）与 Python
+    # 单源常量逐位一致——"applocal._codekey" 任一端漂移 = NOBLOB 全链失败
+    assert keylib.blob_name(mid) == hashlib.sha256(
+        mid.encode("utf-8")).hexdigest() + ".enc"
+
+    root = tmp_path / "runtime"
+    (root / "site-packages" / "applocal").mkdir(parents=True)
+    (root / "site-packages" / "applocal" / keylib.blob_name(mid)).write_bytes(blob)
+    _, call = _px4(patched)
+
+    rc, need, _ = call(str(root), 0)                    # 两段式第一遍：探大小
+    # need = 解密后载荷大小（blob − BLOB_OVERHEAD）——pk_x4 输出裸 marshal 载荷
+    assert rc == -2 and need == len(payload) == len(blob) - keylib.BLOB_OVERHEAD
+    rc, need, out = call(str(root), need)               # 第二遍：装载
+    assert rc == 0 and out == payload                   # 裸 marshal 载荷（剥头后）
+
+    rc, _, _ = call(str(tmp_path / "absent"), 0)        # NOBLOB：明文包常态
+    assert rc == -7
+    rc, need, _ = call(str(root), need - 1)             # cap 不足 → -2 回填载荷大小
+    assert rc == -2 and need == len(payload)
+    bp = root / "site-packages" / "applocal" / keylib.blob_name(mid)
+    data = bytearray(bp.read_bytes())
+    data[-1] ^= 0xFF                                    # GCM tag 翻转（过 FORMAT 达 AUTH）
+    bp.write_bytes(bytes(data))
+    rc, _, _ = call(str(root), need)                    # AUTH：K 不配对/损坏
+    assert rc == -4
+    bp.write_bytes(blob)
+    rc, _, out = call(str(root), need)                  # 修复后恢复装载
+    assert rc == 0 and out == payload
+
+
+def test_mid_not_in_dll_strings():
+    """mid 明文/片段在 keylib 二进制 strings 面 0 命中（k_m1/k_m2 偏置分散纪律；
+    S1 实测：static const 明文会被 MSVC 优化器折叠进 .rdata——此断言防回归）。
+    "/site-packages/applocal/" 目录布局片段允许存在（包目录结构本可见，非 mid）。"""
+    raw = open(_DLL, "rb").read()
+    assert b"applocal._codekey" not in raw              # 完整 mid
+    assert b"applocal." not in raw                      # k_m1 还原形（偏置前明文）
+    assert b"_codekey" not in raw                       # k_m2 还原形
+
+
+# ------------------------------------------------------- ★review 后补防线★
+
+
+def test_dll_version_pair():
+    """dll 名版本抽取：双平台命名 + basename 纪律（路径目录数字不污染）+ 异形态。"""
+    assert assemble._dll_version_pair("python312.dll") == (3, 12)
+    assert assemble._dll_version_pair("libpython3.12.so") == (3, 12)
+    assert assemble._dll_version_pair(os.path.join("D:", "rt", "3.13",
+                                                   "python312.dll")) == (3, 12)
+    assert assemble._dll_version_pair("python.dll") == (0, 0)   # 无版本数字
+
+
+def test_compile_one_pyc_fallback_version_guard(tmp_path):
+    """防线 B：回退打包机解释器时，打包机版本必须与 python_dll 名一致
+    （不符 fail-fast——此前是注释声明过的静默风险）。同版 dll 名正常编译。"""
+    src = tmp_path / "m.py"
+    src.write_text("X = 1\n", encoding="utf-8")
+    bad = f"python{sys.version_info[0]}{sys.version_info[1] + 1}.dll"
+    with pytest.raises(assemble.BuildError, match="版本不符"):
+        assemble._compile_one_pyc(None, bad, str(src),
+                                  str(tmp_path / "m.pyc"), "m.py")
+    ok = f"python{sys.version_info[0]}{sys.version_info[1]}.dll"
+    assemble._compile_one_pyc(None, ok, str(src),
+                              str(tmp_path / "m.pyc"), "m.py")
+    assert isinstance(marshal.loads((tmp_path / "m.pyc").read_bytes()[16:]),
+                      types.CodeType)
+
+
+def test_ensure_same_runtime_version():
+    """防线 A：Windows 代编 Android pyc 的两端版本互等（比较粒度 minor——
+    marshal 兼容粒度；patchlevel 差异放行）。"""
+    assemble._ensure_same_runtime_version("3.12.14", "3.12.7")   # minor 同 → 放行
+    with pytest.raises(assemble.BuildError, match="minor 版本一致"):
+        assemble._ensure_same_runtime_version("3.12.14", "3.13.1")

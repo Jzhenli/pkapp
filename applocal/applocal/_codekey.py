@@ -11,6 +11,12 @@ diag 跳过，避免把中性记录覆盖成技术文案。
 导入纪律：仅在 bootstrap 内、整个 applocal 导入链完成后被导入（_core 惰性 import），
 ctypes/marshal 可安全进模块级——不适用 _ndk.py 的最早期约束。find_spec 内禁止任何
 import（_ndk 同纪律：find_spec 会在其它模块导入中途被递归调用）。
+★期2 壳直引形态（§5.6）★：壳解密注入后本模块先于 `import applocal` 执行——
+`from ._core import diag` 必须排在所有扩展件导入（ctypes→_ctypes、hashlib→
+_hashlib）之前：Android 扩展件带 lib 前缀，NdkExtFinder 由 applocal/__init__ 在
+包导入最先注册，包链未载时拉扩展件必 ModuleNotFoundError（真机实测）；且 hashlib
+早导入会缓存无 _hashlib 后端的残废模块（blob_path 运行期 sha256 必炸）。包链已
+载的原惰性场景（applocal 在 sys.modules）该顺序无感。
 
 跨包契约：索引/blob 常量与载荷格式的契约源是 pkapp.packager.keylib
 （INDEX_MAGIC / INDEX_FILE_NAME / INDEX_MODULE_ID / BLOB_OVERHEAD /
@@ -19,16 +25,16 @@ build_index_payload docstring）；本文件为运行期镜像，勿单方改动
 """
 from __future__ import annotations
 
-import hashlib
 import importlib.machinery
 import importlib.util
 import marshal
 import os
 import sys
 import traceback
-from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_size_t, create_string_buffer
 
 from ._core import diag
+from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_size_t, create_string_buffer
+import hashlib
 
 NEUTRAL = "应用组件缺失或不完整，请重新安装或更新应用"   # §7.3 Q3：错误页唯一文案（勿改）
 
