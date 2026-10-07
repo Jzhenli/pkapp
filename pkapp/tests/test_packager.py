@@ -586,7 +586,8 @@ def test_build_string_obfuscated(project, wheels_dir, tmp_path):
     assert "not-the-helper-name" not in strs             # Compare 比较元已加密
     assert "/api/v1/very-long-route-path" in strs        # 装饰器参数豁免原样
     assert "/default-long-value-xyz" in strs             # 默认参数豁免原样
-    assert "/api/hello" in strs                          # 短串（<16）原样
+    assert "/api/hello" not in strs                      # ★P1.5★ 10 字符入加密面
+    assert "token" in strs and "hit" in strs             # 短串（<8）原样
     assert _has_stub(code)                               # 惰性解密 stub 已注入
     assert any(x.startswith("_o") for x in _collect_local_names(code))
     # G5②闭合环：obf.key + keystream(key32, module_id=co_filename, len) 规格推算
@@ -637,3 +638,98 @@ def test_build_string_obfuscated_and_encrypted(project, wheels_dir, tmp_path,
     assert "/api/v1/very-long-route-path" in strs        # 路由路径合同豁免
     assert _has_stub(code)
     assert any(x.startswith("_o") for x in _collect_local_names(code))
+
+
+# ---------------------------------------------------------------- RFT 跨模块统一改名（§4.1 P1）
+_XMOD_MAIN = '''\
+"""entry stub."""
+import json
+
+import app.pkg1 as p1
+from app.pkg2 import combine
+
+
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    body = json.dumps({"r": p1.do_task(2), "c": combine(3, 4)}).encode()
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": body})
+'''
+_XMOD_PKG1 = "def do_task(x):\n    y = x * 10\n    return y + 1\n"
+_XMOD_PKG2 = "def combine(a, b):\n    return a + b\n"
+
+
+def test_build_xmod_rename_pipeline(project, wheels_dir, tmp_path):
+    """★RFT★ 多模块构建链：build_rename_plan 全局改名 → pyc → 手工接线
+    sys.modules（依赖先于 main）→ ASGI 直调行为等价 + 原符号清零 + G5 双跑一致。"""
+    import asyncio
+    import json
+    import marshal
+    import sys
+
+    for rel, text in (("main.py", _XMOD_MAIN), ("pkg1.py", _XMOD_PKG1),
+                      ("pkg2.py", _XMOD_PKG2)):
+        with open(os.path.join(project, "app", rel), "w", encoding="utf-8") as f:
+            f.write(text)
+    _enable_code_obfuscation(project)
+    out1, out2 = str(tmp_path / "x1.spk"), str(tmp_path / "x2.spk")
+    _build(project, wheels_dir, out1)
+    raws, pycs = {}, {}
+    with zipfile.ZipFile(out1) as zf:
+        for n in zf.namelist():
+            # 仅混淆（无加密）→ app/ 恒保留源码 + __pycache__ checked-hash pyc
+            if n.startswith("app/__pycache__/") and n.endswith(".pyc"):
+                raws[n] = zf.read(n)
+                pycs[n] = marshal.loads(raws[n][16:])       # 剥 16 字节 pyc 头
+    assert set(pycs) == {
+        "app/__pycache__/__init__.cpython-312.pyc",
+        "app/__pycache__/main.cpython-312.pyc",
+        "app/__pycache__/pkg1.cpython-312.pyc",
+        "app/__pycache__/pkg2.cpython-312.pyc"}
+
+    created = []
+    try:
+        for mid in ("app", "app.pkg1", "app.pkg2", "app.main"):
+            m = types.ModuleType(mid)
+            m.__package__ = mid
+            if mid != "app.main":
+                m.__path__ = []                             # 包语义（相对导入可解析）
+            sys.modules[mid] = m
+            created.append(mid)
+        setattr(sys.modules["app"], "pkg1", sys.modules["app.pkg1"])
+        setattr(sys.modules["app"], "pkg2", sys.modules["app.pkg2"])
+        exec(pycs["app/__pycache__/pkg1.cpython-312.pyc"], sys.modules["app.pkg1"].__dict__)
+        exec(pycs["app/__pycache__/pkg2.cpython-312.pyc"], sys.modules["app.pkg2"].__dict__)
+        exec(pycs["app/__pycache__/main.cpython-312.pyc"], sys.modules["app.main"].__dict__)
+        asgi = sys.modules["app.main"].app
+        assert asgi.__name__ == "app"                       # entry 保护对：入口名不动
+        msgs = []
+
+        async def _receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def _send(m):
+            msgs.append(m)
+
+        asyncio.run(asgi({"type": "http", "path": "/x"}, _receive, _send))
+        assert json.loads(msgs[-1]["body"]) == {"r": 21, "c": 7}
+    finally:
+        for mid in created:
+            sys.modules.pop(mid, None)
+
+    # 原符号清零：定义模块原名消失；main 链改写（attr 名进 co_names）
+    assert "do_task" not in pycs["app/__pycache__/pkg1.cpython-312.pyc"].co_names
+    assert "combine" not in pycs["app/__pycache__/pkg2.cpython-312.pyc"].co_names
+    assert "do_task" not in pycs["app/__pycache__/main.cpython-312.pyc"].co_names
+    l1 = _collect_local_names(pycs["app/__pycache__/pkg1.cpython-312.pyc"])
+    l2 = _collect_local_names(pycs["app/__pycache__/pkg2.cpython-312.pyc"])
+    assert "y" not in l1 and any(x.startswith("_o") for x in l1)
+    assert {"a", "b"} <= l2                                 # 参数红线不动
+
+    # G5：双跑 pyc 字节级一致
+    _build(project, wheels_dir, out2)
+    with zipfile.ZipFile(out2) as zf2:
+        for n, raw in raws.items():
+            assert zf2.read(n) == raw, f"G5: {n} 两跑不一致"

@@ -10,8 +10,9 @@ import types
 
 import pytest
 
-from pkapp.packager.obfuscate import (compile_obfuscated, keystream, transform,
-                                      xor_bytes)
+from pkapp.packager.obfuscate import (_module_id_for, build_rename_plan,
+                                      compile_obfuscated, keystream,
+                                      transform, xor_bytes)
 
 
 def _run(src, fname="f", *args, **kwargs):
@@ -454,7 +455,8 @@ def test_transform_deterministic():
     t2, s2 = transform(ast.parse(src), "t.py")
     assert ast.dump(t1, include_attributes=False) == \
         ast.dump(t2, include_attributes=False)
-    assert s1 == s2 == {"renamed": 2, "stripped": 0}
+    assert s1 == s2                              # G5 全字典一致（含 ledger）
+    assert s1["renamed"] == 2 and s1["stripped"] == 0
 
 
 def test_compile_obfuscated_marshal_roundtrip():
@@ -573,7 +575,7 @@ def test_strings_exempt_faces():
         '"""module: >>> doctest keep"""\n'
         '__all__ = ["exported-name-long-string-01"]\n'
         'FS = f"fstring-joined-long-value-002"\n'
-        'SHORT = "short<16"\n'
+        'SHORT = "sh<8"\n'
         'BY = b"bytes-long-value-0000003"\n'
         'def deco(s):\n'
         '    def w(fn):\n'
@@ -600,7 +602,7 @@ def test_strings_exempt_faces():
     assert "_pkobf_d" not in dump                 # 零命中不注入 stub
     for s in ("exported-name-long-string-01",           # __all__
               "fstring-joined-long-value-002",          # f-string 整体
-              "short<16",                               # 短串（<16）
+              "sh<8",                                   # 短串（<8）
               "bytes-long-value-0000003",               # bytes
               "/decorator-route-long-path-04",          # 装饰器参数
               "/default-arg-long-value-05",             # 默认参数
@@ -629,6 +631,19 @@ def test_strings_behavior_equivalence():
     assert stats["strings"] == 3                  # 比较元 + 两个 return
     assert ns1["R"] == ns2["R"] == "yes-return-long-plain-2"
     assert ns2["check"]("other") == "no-return-long-plain-03"
+
+
+def test_min_str_boundary_p15():
+    """★P1.5★ _MIN_STR 16→8：8 字符串入加密面，7 字符串仍原样
+    （forbidden 禁换集防同串断裂机制不变，豁免面照旧）。"""
+    src = 'A = "len-7!!"\nB = "len-8!!!"\nC = "len-9!!!!"\n'
+    assert len("len-7!!") == 7 and len("len-8!!!") == 8 and len("len-9!!!!") == 9
+    tree, stats = transform(ast.parse(src), "app/main.py",
+                            string_key=_KEY, module_id="main.py")
+    assert stats["strings"] == 2                  # 8/9 入加密面
+    dump = ast.dump(tree)
+    assert "len-7!!" in dump                      # 7 仍原样
+    assert "len-8!!!" not in dump and "len-9!!!!" not in dump
 
 
 # ---------------------------------------------------------------- M1 值位递归下钻
@@ -824,7 +839,9 @@ def test_strings_g5_deterministic():
     src = 'V = "deterministic-long-string-001"\n'
     runs = [compile_obfuscated(src, "app/main.py", string_key=_KEY,
                                module_id="main.py") for _ in range(2)]
-    assert runs[0][1] == runs[1][1] == {"renamed": 0, "stripped": 0, "strings": 1}
+    assert runs[0][1] == runs[1][1]              # G5 全字典一致（含 ledger/str_table）
+    assert runs[0][1]["renamed"] == 0
+    assert runs[0][1]["stripped"] == 0 and runs[0][1]["strings"] == 1
     pycs = [_code_to_hash_pyc(c, source_hash(b"x"), checked=True)
             for c, _st in runs]
     assert pycs[0] == pycs[1]
@@ -930,7 +947,9 @@ def test_obf_compile_bom_and_declared_encoding(tmp_path):   # OB-2
         "# -*- coding: gbk -*-\n"
         'def gbk_fn():\n    y = 2\n    return y * 2\n'.encode("gbk"))
     st = _compile_checked_hash(str(root), obfuscate=True, obf_key=bytes(range(32)))
-    assert st["renamed"] == 2 and st["strings"] == 0        # 走通即解码正确
+    # RFT 两遍后模块级 def 也进改名面：get→_o0 / gbk_fn→_o1 + 局部 x/y → 共 4；
+    # 走通即解码正确（BOM / gbk 源码不炸）
+    assert st["renamed"] == 4 and st["strings"] == 0
 
 
 def test_stub_conflict_import_forms():                      # OB-3
@@ -949,3 +968,394 @@ def test_stub_conflict_import_forms():                      # OB-3
                 "from pkg import a\n",
                 "import a.b.c\n"):                           # 首尾段均不命中
         compile_obfuscated(src, "t.py", string_key=key, module_id="m")   # 不抛即可
+
+
+# ---------------------------------------------------------------- 期3 RFT（跨模块统一改名）
+def _sym(mods, plan, mid, name):
+    """取改名后的模块属性（plan.map 命中查新名，豁免/未知查原名）。"""
+    return getattr(mods[mid], plan.map.get((mid, name), name))
+
+
+def _exec_tree(codes):
+    """{rel: code} → 接线 exec：祖先空壳补齐 → 父属性 setattr → 包先/按 mid 深度序
+    exec 填充（import 语句在 exec 期查 sys.modules 命中，不走真 finder）。"""
+    import sys
+    mids = {rel: _module_id_for(rel) for rel in codes}
+    created = []
+    try:
+        for mid in mids.values():
+            for i in range(1, mid.count(".") + 2):
+                anc = ".".join(mid.split(".")[:i])
+                if anc not in sys.modules:
+                    am = types.ModuleType(anc)
+                    am.__path__ = []
+                    am.__package__ = anc
+                    sys.modules[anc] = am
+                    created.append(anc)
+        for rel, mid in mids.items():
+            if "." in mid:
+                pn, leaf = mid.rsplit(".", 1)
+                setattr(sys.modules[pn], leaf, sys.modules[mid])
+        order = sorted(codes, key=lambda r: (
+            not r.endswith("__init__.py"), mids[r].count("."), r))
+        mods = {}
+        pending = order
+        while pending:                       # from-import 依赖序：ImportError 延后重试
+            rest = []
+            for rel in pending:
+                try:
+                    exec(codes[rel], sys.modules[mids[rel]].__dict__)
+                    mods[mids[rel]] = sys.modules[mids[rel]]
+                except ImportError:
+                    rest.append(rel)
+            if len(rest) == len(pending):
+                raise ImportError(f"exec 接线依赖不可满足: {rest}")
+            pending = rest
+        return mods
+    finally:
+        for mid in created:
+            sys.modules.pop(mid, None)
+
+
+def _xmod(sources, **kw):
+    """RFT 多模块基建：plan → 原码/混淆码同构接线 exec，返回 (plan, 原mods, 混mods)。"""
+    plan = build_rename_plan(sources, **kw)
+    plain = {rel: compile(src, rel, "exec") for rel, src in sources.items()}
+    obf = {rel: compile_obfuscated(src, rel, plan=plan)[0]
+           for rel, src in sources.items()}
+    return plan, _exec_tree(plain), _exec_tree(obf)
+
+
+def test_xmod_basic_attr_chain_and_from_import():           # ① 跨模块映射基础
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    val = x + 1\n    return val\n\nCOUNT = 10\n",
+        "main.py": "import app.pkg as p\nfrom app.pkg import COUNT\n\n"
+                   "def use(v):\n    return p.helper(v) + COUNT\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.map[("app.main", "use")] == "_o0"           # rels UTF-8 序 main 先分配
+    assert plan.map[("app.pkg", "helper")] == "_o1"
+    assert plan.map[("app.pkg", "COUNT")] == "_o2"
+    assert plan.import_roots["app.main"]["p"] == "app.pkg"
+    assert plain["app.main"].use(1) == 12
+    assert _sym(obf, plan, "app.main", "use")(1) == 12      # 链改写 + from-import 回填
+
+
+def test_xmod_relative_import_sync():                       # ② 相对 import 同步
+    sources = {
+        "pkg/__init__.py": "from .mod import helper\n\ndef call(v):\n    return helper(v)\n",
+        "pkg/mod.py": "def helper(x):\n    return x * 2\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.map[("app.pkg", "call")] == "_o0"           # init 先于 mod（rels 序）
+    assert plan.map[("app.pkg.mod", "helper")] == "_o1"
+    assert plan.from_rewrite["app.pkg"][(1, "mod", "helper")] == "_o1"
+    assert plain["app.pkg"].call(5) == _sym(obf, plan, "app.pkg", "call")(5) == 10
+
+
+def test_xmod_deep_attr_chain():                            # ③ 属性链 app.pkg.m2.helper
+    sources = {
+        "main.py": "import app.pkg.m2 as m\n\ndef go(v):\n    return m.helper(v)\n",
+        "pkg/__init__.py": "KEEP = 1\n",
+        "pkg/m2.py": "def helper(x):\n    return x + 3\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.import_roots["app.main"]["m"] == "app.pkg.m2"
+    assert plain["app.main"].go(1) == _sym(obf, plan, "app.main", "go")(1) == 4
+
+
+def test_xmod_str_hit_exempt():                             # ④ 动态串豁免
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    return x\n",
+        "main.py": "import app.pkg as p\n\ndef go():\n    return getattr(p, 'helper')(7)\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.exempt[("app.pkg", "helper")] == "str-hit"
+    assert ("app.pkg", "helper") not in plan.map
+    assert _sym(obf, plan, "app.main", "go")() \
+        == plain["app.main"].go() == 7                      # getattr 走原名
+
+
+def test_xmod_star_import_exempt():                         # ⑤ star 豁免
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    return x\n",
+        "main.py": "from app.pkg import *\n\ndef go(v):\n    return helper(v)\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.exempt[("app.pkg", "helper")] == "star-import-src"
+    assert _sym(obf, plan, "app.main", "go")(9) \
+        == plain["app.main"].go(9) == 9
+
+
+def test_xmod_entry_protected_pair():                       # ⑥ entry 保护对
+    src = "async def app(scope, receive, send):\n    return None\n\nFLAG = 1\n"
+    plan = build_rename_plan({"main.py": src},
+                             protected_pairs=frozenset({("app.main", "app")}))
+    assert plan.exempt[("app.main", "app")] == "protected"
+    assert ("app.main", "FLAG") in plan.map
+    bare = build_rename_plan({"main.py": src})
+    assert ("app.main", "app") in bare.map                  # 无保护对则照改
+
+
+def test_xmod_param_shadow_site():                          # ⑦ 站点级参数遮蔽豁免
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    return x\n",
+        "main.py": "import app.pkg as p\n\nR = p.helper\n\ndef go(p):\n    return p.helper\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.import_roots["app.main"]["p"] == "app.pkg"   # 参数绑定非 Store，防线不删
+    class Dummy:
+        helper = 7
+    assert _sym(obf, plan, "app.main", "go")(Dummy()) == 7   # 参数遮蔽位不改写
+    assert getattr(obf["app.main"], plan.map.get(("app.main", "R"), "R"))(3) \
+        == plain["app.main"].R(3) == 3                      # 模块级链照改
+
+
+def test_xmod_plan_deterministic():                         # ⑧ G5 计划确定性
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    val = x + 1\n    return val\n\nCOUNT = 10\n",
+        "main.py": "import app.pkg as p\n\ndef use(v):\n    return p.helper(v)\n",
+    }
+    p1, p2 = build_rename_plan(sources), build_rename_plan(sources)
+    for f in ("map", "exempt", "modset", "import_roots", "from_rewrite",
+              "self_map", "stats"):
+        assert getattr(p1, f) == getattr(p2, f), f
+    assert p1.next_index == p2.next_index
+    c1 = compile_obfuscated(sources["main.py"], "main.py", plan=p1)[0]
+    c2 = compile_obfuscated(sources["main.py"], "main.py", plan=p2)[0]
+    assert marshal.dumps(c1) == marshal.dumps(c2)
+
+
+def test_xmod_counter_continuation():                       # ⑨ 全局计数器续位
+    sources = {
+        "pkg/__init__.py": "def helper(x):\n    y = x + 1\n    return y\n",
+        "main.py": "import app.pkg as p\n\ndef use(v):\n    w = v * 2\n    return p.helper(w)\n",
+    }
+    plan = build_rename_plan(sources)
+    assert plan.next_index == 2                     # main.use→_o0, pkg.helper→_o1（rels UTF-8 序）
+    codes = {rel: compile_obfuscated(src, rel, plan=plan)[0]
+             for rel, src in sources.items()}
+    use_code = [c for c in _funcs(codes["main.py"]) if c.co_name == "_o0"][0]
+    assert use_code.co_varnames == ("v", "_o2")     # 参数红线保留；局部 w 从 next_index 续位
+    helper_code = [c for c in _funcs(codes["pkg/__init__.py"])
+                   if c.co_name == "_o1"][0]
+    assert "_o2" in helper_code.co_varnames                 # 各模块独立续位，不撞模块级
+
+
+def test_xmod_cls_v1_exempt():                              # ⑩ 类名豁免（cls-v1）
+    sources = {
+        "pkg/__init__.py": "class Repo:\n    factor = 3\n\n    def get(self, v):\n"
+                           "        return v * self.factor\n\n\ndef helper(x):\n"
+                           "    return Repo().get(x)\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.exempt[("app.pkg", "Repo")] == "cls-v1"
+    assert ("app.pkg", "helper") in plan.map
+    assert "Repo" in obf["app.pkg"].__dict__                # 类名保留
+    assert _sym(obf, plan, "app.pkg", "helper")(5) == plain["app.pkg"].helper(5) == 15
+
+
+def test_xmod_dunder_imported_escape():                     # ⑪ dunder/imported/escape
+    sources = {
+        "m.py": "import os\n__version__ = '1.0'\n"
+                "def rec():\n    return rec\n\ndef plain(v):\n    return v + 1\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert ("app.m", "plain") in plan.map
+    assert plan.exempt[("app.m", "rec")] == "escape"
+    assert ("app.m", "__version__") not in plan.map         # dunder 红线
+    assert ("app.m", "os") not in plan.map                  # import 绑定红线
+    assert obf["app.m"].rec() is obf["app.m"].rec()         # 自引用语义保持
+    assert _sym(obf, plan, "app.m", "plain")(1) == 2
+
+
+def test_xmod_submodule_conflict():                         # ⑫ 子模块名冲突豁免
+    sources = {
+        "pkg/__init__.py": "def m2(x):\n    return x + 1\n\nuse_sub = 0\n",
+        "pkg/m2.py": "def inner(x):\n    return x * 2\n",
+        "main.py": "from app.pkg.m2 import inner\n\ndef go(v):\n    return inner(v)\n",
+    }
+    plan, plain, obf = _xmod(sources)
+    assert plan.exempt[("app.pkg", "m2")] == "submodule-shadow"
+    assert plan.map[("app.pkg.m2", "inner")] == "_o2"       # go→_o0, use_sub→_o1
+    assert plain["app.main"].go(3) == _sym(obf, plan, "app.main", "go")(3) == 6
+
+
+def test_module_id_parity_with_keylib():                    # 子进程裸导入对拍锁
+    from pkapp.packager.keylib import module_id_for
+    for rel in ("main.py", "__init__.py", "pkg/__init__.py", "pkg/mod.py",
+                "a/b/c.py", "a/b/__init__.py", "deep/nest/leaf/__init__.py"):
+        assert _module_id_for(rel) == module_id_for(rel), rel
+
+
+# ---------------------------------------------------------------- ★R-13★ 双编译对拍（§4.1.5 ①）
+from pkapp.packager.obfuscate import ParityError, verify_parity
+
+_KEY = bytes(range(32))
+
+
+def test_parity_single_module_composite():
+    """复合变换正例：改名 + docstring 剥离 + 字符串加密（长串换/短串留/f-string/
+    保留 doctest）全场景对拍通过——两表逐项解释全部符号面差异。"""
+    src = ('"""mod doc."""\n'
+           'WIDE = "a-long-enough-secret-string!"\n'
+           'SHORT = "short"\n'
+           'def go(x):\n'
+           '    """fn doc."""\n'
+           '    tag = "another-long-secret-value"\n'
+           '    return WIDE[:4] + f"{x}-{SHORT}" + tag[:3]\n'
+           'class Keep:\n'
+           '    """class doc retained."""\n'
+           '    def m(self):\n'
+           '        return "yet-one-more-long-string"\n')
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY, module_id="app.m")
+    verify_parity(src, "m.py", code, stats, string_key=_KEY, module_id="app.m")
+
+
+def test_parity_plan_cross_module():
+    """RFT plan 复合正例：跨模块 attr 链 + from-import 改写 + 模块级/局部改名，
+    每模块对拍通过（台账 = plan.map 模块级 + 局部 + 属性链 + from-import）。"""
+    sources = {
+        "pkg/__init__.py": 'COUNT = 10\n\ndef helper(x):\n    val = x + 1\n    return val\n',
+        "main.py": 'import app.pkg as p\nfrom app.pkg import COUNT\n\n'
+                   'def use(v):\n    return p.helper(v) + COUNT\n',
+    }
+    plan = build_rename_plan(sources)
+    for rel, src in sources.items():
+        code, stats = compile_obfuscated(src, rel, plan=plan)
+        verify_parity(src, rel, code, stats)
+
+
+def test_parity_no_string_pass():
+    """仅改名（无 string_key）对拍通过：台账解释全部差异，无密钥表介入。
+    一期模式模块级名不改（go 保留），只有函数局部 w 进台账。"""
+    src = 'def go(v):\n    w = v * 2\n    return w + 1\n'
+    code, stats = compile_obfuscated(src, "m.py")
+    assert stats["ledger"] == frozenset({("w", "_o0")})
+    verify_parity(src, "m.py", code, stats)
+
+
+def test_parity_detects_wrong_key():
+    """验牙①：密钥表换钥 → 密文重算不匹配 → 新现 bytes 无解释 → ParityError。"""
+    src = 'V = "a-long-enough-secret-string!"\n'
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY, module_id="app.m")
+    with pytest.raises(ParityError, match="新现常量"):
+        verify_parity(src, "m.py", code, stats,
+                      string_key=bytes(range(32, 64)), module_id="app.m")
+
+
+def test_parity_detects_source_drift():
+    """验牙②：对拍参照源与产物源漂移（多一个函数）→ 子 code 数不匹配 → 炸。"""
+    src = 'def go(v):\n    return v + 1\n'
+    drifted = src + '\ndef extra():\n    return 1\n'
+    code, stats = compile_obfuscated(drifted, "m.py")
+    with pytest.raises(ParityError, match="子 code object"):
+        verify_parity(src, "m.py", code, stats)
+
+
+def test_parity_detects_name_out_of_ledger():
+    """验牙③：台账被抽走一条 → 对应消失名无解释 → 炸（全量断言非抽样）。"""
+    src = 'def go(v):\n    w = v * 2\n    return w\n'
+    code, stats = compile_obfuscated(src, "m.py")
+    stats["ledger"] = frozenset(x for x in stats["ledger"] if x[0] != "w")
+    with pytest.raises(ParityError, match="消失名"):
+        verify_parity(src, "m.py", code, stats)
+
+
+def test_parity_constkey_map_degraded():
+    """★P1.5★ 伴生对拍规则：全常量键 dict 编译为 BUILD_CONST_KEY_MAP（键 =
+    str 元组常量）；任一键 ≥_MIN_STR(8) 被加密替换为 _pkobf_d(idx) Call 后
+    3.12 编译器退化 BUILD_MAP——键元组消失、未加密键散为独立常量。
+    keymap_degraded 规则：逐元素 ∈ (str_table ∪ 新现散串) 全命中放行。"""
+    src = ('def go(v):\n'
+           '    return {"hello": "world", "data_dir": v, "cfg_file": 1}\n')
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="app.m")
+    verify_parity(src, "m.py", code, stats, string_key=_KEY, module_id="app.m")
+
+
+def test_parity_constkey_map_degraded_negative():
+    """验牙④：键元组退化规则不放走真漂移——密钥表抽走加密键条目 → 该元素
+    既不在表也未散现 → 消失常量报错（部分命中必拒，全量断言非抽样）。"""
+    src = 'def go(v):\n    return {"hello": "world", "data_dir": v}\n'
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="app.m")
+    stats["str_table"] = [s for s in stats["str_table"] if s != "data_dir"]
+    with pytest.raises(ParityError, match="消失常量"):
+        verify_parity(src, "m.py", code, stats, string_key=_KEY,
+                      module_id="app.m")
+
+
+def test_parity_docstring_none_slot():
+    """docstring 剥离伴生（真实项目 db.py 抓出）：3.12 函数 scope const 池恒带
+    docstring 槽位，无 docstring 时填 None 占位——原码「docstring + 全函数无
+    None」的函数剥离后 consts[0] 从 docstring 变 None，出现「消失 str(consts[0])
+    + 新现 None」成对差异，规则须成对解释（原码本有 None 的函数去重无 diff，
+    如 x[:4] 的 BINARY_SLICE start=None）。"""
+    src = ('def now() -> str:\n'
+           '    """ISO 秒级时间戳（共用）。"""\n'
+           '    return datetime.now().isoformat(timespec="seconds")\n')
+    code, stats = compile_obfuscated(src, "db.py", string_key=_KEY,
+                                     module_id="db.py")
+    verify_parity(src, "db.py", code, stats, string_key=_KEY, module_id="db.py")
+
+
+def test_parity_const_fold_degraded():
+    """折叠体退化伴生（真实项目 main.py/roles.py 抓出）：全常量容器字面量
+    （list-of-tuples / set）被 3.12 整体折叠为嵌套元组/frozenset 常量；任一
+    str 叶子被加密后折叠失效摊平——未加密叶子散现（子元组或散串）、加密叶子
+    进密钥表，逐叶子全命中放行。"""
+    src = ('ROUTE = [("GET", "/api/me"), ("POST", "/api/devices-list")]\n'
+           'ROLES = {"r": {"device.read", "event.read"}}\n')
+    plan = build_rename_plan({"m.py": src})
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="m.py", plan=plan)
+    verify_parity(src, "m.py", code, stats, string_key=_KEY, module_id="m.py")
+
+
+def test_parity_annotation_drift():
+    """注解 const 漂移伴生（真实项目 schemas.py/roles.py 抓出）：3.12 类体
+    注解字符串化 / AnnAssign 的 __annotations__ 键——注解文本内的名字 = AST
+    Name，RFT 改名后编译器重生成注解字符串（'DeviceStatus | None' →
+    '_o53 | None'、键 'ROLES' → '_o21'）。台账全词替换逐字相等放行；
+    运行期解析走模块命名空间，引用与绑定同步漂移，语义等价。"""
+    src = ('from typing import Literal\n'
+           'DeviceStatus = Literal["online", "error"]\n'
+           'class DeviceCreate:\n'
+           '    status: DeviceStatus = "online"\n'
+           'ROLES: dict = {"admin": "*"}\n')
+    plan = build_rename_plan({"m.py": src})
+    code, stats = compile_obfuscated(src, "m.py", plan=plan)
+    verify_parity(src, "m.py", code, stats)
+    led = dict(stats["ledger"])
+    assert "_o0" in led.values() or len(led) >= 1      # 类名豁免，变量/注解键漂移进台账
+
+
+def test_parity_no_docstring_first_const_not_exempted():
+    """★评审修复②★ 无 docstring 时 scope consts[0] 是首个业务常量，其消失
+    不得凭位次豁免（旧判定 `c == a[0]` 会把短串真实漂移误放）。人为剔除模块
+    首常量构造漂移，ParityError 必须炸；对照：真 docstring 的位次豁免仍由
+    test_parity_docstring_none_slot 正例覆盖。"""
+    src = ('X = "ab"\n'          # <8 短串：不开加密时不进密钥表，无任何合法消失路径
+           'def f():\n'
+           '    return X\n')
+    code, stats = compile_obfuscated(src, "m.py")
+    verify_parity(src, "m.py", code, stats)            # 完整 code 对拍通过
+    drifted = code.replace(co_consts=tuple(c for c in code.co_consts if c != "ab"))
+    with pytest.raises(ParityError, match="消失常量"):
+        verify_parity(src, "m.py", drifted, stats)     # 人为漂移 → 当场炸
+
+
+def test_parity_annotation_drift_single_pass():
+    """★评审修复③★ 台账单趟交替替换：v1 与 Wv1（orig 词互为前缀包含）同入
+    台账——交替 pattern 共享 \\b 边界必须靠回溯保证最长词形唯一命中（v1 先试
+    匹配 Wv1 时尾 \\b 失败），替换后对拍仍逐字精确；同时锁「单趟无链式污染」
+    的实现合同（跨 scope orig 名与新名撞形 _oK 时，链式 re.sub 的结果依赖
+    frozenset 迭代序，单趟替换与序无关）。"""
+    src = ('v1 = 1\n'
+           'Wv1 = 2\n'
+           'class C:\n'
+           '    x: Wv1 = 0\n')
+    plan = build_rename_plan({"m.py": src})
+    code, stats = compile_obfuscated(src, "m.py", plan=plan)
+    verify_parity(src, "m.py", code, stats)

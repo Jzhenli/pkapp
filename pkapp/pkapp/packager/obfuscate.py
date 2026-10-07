@@ -32,7 +32,8 @@
 - keystream：SHA256(key32 ‖ module_id ‖ counter_u32_be) 逐块（32B）拼接截断，
   counter 从 0 大端——同 (key32, module_id) → 同流（G5 确定性的唯一依据）。
 - 字符串 pass 在改名 pass 之后跑（scope 结构稳定；注入名天然不参与改名）：
-  值位递归下钻——非豁免子树内所有 ≥16 纯 str Constant 全替换为 _pkobf_d(idx)
+  值位递归下钻——非豁免子树内所有 ≥_MIN_STR（★P1.5★ 16→8）纯 str Constant 全
+  替换为 _pkobf_d(idx)
   （容器元素 / Call 实参 / dict key 与值 / BinOp 操作数 / 比较元全覆盖，不再
   区分直值与嵌套）；同串复用同条目（表长 = 唯一串数，首现序 = 表序 = 确定）；
   密文表 _TBL 与惰性解密 stub 注入模块头（docstring 与 __future__ import 之后）。
@@ -42,17 +43,32 @@
   再对流解密。
 - 豁免面（从严，各配测试）：装饰器参数、函数默认参数、注解（AnnAssign/arg/
   returns）、match case pattern、__all__ 赋值、JoinedStr（f-string）整体、
-  bytes、短串（<16）、模块/函数/类 docstring 位置；业务源码占用 _TBL/_pkobf_d
+  bytes、短串（<8）、模块/函数/类 docstring 位置；业务源码占用 _TBL/_pkobf_d
   名 → ValueError 拒绝（极端保守）。
+
+期3（§4.1 P1-RFT）：跨模块统一改名（build_rename_plan + transform(plan)）。
+- 改名面扩到模块级 def/async def + 顶层变量：全局唯一计数器分配 _o{n}（★R-12★
+  与函数局部续位不重号）；类名豁免（cls-v1，理由见 build_rename_plan docstring）。
+- 消费端同步三通道：模块内引用（self_map 预填 root + _lookup 上溯到 module
+  scope，global 引用/递归自引用同步）；import 属性链（import_roots + 链解析
+  内→外，子模块名前进/map 命中改写；rebind 防线 + 站点级遮蔽检查）；from-import
+  （from_rewrite 改源名 + asname 回填保绑定名）。
+- 豁免合同（六类 reason 常驻构建日志）：str-hit / submodule-shadow /
+  star-import-src / cls-v1 / escape / protected。
+- 红线：类体名 / 参数名 / 模块名 / entry 面（protected_pairs）不参与改名。
+- 已知 v1 限制：sys.modules[...].attr 串外属性链、globals()[name] 变量名动态
+  访问不在改写面（str-hit 只保 Constant 字面量命中）。
 """
 from __future__ import annotations
 
 import ast
 import hashlib
+import re
 import symtable
 import types
 
-__all__ = ["transform", "compile_obfuscated", "keystream", "xor_bytes"]
+__all__ = ["transform", "compile_obfuscated", "keystream", "xor_bytes",
+           "RenamePlan", "build_rename_plan", "verify_parity", "ParityError"]
 
 # 兼容不同打包解释器版本的作用域块名（3.12 推导式内联无块；3.10/3.11 回退编译带块）
 _LAMBDA_NAMES = ("lambda", "<lambda>")
@@ -62,7 +78,8 @@ _SETCOMP_NAMES = ("setcomp", "<setcomp>")
 _DICTCOMP_NAMES = ("dictcomp", "<dictcomp>")
 
 # ---------------------------------------------------------------- keystream 层（§13.3③ S5）
-_MIN_STR = 16                      # 字符串加密最小长度（≥16 才替换）
+_MIN_STR = 8                       # 字符串加密最小长度（★P1.5★ 16→8：8–15 带入
+                                   # 加密面；forbidden 禁换集已防同串断裂）
 _STUB_TABLE = "_TBL"               # 密文表（模块级注入名）
 _STUB_FUNC = "_pkobf_d"            # 惰性解密 stub（模块级注入名）
 _STUB_NAMES = frozenset((_STUB_TABLE, _STUB_FUNC))
@@ -181,11 +198,21 @@ def _escape_exempt_names(tree: ast.Module) -> frozenset[str]:
 
 
 class _Renamer(ast.NodeTransformer):
-    """阶段二：单遍 AST 改写，scope 栈跟随 AST 结构与块树认领式对齐。"""
+    """阶段二：单遍 AST 改写，scope 栈跟随 AST 结构与块树认领式对齐。
 
-    def __init__(self, root: _Scope):
+    ★期3 RFT★ plan 在位时扩展跨模块改写：root _Scope.mapping 预填 plan.self_map
+    （模块级名参与改名，_lookup 上溯到 module scope 查映射）；visit_ImportFrom 按
+    from_rewrite 改写 from-import 源名（asname 缺省回填保绑定名）；visit_Attribute
+    按 import_roots 解析属性链改写终点 attr。plan 缺省 → 行为与一期逐位一致。
+    """
+
+    def __init__(self, root: _Scope, plan: "RenamePlan | None" = None,
+                 mid: str | None = None):
         self._stack = [root]
         self.stripped = 0
+        self._plan = plan
+        self._mid = mid
+        self.ledger: set[tuple[str, str]] = set()   # ★R-13★ 实际改名台账 (orig, new)
 
     # ---- 作用域对齐 ----
     @property
@@ -210,7 +237,12 @@ class _Renamer(ast.NodeTransformer):
         return None
 
     def _lookup(self, name: str) -> str | None:
-        """名字查找：沿父链只穿越 function scope，映射命中即改，遇本层绑定即止。"""
+        """名字查找：沿父链只穿越 function scope，映射命中即改，遇本层绑定即止。
+
+        ★RFT★ plan 在位时两处放宽：function scope 的 global 引用不再止步
+        （继续上溯到 module scope 查 self_map——模块级名参与改名后，函数内的
+        global 引用/递归自引用必须同步，否则 global x = ... 赋旧名 = 断裂）；
+        module scope 查 self_map 命中即改。plan 缺省 → 与一期逐位一致。"""
         s: _Scope | None = self._stack[-1]
         while s is not None:
             if s.kind == "function":
@@ -218,15 +250,20 @@ class _Renamer(ast.NodeTransformer):
                 if new is not None:
                     return new
                 sym = s.symbols.get(name)
-                if sym is not None and (sym.is_local() or sym.is_parameter()
-                                        or sym.is_global()):
-                    return None          # 本层绑定（含参数遮蔽）/ global → 止步不改
+                if sym is not None and (sym.is_local() or sym.is_parameter()):
+                    return None          # 本层绑定（含参数遮蔽）→ 止步不改
+                if (self._plan is None and sym is not None and sym.is_global()):
+                    return None          # 一期：global → 止步不改
             elif s.kind == "class":
                 sym = s.symbols.get(name)
                 if sym is not None and sym.is_local():
                     return None          # 类体内名是合同（pydantic 字段等）
             elif s.kind == "module":
-                return None              # 模块级名 / builtins 永不改
+                if self._plan is not None:
+                    new = self._plan.self_map.get(self._mid, {}).get(name)
+                    if new is not None:
+                        return new       # 模块级名映射（RFT）
+                return None              # builtins / 未映射名
             else:
                 sym = s.symbols.get(name)
                 if sym is not None and sym.is_local():
@@ -258,11 +295,15 @@ class _Renamer(ast.NodeTransformer):
 
         ★OB-1★ 豁免名在阶段一已被排除出映射（映射终态前置到引用改写之前），
         此处不再判豁免、更不 del——visit 时才删映射会让先前已按映射改写的引用
-        悬空（前向引用兄弟 / 同名重定义 split-binding）。"""
+        悬空（前向引用兄弟 / 同名重定义 split-binding）。
+        ★RFT★ module scope 也参与：plan 态下 root.mapping 预填 self_map，模块级
+        def/async def 名照改（类 scope mapping 恒空，类体内 def 天然不改）。"""
         parent = self._cur
-        if parent.kind != "function" or node.name not in parent.mapping:
+        if node.name not in parent.mapping:
             return
+        old = node.name
         node.name = parent.mapping[node.name]
+        self.ledger.add((old, node.name))       # ★R-13★ 对拍台账
 
     def _visit_signature(self, args: ast.arguments) -> None:
         """默认值 / 参数注解在外层 scope 求值（Python 语义）——入栈前访问；
@@ -394,8 +435,74 @@ class _Renamer(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.Name:
         new = self._lookup(node.id)
         if new is not None:
-            node.id = new                    # ctx 无关：Store/Load/Del 统一（漏改 Del 会 NameError）
+            self.ledger.add((node.id, new))     # ★R-13★ 对拍台账
+            node.id = new                       # ctx 无关：Store/Load/Del 统一（漏改 Del 会 NameError）
         return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        """★RFT★ from-import 源名同步：from_rewrite 命中 (level, module, name) →
+        alias.name 改新名；asname 缺省回填原名（绑定名不变 → 模块内引用零改写）。"""
+        if self._plan is not None:
+            rew = self._plan.from_rewrite.get(self._mid, {})
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                new = rew.get((node.level, node.module, alias.name))
+                if new is not None:
+                    self.ledger.add((alias.name, new))   # ★R-13★ 对拍台账
+                    if alias.asname is None:
+                        alias.asname = alias.name    # 保绑定名
+                    alias.name = new
+        return node
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.Attribute:
+        """★RFT★ 属性链改写：root 命中 import_roots（如 p = import app.pkg as p）
+        → 链解析内→外——子模块名前进 cur；map 命中改写该深度 .attr 后止。
+        链 + root id 必须先于 visit(node.value) 捕获（visit 会改 Name.id）。
+        .attr 是字符串字段天然不参与 Name 改名——此处是唯一属性位改写入口；
+        Load/Store/Del ctx 无关（obj.attr 赋值/删除同为命名空间引用）。"""
+        if self._plan is not None:
+            attrs: list[str] = []
+            nodes: list[ast.Attribute] = []
+            cur: ast.AST = node
+            while isinstance(cur, ast.Attribute):
+                attrs.append(cur.attr)               # 外→内收集
+                nodes.append(cur)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                root = cur.id
+                target = self._plan.import_roots.get(self._mid, {}).get(root)
+                if target is not None and not self._root_shadowed(root):
+                    m = target
+                    for k in range(len(attrs) - 1, -1, -1):   # 内→外 = 从 root 向外
+                        sub = m + "." + attrs[k]
+                        if sub in self._plan.modset:
+                            m = sub                  # 子模块名前进（模块名是红线不改）
+                            continue
+                        new = self._plan.map.get((m, attrs[k]))
+                        if new is not None:
+                            self.ledger.add((attrs[k], new))  # ★R-13★ 对拍台账
+                            nodes[k].attr = new      # 改写该深度后止（外层是对值访问）
+                        break
+        node.value = self.visit(node.value)
+        return node
+
+    def _root_shadowed(self, name: str) -> bool:
+        """属性链 root 的站点级遮蔽检查：沿 scope 栈自顶向下（排除 module scope——
+        root 本身就是模块级 import 绑定），任一 enclosing function 的 local/参数、
+        class/包装块的 local 绑定 → 遮蔽跳过。is_global 纯引用不算遮蔽（引用的
+        恰是 root 本身）；`global x; x = ...` 重绑定场景由 rebind 防线在 plan 期
+        整体删 root（Name-Store 全树扫描）兜住。"""
+        for s in reversed(self._stack[1:]):
+            sym = s.symbols.get(name)
+            if sym is None:
+                continue
+            if s.kind == "function":
+                if sym.is_local() or sym.is_parameter():
+                    return True
+            elif sym.is_local():
+                return True
+        return False
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> ast.Nonlocal:
         # nonlocal 语句名串须与定义 scope 的映射一致（漏改 = SyntaxError 断裂）
@@ -555,7 +662,7 @@ class _StringCipher(ast.NodeTransformer):
     名位天然安全：keyword.arg/attr/arg/import 名是 AST str 字段非 Constant
     节点，不触碰。docstring：被剥离的在 rename pass 已消失不参与；保留的
     （class/带装饰器函数/含 >>> doctest，剥离豁免命中）吸收进禁换集
-    （★M1-FB-1★），head 位两遍同规豁免。豁免面从严不松；bytes/短串（<16）
+    （★M1-FB-1★），head 位两遍同规豁免。豁免面从严不松；bytes/短串（<8）
     天然不命中；注入的 Call 里 Constant(idx) 是 int 不受影响。
     """
 
@@ -705,10 +812,10 @@ class _StringCipher(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
-def _encrypt_strings(tree: ast.Module, string_key: bytes, module_id: str) -> int:
+def _encrypt_strings(tree: ast.Module, string_key: bytes, module_id: str) -> tuple[int, list[str]]:
     """字符串加密主流程：冲突检查 → 第一遍收禁换集 → 第二遍值位替换收表
-    → stub 注入模块头。返回加密条目数（= 唯一串数，同串复用同条目）；
-    无命中则不注入任何内容。"""
+    → stub 注入模块头。返回 (加密条目数, 明文表)（表序 = 首现序 = 密文 idx 序，
+    ★R-13★ 对拍第二表：同串复用同条目；无命中则不注入任何内容）。"""
     if len(string_key) != 32:
         raise ValueError("string_key 必须为 32 字节（obf.key 语义）")
     _check_stub_name_conflicts(tree)
@@ -734,13 +841,209 @@ def _encrypt_strings(tree: ast.Module, string_key: bytes, module_id: str) -> int
                and tree.body[idx].module == "__future__"):
             idx += 1
         tree.body[idx:idx] = stmts
-    return len(cipher.table)
+    plain = [""] * len(cipher.table)
+    for s, i in cipher._idx_of.items():
+        plain[i] = s
+    return len(cipher.table), plain
+
+
+# ---------------------------------------------------------------- 期3 RFT（跨模块统一改名）
+def _module_id_for(rel: str) -> str:
+    """app/ 内相对路径（'/' 分隔，.py 结尾）→ canonical module id。
+
+    ★子进程裸模块导入约束★：子进程只 sys.path.insert(packager) 后 `import obfuscate`，
+    不能包导入 keylib（其依赖 ctypes/构建态）——本函数复制自 keylib.module_id_for，
+    语义必须逐位一致（test_module_id_parity_with_keylib 对拍锁定）。
+    """
+    p = rel[:-3]
+    if p == "__init__":                  # 根包（不带 / 前缀）
+        p = ""
+    elif p.endswith("/__init__"):
+        p = p[:-9]
+    parts = [x for x in p.split("/") if x]
+    return ".".join(["app"] + parts)
+
+
+class RenamePlan:
+    """跨模块统一改名计划（build_rename_plan 产物，G5 确定性）。
+
+    map          {(mid, orig): new}   全局改名映射（模块级名，全局唯一 _o{n}）
+    exempt       {(mid, orig): reason} 豁免登记（str-hit/submodule-shadow/
+                                       star-import-src/cls-v1/escape/protected）
+    modset       frozenset[mid]        全部模块 id（子模块名前进/冲突判定域）
+    import_roots {mid: {bound: target_mid}} import 绑定 → 目标模块（属性链入口）
+    from_rewrite {mid: {(level, module, orig): new}} from-import 源名改写表
+    self_map     {mid: {orig: new}}    map 的按模块视图（transform 预填 root）
+    next_index   int                   全局计数器终态（transform 局部改名续位，
+                                       ★R-12★ 模块级名与函数局部名不重号）
+    stats        {reason: count}       豁免统计（构建日志常驻，§4.1）
+    """
+
+    __slots__ = ("map", "exempt", "modset", "import_roots", "from_rewrite",
+                 "self_map", "next_index", "stats")
+
+    def __init__(self) -> None:
+        self.map: dict[tuple[str, str], str] = {}
+        self.exempt: dict[tuple[str, str], str] = {}
+        self.modset: frozenset = frozenset()
+        self.import_roots: dict[str, dict[str, str]] = {}
+        self.from_rewrite: dict[str, dict[tuple, str]] = {}
+        self.self_map: dict[str, dict[str, str]] = {}
+        self.next_index = 0
+        self.stats: dict[str, int] = {}
+
+
+def _parent_mid(mid: str) -> str | None:
+    return mid.rsplit(".", 1)[0] if "." in mid else None
+
+
+def _resolve_import_target(level: int, module: str | None, mid: str,
+                           pkgset: frozenset) -> str | None:
+    """import 源解析：绝对（level=0）→ module 原样（调用方查 modset/map）；
+    相对 → base =（mid 是包取自身，否则取父），再 level-1 次上溯，拼 module。"""
+    if level == 0:
+        return module
+    base = mid if mid in pkgset else _parent_mid(mid)
+    for _ in range(level - 1):
+        base = _parent_mid(base) if base else None
+    if base is None:
+        return None
+    return base if not module else base + "." + module
+
+
+def build_rename_plan(sources: dict, *, protected: frozenset = frozenset(),
+                      protected_pairs: frozenset = frozenset()) -> RenamePlan:
+    """跨模块统一改名计划构建（§4.1 P1-RFT，G5 确定性）。
+
+    sources = {rel: 源码文本}（rel 为 app/ 内 '/' 相对路径）。阶段序：
+    A 候选收集（symtable module scope：is_local 非 import 非 dunder；顶层
+      ClassDef 名 → cls-v1、逃逸自引用名 → escape 豁免——有意偏离范围行的
+      "class"：ORM __tablename__/元类/__name__ 派生属灾难级错改面，类名可读
+      且类体本就全豁免，v1 保守）→ B 全树 Constant str 精确命中 → str-hit
+      （getattr/globals 动态串访问保护）→ C mid.name 是子模块名 →
+      submodule-shadow（def 遮蔽子模块时改 def 名会扭曲 import 语义）→
+      D star-import 源模块候选全豁免 → star-import-src（star 拷贝按原名，
+      源改名 = 消费端静默断）→ E protected 名/(mid, name) 对 → protected →
+      F 计数分配（sorted rel UTF-8 字节序 + symtable 序 + 全局 counter，
+      禁 set 迭代序）→ G import_roots/from_rewrite 构建 + rebind 防线
+      （全树 Name-Store id==root → drop 该 root，保守）。
+    """
+    plan = RenamePlan()
+    rels = sorted(sources, key=lambda r: r.encode("utf-8"))
+    plan.modset = frozenset(_module_id_for(r) for r in rels)
+    pkgset = frozenset(_module_id_for(r) for r in rels if r.endswith("__init__.py"))
+
+    def exempt(mid: str, name: str, reason: str) -> None:
+        plan.exempt[(mid, name)] = reason
+        plan.stats[reason] = plan.stats.get(reason, 0) + 1
+
+    # 预解析：树 / 块 / 全树字符串值集 / star-import 源集
+    trees, blocks, top_classes, escapes = {}, {}, {}, {}
+    all_strs: set[str] = set()
+    star_src: set[str] = set()
+    for rel in rels:
+        src = sources[rel]
+        tree = ast.parse(src, rel)
+        trees[rel] = tree
+        blocks[rel] = symtable.symtable(src, rel, "exec")
+        escapes[rel] = _escape_exempt_names(tree)
+        top_classes[rel] = {nd.name for nd in tree.body
+                            if isinstance(nd, ast.ClassDef)}
+        mid = _module_id_for(rel)
+        for nd in ast.walk(tree):
+            if isinstance(nd, ast.Constant) and isinstance(nd.value, str):
+                all_strs.add(nd.value)
+            elif isinstance(nd, ast.ImportFrom):
+                for a in nd.names:
+                    if a.name == "*":
+                        t = _resolve_import_target(nd.level, nd.module,
+                                                   mid, pkgset)
+                        if t in plan.modset:
+                            star_src.add(t)
+
+    # A-E：逐模块按 symtable 序收集候选并走豁免链（幸存名保序交 F）
+    survivors: dict[str, list[str]] = {}
+    for rel in rels:
+        mid = _module_id_for(rel)
+        keep: list[str] = []
+        for sym in blocks[rel].get_symbols():        # get_symbols() 序 = 确定序
+            n = sym.get_name()
+            if not sym.is_local() or sym.is_imported() \
+                    or (n.startswith("__") and n.endswith("__")):
+                continue                             # 红线：import 绑定 / dunder
+            if n in top_classes[rel]:
+                exempt(mid, n, "cls-v1")
+            elif n in escapes[rel]:
+                exempt(mid, n, "escape")
+            elif n in all_strs:
+                exempt(mid, n, "str-hit")
+            elif mid + "." + n in plan.modset:
+                exempt(mid, n, "submodule-shadow")
+            elif mid in star_src:
+                exempt(mid, n, "star-import-src")
+            elif n in protected or (mid, n) in protected_pairs:
+                exempt(mid, n, "protected")
+            else:
+                keep.append(n)
+        survivors[rel] = keep
+
+    # F：计数分配（全局唯一计数器，★R-12★）
+    counter = 0
+    for rel in rels:
+        mid = _module_id_for(rel)
+        sm: dict[str, str] = {}
+        for n in survivors[rel]:
+            new = "_o%d" % counter
+            counter += 1
+            plan.map[(mid, n)] = new
+            sm[n] = new
+        if sm:
+            plan.self_map[mid] = sm
+    plan.next_index = counter
+
+    # G：import 图（roots / from_rewrite）+ rebind 防线
+    for rel in rels:
+        mid = _module_id_for(rel)
+        roots: dict[str, str] = {}
+        fromrw: dict[tuple, str] = {}
+        for nd in ast.walk(trees[rel]):
+            if isinstance(nd, ast.Import):
+                for a in nd.names:
+                    if a.asname:
+                        if a.name in plan.modset:    # import app.pkg as p
+                            roots.setdefault(a.asname, a.name)
+                    else:
+                        first = a.name.split(".")[0]  # import app.pkg → 绑定 app
+                        if first == "app" or first in plan.modset:
+                            roots.setdefault(first, first)
+            elif isinstance(nd, ast.ImportFrom):
+                target = _resolve_import_target(nd.level, nd.module, mid, pkgset)
+                if target is None:
+                    continue
+                for a in nd.names:
+                    if a.name == "*":
+                        continue
+                    sub = target + "." + a.name
+                    if sub in plan.modset:           # from-import 子模块绑定
+                        roots.setdefault(a.name, sub)
+                    elif (target, a.name) in plan.map:
+                        fromrw[(nd.level, nd.module, a.name)] = \
+                            plan.map[(target, a.name)]
+        stores = {n.id for n in ast.walk(trees[rel])
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        roots = {k: v for k, v in roots.items() if k not in stores}   # rebind 防线
+        if roots:
+            plan.import_roots[mid] = roots
+        if fromrw:
+            plan.from_rewrite[mid] = fromrw
+    return plan
 
 
 def transform(tree: ast.Module, filename: str, *,
               protected: frozenset[str] = frozenset(),
               string_key: bytes | None = None,
-              module_id: str | None = None) -> tuple[ast.Module, dict]:
+              module_id: str | None = None,
+              plan: RenamePlan | None = None) -> tuple[ast.Module, dict]:
     """AST 变换入口：返回 (变换后树, {"renamed": n, "stripped": m[, "strings": k]})。
 
     renamed = 实际改名 binding 数（逃逸豁免撤项不计）；stripped = 剥离 docstring 数；
@@ -749,34 +1052,307 @@ def transform(tree: ast.Module, filename: str, *,
     （§13.3③ S6：改名 pass 先跑、字符串 pass 后跑；期1 调用方不传 → 行为与
     stats 形态不变）。symtable 需要源文本——用 ast.unparse 重建（结构等价 →
     作用域语义不变），原 tree 行号原样保留，symtable 仅用于作用域/候选分析。
+    ★RFT★ plan 在位 → 模块级名参与改名：root.mapping 预填 self_map[filename
+    对应 mid]，全局计数器从 plan.next_index 续位（★R-12★ 不重号）；缺省 →
+    行为与一期逐位一致。
     """
+    mid = _module_id_for(filename)
     root_block = symtable.symtable(ast.unparse(tree), filename, "exec")
     escape_names = _escape_exempt_names(tree)   # ★OB-1★ 先于候选分配：映射终态前置
-    counter = [0]                             # 单文件全局计数器（禁用 set 迭代序）
+    counter = [plan.next_index if plan is not None else 0]   # 全局计数器（禁 set 序）
     all_scopes: list[_Scope] = []
     root = _build_scopes(root_block, None, frozenset(protected), counter,
                          all_scopes, escape_names)
-    renamer = _Renamer(root)
+    if plan is not None:
+        root.mapping.update(plan.self_map.get(mid, {}))   # 模块级名映射预填
+    renamer = _Renamer(root, plan=plan, mid=mid)
     tree = renamer.visit(tree)
     renamed = sum(len(s.mapping) for s in all_scopes)
-    stats = {"renamed": renamed, "stripped": renamer.stripped}
+    stats = {"renamed": renamed, "stripped": renamer.stripped,
+             "ledger": frozenset(renamer.ledger)}   # ★R-13★ 对拍第一表（实际改名）
     if string_key is not None and module_id is not None:
-        stats["strings"] = _encrypt_strings(tree, string_key, module_id)
+        n, plain = _encrypt_strings(tree, string_key, module_id)
+        stats["strings"] = n
+        stats["str_table"] = plain                  # ★R-13★ 对拍第二表（明文密钥表）
     return tree, stats
 
 
 def compile_obfuscated(src_text: str, filename: str, *,
                        string_key: bytes | None = None,
-                       module_id: str | None = None) -> tuple[types.CodeType, dict]:
+                       module_id: str | None = None,
+                       plan: RenamePlan | None = None) -> tuple[types.CodeType, dict]:
     """源码 → 混淆 code object：parse → transform → compile(tree, "exec")。
 
     string_key/module_id 透传字符串加密 pass（都给才启用，§13.3③ S6）。
+    plan 透传跨模块统一改名（RFT；缺省 None = 单文件一期行为）。
     co_filename=filename（调用方传包内相对路径，同时作 keystream 的 module_id）；
     compile(ast_obj) 保留原行号，docstring 剥离只删 Expr(Constant(str)) 节点，
     其余语句 lineno 不重排。
     """
     tree = ast.parse(src_text, filename)
     tree, stats = transform(tree, filename, string_key=string_key,
-                            module_id=module_id)
+                            module_id=module_id, plan=plan)
     code = compile(tree, filename, "exec")
     return code, stats
+
+
+# ---------------------------------------------------------------- ★R-13★ 双编译对拍（§4.1.5 ①）
+class ParityError(Exception):
+    """对拍失败：符号面差异存在映射表/密钥表之外的解释（多改/少改/错改）。"""
+
+
+def _param_names(co: types.CodeType) -> tuple[str, ...]:
+    """参数名前缀（位置/kwonly/*args/**kwargs——varnames 布局按此序）。"""
+    n = co.co_argcount + co.co_kwonlyargcount
+    if co.co_flags & 0x04:                   # CO_VARARGS
+        n += 1
+    if co.co_flags & 0x08:                   # CO_VARKEYWORDS
+        n += 1
+    return co.co_varnames[:n]
+
+
+def _child_codes(co: types.CodeType) -> list[types.CodeType]:
+    # stub 函数按名排除（_check_stub_name_conflicts 已保证业务源码不可能占用该名）
+    return [c for c in co.co_consts
+            if isinstance(c, types.CodeType) and c.co_name != _STUB_FUNC]
+
+
+def _cipher_bytes(str_table: list[str], key: bytes, mid: str) -> set[bytes]:
+    """密文全集（表条目 + stub wrapped/mask——与 _stub_statements 同派生式）。"""
+    out = set()
+    for s in str_table:
+        raw = s.encode("utf-8")
+        out.add(xor_bytes(raw, keystream(key, mid, len(raw))))
+    mask = keystream(key, mid + _MASK_TAG, 32)
+    out.add(xor_bytes(key, mask))
+    out.add(mask)
+    return out
+
+
+def _docstring_consts(tree: ast.Module) -> set:
+    """原码全树 docstring 文本集（Module/函数/类体首语句为 str Expr 的值）。
+
+    ★评审修复②★ 消失侧 consts[0] 豁免的精确判据：CPython 惯例「有 docstring
+    时 scope consts[0] 即 docstring」——但**无 docstring** 时 consts[0] 是首个
+    业务常量，笼统的 `c == a[0]` 会把该常量的真实消失误豁免（短串 <_MIN_STR
+    不进密钥表，是唯一漏检窗口）。以 AST 首语句判定把豁免收窄到真 docstring。
+    """
+    out: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                out.add(body[0].value.value)
+    return out
+
+
+def verify_parity(src_text: str, filename: str, obf_code: types.CodeType,
+                  stats: dict, *, string_key: bytes | None = None,
+                  module_id: str | None = None) -> None:
+    """★R-13★ 双编译对拍（§4.1.5 ①，每模块每构建全量断言，非抽样）：
+
+    compile(src) 与混淆 code object 逐层配对，符号面差异（co_names / 局部名 /
+    co_consts / co_name）必须被两张表逐项解释——
+      第一表 改名台账（stats["ledger"]，transform 实际落地的 (orig, new) 集，
+      覆盖 plan.map 模块级 + 函数局部 + 属性链 + from-import 四通道）；
+      第二表 字符串密钥表（stats["str_table"]，明文表序 = 密文 idx 序，密文可由
+      (string_key, module_id) 确定性重算——stub 注入物 wrapped/mask 同式重算）。
+    多改、少改、错改任何一个，ParityError 当场炸，到不了打包。
+
+    结构性红线独立于台账硬校验：参数名前缀逐位相等（参数是公开合同）；业务
+    code object 配对数相等（stub 函数按名排除——_check_stub_name_conflicts
+    已保证业务源码不可能占用该名）。
+
+    已知边界（R-12 边界一）：对拍证明「改名范围 = 台账」，不证明「程序仍正确」
+    ——漏改（保守豁免）只损覆盖率；运行时行为由特性矩阵 + 端到端冒烟兜底。
+    """
+    ledger: set = stats.get("ledger", frozenset())
+    str_table: list = stats.get("str_table", [])
+    str_on = string_key is not None and module_id is not None
+    ciphers = _cipher_bytes(str_table, string_key, module_id) if str_on else set()
+    orig_code = compile(src_text, filename, "exec")
+    docstrs = _docstring_consts(ast.parse(src_text, filename))
+    # ★评审修复③★ 注解漂移替换单趟化：台账合并为交替 pattern 一次 sub（回调查
+    # 表）——链式逐条 re.sub 在源码自定义 _o* 名入台账时，先替换出的新名可能被
+    # 后续 orig 再命中（frozenset 序敏感）。单趟替换结果与遍历序无关：交替分支
+    # 虽从左到右先到先得，但共享 \b 边界保证最长词形唯一命中（app 在 app_root
+    # 前匹配时尾 \b 失败回溯），无链式污染。
+    _drift_tbl = {o: n for o, n in ledger}
+    _drift_pat = (re.compile(r"\b(" + "|".join(
+        sorted((re.escape(o) for o, _ in ledger), key=len, reverse=True))
+        + r")\b") if ledger else None)
+    bad: list[str] = []
+
+    def face_names(co: types.CodeType) -> dict[str, frozenset]:
+        tail = co.co_varnames[len(_param_names(co)):]
+        return {"co_names": frozenset(co.co_names),
+                "locals": frozenset(tail) | frozenset(co.co_cellvars)
+                          | frozenset(co.co_freevars)}
+
+    def diff_names(what: str, a: frozenset, b: frozenset) -> None:
+        for n in a - b:                      # 消失的名：必须被台账登记为 orig
+            if n == "__doc__":
+                continue                     # 模块 docstring 剥离带走 STORE_NAME __doc__
+            if not any(o == n for o, _ in ledger):
+                bad.append(f"{what}: 消失名 {n!r} 无台账来源")
+        for n in b - a:                      # 新现的名：_o{n} 且台账登记为 new，或 stub 注入名
+            if n in _STUB_NAMES:
+                continue
+            if not any(v == n and n.startswith("_o") for _, v in ledger):
+                bad.append(f"{what}: 新现名 {n!r} 非台账改名且非 stub 注入")
+
+    def diff_consts(what: str, a: tuple, b: tuple) -> None:
+        # CodeType 不进集合 diff（无值语义，由 walk 逐位配对）——否则恒报漂移
+        sa = {c for c in a if not isinstance(c, types.CodeType)}
+        sb = {c for c in b if not isinstance(c, types.CodeType)}
+        ra, rb = sa - sb, sb - sa
+        added_strs = {c for c in rb if isinstance(c, str)}
+
+        def all_str_tuple(c) -> bool:
+            return isinstance(c, tuple) and c and all(isinstance(x, str) for x in c)
+
+        def str_tuple_paired(t1: tuple, pool: set) -> bool:
+            """str 元组常量配对（from-import 的 fromlist 元组随改写漂移）：
+            等长且逐位相等或 (x, y)/(y, x) ∈ 台账（两方向对称——调用侧 t1 可能
+            是原侧也可能是新侧）。"""
+            return any(isinstance(d, tuple) and len(d) == len(t1)
+                       and all(x == y or (x, y) in ledger or (y, x) in ledger
+                               for x, y in zip(t1, d)) for d in pool)
+
+        def keymap_degraded(t: tuple) -> bool:
+            """★P1.5★ 伴生规则：全常量键 dict 编译为 BUILD_CONST_KEY_MAP（键 =
+            str 元组常量）；任一键 ≥_MIN_STR 被加密替换为 _pkobf_d(idx) Call 后
+            3.12 编译器退化 BUILD_MAP——键元组消失、未加密键散为独立常量、加密
+            键进密钥表。逐元素 ∈ (str_table ∪ 新现散串) 全命中才放行——部分
+            命中（既未加密也未散现）必是真实漂移，拒绝。
+            ★评审已知窗口★（接受并声明）：added_strs 是新现散串全集，无「同源
+            dict」结构校验——无关漂移串凑巧逐元素全命中时会漏检。不收紧原因：
+            退化触发条件是「任一值被加密」（含全 <8 未加密键的 dict），t 元素
+            是否进密钥表与是否散现无必然绑定，任何同源判据都会误伤多 dict 共键
+            场景；漏检风险由 co_names/locals diff 与端到端冒烟独立兜底。"""
+            return all(x in str_table or x in added_strs for x in t)
+
+        def str_leaves(x, acc=None):
+            """嵌套常量容器的 str 叶子集（None/int 等非 str 叶子忽略）。"""
+            acc = set() if acc is None else acc
+            for e in x:
+                if isinstance(e, (tuple, frozenset)) and e:
+                    str_leaves(e, acc)
+                elif isinstance(e, str):
+                    acc.add(e)
+            return acc
+
+        added_tuple_leaves = set()
+        for u in rb:
+            if isinstance(u, (tuple, frozenset)) and u:
+                str_leaves(u, added_tuple_leaves)
+
+        def fold_degraded(t) -> bool:
+            """★真实项目伴生★：全常量容器字面量（list-of-tuples 路由权限表 /
+            set 字面量折叠为 frozenset）被 3.12 编译器整体折叠为常量；任一 str
+            叶子被加密替换为 _pkobf_d(idx) Call 后整体折叠失效——未加密叶子以
+            更低折叠粒度散现（子元组或散串）、加密叶子进密钥表。递归 str 叶子
+            逐个 ∈ (str_table ∪ 新现散串 ∪ 新现子元组叶子) 全命中才放行，部分
+            命中必是真实漂移。"""
+            leaves = str_leaves(t)
+            return bool(leaves) and all(x in str_table or x in added_strs
+                                        or x in added_tuple_leaves
+                                        for x in leaves)
+
+        def fold_member(x) -> bool:
+            """新现侧散串/子元组：str 叶子是某合法退化折叠体叶子的子集。"""
+            ls = str_leaves(x) if isinstance(x, (tuple, frozenset)) else {x}
+            return bool(ls) and any(ls <= str_leaves(t) and fold_degraded(t)
+                                    for t in ra
+                                    if isinstance(t, (tuple, frozenset)) and t)
+
+        def annotation_drift(x: str, pool: set) -> bool:
+            """注解 const 随改名漂移（★真实项目伴生★）：3.12 类/模块体注解
+            字符串化（__future__.annotations 或类体注解的惰性编码），注解文本
+            内的名字即 AST Name——RFT 改名后编译器重生成注解字符串（orig
+            'DeviceStatus | None' → obf '_o53 | None'；AnnAssign 的
+            __annotations__ 键 'ROLES' → '_o21' 同族）。消失侧文本按台账全词
+            单趟替换后与新现侧逐字相等 → 合法：引用与绑定同步漂移，运行期解析
+            走模块命名空间（_o53 与 ns['_o53'] 一致），语义等价。x 是原侧文本
+            （含台账 orig 词）走正向替换比对；否则是新侧文本，反向找 pool 中
+            可替换出 x 的原侧文本。"""
+            if _drift_pat is None:
+                return False
+            if _drift_pat.search(x):
+                r = _drift_pat.sub(lambda m: _drift_tbl[m.group(0)], x)
+                return r != x and r in pool
+            for s in pool:
+                if not isinstance(s, str) or not _drift_pat.search(s):
+                    continue
+                r = _drift_pat.sub(lambda m: _drift_tbl[m.group(0)], s)
+                if r == x and r != s:
+                    return True
+            return False
+
+        for c in ra:
+            if isinstance(c, str) and (c in str_table
+                                       or (c == a[0] and c in docstrs)):
+                continue          # 加密替换 / docstring 剥离（★评审修复②★ 豁免
+                                  # 收窄到 AST 判定的真 docstring——无 docstring
+                                  # 时 consts[0] 是业务常量，不得凭位次豁免）
+            if isinstance(c, str) and annotation_drift(c, rb):   # 注解 const 漂移
+                continue
+            if all_str_tuple(c) and (str_tuple_paired(c, rb)     # fromlist 改写
+                                     or keymap_degraded(c)):     # 键元组退化
+                continue
+            if isinstance(c, (tuple, frozenset)) and c \
+                    and fold_degraded(c):                        # 折叠体退化
+                continue
+            bad.append(f"{what}: 消失常量 {c!r} 无合法解释")
+        for c in rb:
+            if str_on:
+                if isinstance(c, bytes) and c in ciphers:
+                    continue
+                if isinstance(c, tuple) and c and all(       # 3.12 _TBL 列表字面量
+                        isinstance(x, bytes) and x in ciphers for x in c):
+                    continue                                 #   常量折叠为 tuple const
+                if isinstance(c, str) and c == module_id:    # stub 内嵌 module_id
+                    continue
+                if isinstance(c, int) and 0 <= c < len(str_table):
+                    continue                                 # stub Call(_pkobf_d, idx)
+            if all_str_tuple(c) and str_tuple_paired(c, ra):  # fromlist 改写
+                continue
+            if isinstance(c, str) and any(                   # 键元组退化的未加密键
+                    all_str_tuple(t) and c in t and keymap_degraded(t)
+                    for t in ra):
+                continue
+            if c is None and a and isinstance(a[0], str) and a[0] in docstrs \
+                    and a[0] not in sb:
+                continue          # docstring 剥离伴生：3.12 函数 scope const 池恒带
+                                  # docstring 槽位（无 docstring 时填 None 占位）——
+                                  # 原码 consts[0] 的 docstring 被剥离后槽位 None 新现
+                                  # （a[0] 须是真 docstring，同★评审修复②★判据）
+            if isinstance(c, str) and annotation_drift(c, ra):   # 注解 const 漂移
+                continue
+            if fold_member(c):    # 折叠体退化的散串/子元组
+                continue
+            bad.append(f"{what}: 新现常量 {c!r} 非字符串加密/注入物")
+
+    def walk(oco: types.CodeType, bco: types.CodeType, path: str) -> None:
+        if _param_names(oco) != _param_names(bco):
+            bad.append(f"{path}: 参数名前缀漂移 {_param_names(oco)} != {_param_names(bco)}")
+        if oco.co_name != bco.co_name \
+                and (oco.co_name, bco.co_name) not in ledger:
+            bad.append(f"{path}: co_name {oco.co_name!r}→{bco.co_name!r} 无台账")
+        fa, fb = face_names(oco), face_names(bco)
+        diff_names(f"{path} co_names", fa["co_names"], fb["co_names"])
+        diff_names(f"{path} locals", fa["locals"], fb["locals"])
+        diff_consts(f"{path} consts", oco.co_consts, bco.co_consts)
+        ka, kb = _child_codes(oco), _child_codes(bco)
+        if len(ka) != len(kb):
+            bad.append(f"{path}: 子 code object 数 {len(ka)}!={len(kb)}")
+            return
+        for i, (x, y) in enumerate(zip(ka, kb)):
+            walk(x, y, f"{path}<{i}:{y.co_name}>")
+
+    walk(orig_code, obf_code, filename)
+    if bad:
+        raise ParityError(filename + " 对拍失败:\n  " + "\n  ".join(bad[:20]))
