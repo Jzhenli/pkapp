@@ -625,16 +625,36 @@ PKKEY_API const char *pk_x3(void)
  * pk_x2 解密"，输出裸 marshal 字节；解释器侧装载（marshal/exec/注入 sys.modules）
  * 归壳——件内不引用任何 Python API，零依赖独立件纪律与 Android 可构建性保住。
  * 协议知识单点收敛：mid（两块分散常量栈上拼装）/blob 文件名（sha256(mid) hex
- * + ".enc"）/目录布局（"<root>/site-packages/applocal/"）。
+ * + ".enc"）/目录布局（★P0★ windows 收拢形态 "<root>/site-packages/loose/applocal/"
+ * 优先，android/旧形态 "<root>/site-packages/applocal/" 兜底，双路径探测）。
  * 缓冲两段式（跨 CRT 堆规避：件内 malloc 的读文件缓冲件内 free，永不出界）；
  * NOBLOB 是明文包常态而非错误（壳静默跳过）；加密包 blob 缺失不降级——明文
  * _codekey.py 已删，Python 侧 import 必失败（fail-closed，§5.4 同纪律）。 */
+/* UTF-8 字节路径打开（★review 修复①★ 同款语义抽出）：fopen 在 MSVC 是 ANSI
+ * （CP_ACP）语义——壳传来的 UTF-8 字节路径在中文系统（GBK 代码页）被误读，
+ * 含中文用户名的安装路径必挂。Windows 转宽字符走 _wfopen；POSIX 直开。 */
+static FILE *pkkey_fopen_utf8(const char *path)
+{
+#ifdef _WIN32
+    {
+        int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+        wchar_t wpath[1024];
+        if (wn > 0 && wn <= (int)(sizeof wpath / sizeof wpath[0]) &&
+            MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn) == wn)
+            return _wfopen(wpath, L"rb");
+        return NULL;
+    }
+#else
+    return fopen(path, "rb");
+#endif
+}
+
 PKKEY_API int pk_x4(
     const char *runtime_root,
     unsigned char *out, unsigned long long out_cap,
     unsigned long long *out_len)
 {
-    char mid[18], blobname[69], path[1024];
+    char mid[18], blobname[69];
     unsigned char *buf;
     unsigned long long payload;
     uint8_t d[32];
@@ -646,8 +666,8 @@ PKKEY_API int pk_x4(
     if (!runtime_root || !out_len)
         return PKKEY_E_ARGS;
     rl = strlen(runtime_root);
-    if (rl == 0 || rl + 93 > sizeof path)    /* 24(目录) + 68(blob 名) + NUL */
-        return PKKEY_E_ARGS;
+    if (rl == 0 || rl > 900)
+        return PKKEY_E_ARGS;                 /* 超长 root 由循环内 path[1024] 容量检查兜底 */
     /* mid 栈上拼装 + 偏置还原（k_m1 ‖ k_m2，见分散常量注释）；blob 文件名 = sha256(mid) hex。
      * ★volatile 读取★：static const 片段 ⊕ 常量的循环会被优化器常量折叠——
      * 还原后的完整 mid 明文烧进 .rdata（strings 直捞命中，实测 0x15c50）；
@@ -669,26 +689,27 @@ PKKEY_API int pk_x4(
         }
     }
     memcpy(blobname + 64, ".enc", 5);
-    memcpy(path, runtime_root, rl);
-    memcpy(path + rl, "/site-packages/applocal/", 24);
-    memcpy(path + rl + 24, blobname, 69);
     pkkey_secure_zero(d, sizeof d);
-#ifdef _WIN32
-    /* ★review 修复①★ fopen 在 MSVC 是 ANSI（CP_ACP）语义——壳传来的 UTF-8
-     * 字节路径在中文系统（GBK 代码页）被误读，含中文用户名的安装路径必挂。
-     * 转宽字符走 _wfopen（仅本函数，Windows 专属 API 不入 POSIX 分支）。 */
     {
-        int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-        wchar_t wpath[1024];
-        if (wn > 0 && wn <= (int)(sizeof wpath / sizeof wpath[0]) &&
-            MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn) == wn)
-            f = _wfopen(wpath, L"rb");
-        else
-            f = NULL;
+        /* 双路径探测（★P0★）：windows 收拢形态 loose 聚合目录在前，android/
+         * 旧形态兜底；两处皆无 = NOBLOB。路径串为目录名（非密钥知识），栈上
+         * 拼装后即用即弃；UTF-8 打开分支共用 pkkey_fopen_utf8。 */
+        static const char DIR_LOOSE[] = "/site-packages/loose/applocal/";
+        static const char DIR_TOP[] = "/site-packages/applocal/";
+        const char *dirs[2] = {DIR_LOOSE, DIR_TOP};
+        int di;
+        f = NULL;
+        for (di = 0; di < 2 && !f; di++) {
+            size_t dl = strlen(dirs[di]);
+            char path[1024];
+            if (rl + dl + 69 > sizeof path)     /* dl(目录) + 68(blob 名) + NUL */
+                continue;
+            memcpy(path, runtime_root, rl);
+            memcpy(path + rl, dirs[di], dl);
+            memcpy(path + rl + dl, blobname, 69);
+            f = pkkey_fopen_utf8(path);
+        }
     }
-#else
-    f = fopen(path, "rb");
-#endif
     if (!f)
         return PKKEY_E_NOBLOB;               /* 明文包常态 / 加密包损坏（不降级） */
     if (fseek(f, 0, SEEK_END) != 0 || (fsize = ftell(f)) < 0 ||

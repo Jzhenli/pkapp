@@ -38,6 +38,9 @@ const char *manifest_get(const manifest_doc *doc, const char *key);
    out 由调用者提供（≥ text_len + 1）。返回写入长度。 */
 size_t manifest_canonical(const char *text, size_t text_len, char *out);
 
+/* 内置发布公钥（Ed25519 raw hex；spk manifest 与 integrity 侧车共用一枚，Q7） */
+const char *shell_pub_hex(void);
+
 /* 仅签名链（协议 B §2 顺序前三步：全键非空 → format_version → Ed25519 验签）。
    供无 spk 场景复验已装 manifest；manifest_verify 在此之上追加 spk_hash 重算。 */
 int manifest_check_signature(const manifest_doc *doc, const char *manifest_text,
@@ -46,7 +49,7 @@ int manifest_check_signature(const manifest_doc *doc, const char *manifest_text,
 
 /* 完整验签链（协议 B §2）：
    1) 全键非空（10 键 + signature）
-   2) format_version == "1"
+   2) format_version == "2"（★P0★ 旧 format 1 无 integrity 侧车 → 拒绝）
    3) Ed25519 验签（内置公钥 vs 待签正文）
    4) spk_hash 同法重算比对（排除 manifest 条目）
    返回 0 通过；失败时 err_stage 写 "keys"/"format"/"signature"/"spk_hash"，

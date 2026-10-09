@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from . import integrity
 from . import spk
 
 # §2 键位顺序（写盘顺序即展示顺序；signature 恒最后）
@@ -69,11 +70,15 @@ def verify_spk(spk_path: str, public_hex: str) -> tuple[dict, str]:
     for k in REQUIRED_NONEMPTY:  # G2
         if not fields.get(k):
             raise ValueError(f"manifest 键缺失或为空: {k}")
-    if fields["format_version"] != "1":
+    if fields["format_version"] not in ("1", "2"):   # ★P0 Q2★ 2 = integrity 侧车契约
         raise ValueError(f"未知 format_version: {fields['format_version']}（壳须拒绝并提示需新壳）")
     if not _sign.verify(public_hex, canonical_bytes(text), fields["signature"]):
         raise ValueError("验签失败（签名与正文不匹配）")
-    actual = spk.spk_hash([e for e in entries if e[0] != spk.MANIFEST_ENTRY])
+    # spk_hash 签名面排除 manifest 与 _integrity/ 侧车条目（★P0 Q7★ 循环引用规避，
+    # 与壳侧 manifest_verify 同规则）
+    actual = spk.spk_hash([e for e in entries
+                           if e[0] != spk.MANIFEST_ENTRY
+                           and not e[0].startswith(integrity.INTEGRITY_DIR + "/")])
     expected = fields["spk_hash"]
     if expected.startswith("sha256:"):
         expected = expected[len("sha256:"):]

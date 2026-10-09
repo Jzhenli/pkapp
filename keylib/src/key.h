@@ -68,7 +68,9 @@ PKKEY_API int pk_x2(
 PKKEY_API const char *pk_x3(void);
 
 /* applocal 引导装载（停在 marshal.loads 之前）：从 runtime_root 定位
- * "<root>/site-packages/applocal/<sha256(mid) hex>.enc"（mid 见 key.c 分散常量），
+ * "<root>/site-packages/loose/applocal/<sha256(mid) hex>.enc"（★P0★ windows
+ * 收拢形态，优先）或 "<root>/site-packages/applocal/<...>.enc"（android/旧形态
+ * 兜底；mid 见 key.c 分散常量），
  * 读文件 → 复用 pk_x2 解密（AAD 绑定 mid）→ 输出裸 marshal 字节。
  * 两段式：第一遍 out_cap=0（out 可 NULL）→ 返回 PKKEY_E_CAP 且 *out_len 回填
  * 必需大小；调用方分配后第二遍真装载。

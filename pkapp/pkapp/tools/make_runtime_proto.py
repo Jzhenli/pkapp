@@ -25,13 +25,15 @@ from ..packager.runtime import resolve
 from .mockkit import make_wheel
 
 # G11 冒烟脚本（在目标解释器内执行）：_pth 生效 + 真 pyd 加载 + site-packages 解析
-# 注意：_pth 含 "import site" 行 → no_site==0 是 B.x 设计（re-enable site），不断言它
+# ★P0★ 收窄后 site-packages/ 本身不上 sys.path（deps.zip + 散件目录上），改断言
+# deps.zip/散件可解析：applocal（散件）与 certifi（含 cacert.pem 数据文件）
 _SMOKE = r"""
 import sys
 assert any(p.replace("\\", "/").endswith("python312.zip") for p in sys.path), sys.path
-assert any(p.replace("\\", "/").endswith("site-packages") for p in sys.path), sys.path
+assert any(p.replace("\\", "/").endswith("deps.zip") for p in sys.path), sys.path
 import ssl, sqlite3, asyncio, bz2, lzma, hashlib, json   # 真 pyd 加载（B.s 闭包实证）
-import applocal
+import applocal, certifi
+assert certifi.where().endswith("cacert.pem"), certifi.where()
 print("G11-OK", sys.version.split()[0], "openssl=" + ssl.OPENSSL_VERSION.split()[0],
       "applocal=" + applocal.__version__)
 """
@@ -72,7 +74,15 @@ def run(snapshot_dir: str, outdir: str | None = None,
         make_wheel(wheels, name, ver, files)
 
     ensure("applocal", "0.1.0", {"applocal/__init__.py": '__version__ = "0.1.0"\n'})
-    make_wheel(wheels, "certifi", "2024.1.1", {"certifi/__init__.py": "", "certifi/core.py": ""})
+    # certifi mock 对齐 B.v 真实形态：含 cacert.pem 数据文件（非惰性 → P0 收拢
+    # 判定散件化，B.z⑥ 检查的就是散件目录）+ where() API（G11 冒烟断言用）
+    make_wheel(wheels, "certifi", "2024.1.1",
+               {"certifi/__init__.py":
+                    "import os\n"
+                    "def where():\n"
+                    "    return os.path.join(os.path.dirname(__file__), 'cacert.pem')\n",
+                "certifi/core.py": "",
+                "certifi/cacert.pem": "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n"})
     ensure("uvicorn", "0.30.0", {"uvicorn/__init__.py": ""})
 
     # 2) 真快照走完整构建管线

@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from ..appspec import SpecError, load
+from ..packager import integrity
 from ..packager import runtime as rtmod
 
 
@@ -46,7 +47,81 @@ def _venv_applocal_version(project: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else f"missing（{r.stderr.strip()[:80]}）"
 
 
-def cmd_doctor(project: str) -> int:
+def _check_integrity(project: str, install_dir: str) -> int:
+    """★P0★ Q5 离线审计：镜像壳 integrity_gate 语义（验签 + 对称差），免启动应用。
+
+    install_dir = 部署目录（exe/integrity.manifest(.sig)/_runtime 同级）；侧车缺失
+    时从同目录 *.spk 的 _integrity/ 条目自愈读取（与壳 integrity_gate 自愈分支同
+    合同）。公钥 = 项目密钥对（build 签名同一枚，Q7——壳内嵌公钥同一枚，验过即
+    部署面未被替换/篡改）。返回 0 = 通过；1 = 存在问题（逐条已打印）。
+    """
+    from ..packager import sign
+    from ..packager import spk as spk_mod
+
+    side_m = os.path.join(install_dir, integrity.SIDECAR_NAME)
+    side_s = os.path.join(install_dir, integrity.SIDECAR_SIG_NAME)
+    try:
+        with open(side_m, "rb") as f:
+            text = f.read()
+        with open(side_s, "rb") as f:
+            sig = f.read().decode("ascii").strip()
+    except OSError:
+        text = sig = None
+        for s in glob.glob(os.path.join(install_dir, "*.spk")):
+            try:
+                entries = dict(spk_mod.read_spk(s))
+                if integrity.SPK_MANIFEST_ENTRY in entries and integrity.SPK_SIG_ENTRY in entries:
+                    text = entries[integrity.SPK_MANIFEST_ENTRY]
+                    sig = entries[integrity.SPK_SIG_ENTRY].decode("ascii")
+            except Exception:
+                continue                    # 损坏 spk（含 sig 条目非 ASCII）→ 视同不可读跳过
+            if sig is not None:
+                print(f"[doctor] integrity: 侧车缺失，从 {os.path.basename(s)} 自愈读取"
+                      "（部署面侧车文件被删——壳首启亦走此路径）")
+                break
+        if text is None:
+            print(f"[doctor] integrity: 侧车缺失且无含 _integrity/ 的 spk @ {install_dir}"
+                  "——非 format 2 部署面（旧包/目录错误）")
+            return 1
+    try:
+        key_path = sign.resolve_private_key(None, project)
+        if key_path is None:
+            raise sign.SignError("未定位到签名私钥"
+                                 "（PKAPP_SIGN_KEY / <project>/.pkapp/sign.key）")
+        pub = sign.public_key_hex(key_path)
+    except sign.SignError as e:
+        print(f"[doctor] integrity: 公钥不可得（{e}）——无法验签，审计中止")
+        return 1
+    if not integrity.verify_signature(text, sig, pub):
+        print("[doctor] integrity: 清单签名验证失败——部署面与项目密钥不配对"
+              "（包被替换或公钥换了）")
+        return 1
+    try:
+        manifest = integrity.parse(text)
+    except ValueError as e:
+        print(f"[doctor] integrity: 清单非法: {e}")
+        return 1
+    rt = os.path.join(install_dir, "_runtime")
+    if not os.path.isdir(rt):
+        print(f"[doctor] integrity: _runtime 不存在 @ {install_dir}"
+              "（未首启解包？壳首启 unpack 后再审计）")
+        return 1
+    missing, extra, mismatch = integrity.diff(manifest, integrity.build_entries(rt))
+    if not (missing or extra or mismatch):
+        print(f"[doctor] integrity: ok（验签 ok，{len(manifest)} 件全一致 @ {install_dir}）")
+        return 0
+    for label, items in (("缺失", missing), ("清单外", extra), ("篡改", mismatch)):
+        for rel in items[:10]:
+            print(f"[doctor] integrity: {label}: {rel}")
+        if len(items) > 10:
+            print(f"[doctor] integrity: {label}: …共 {len(items)} 件")
+    return 1
+
+
+def cmd_doctor(project: str, integrity_dir: str | None = None) -> int:
+    # ★P0★ Q5 专项模式：只做部署面完整性审计，退出码直接可用（0 ok / 1 fail）
+    if integrity_dir:
+        return _check_integrity(project, os.path.abspath(integrity_dir))
     problems = 0
     print(f"[doctor] pkapp {__import__('pkapp').__version__} / python {sys.version.split()[0]}")
 

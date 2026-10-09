@@ -36,6 +36,38 @@ def test_package_windows_requires_spk(tmp_path, capsys):
     assert "未找到 spk" in capsys.readouterr().out
 
 
+def test_package_sidecar_extract_and_format1_rejected(tmp_path):
+    """★P0★ 侧车提取：spk _integrity/* → exe 旁两文件；旧 format 1（无侧车）
+    → RuntimeError 引导重 build（新壳拒收，组装期提前给可行动错误）。"""
+    from pkapp.commands.package import _extract_integrity_sidecar
+    from pkapp.packager import integrity as ig
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import spk as spk_mod
+
+    proj = _make_project(tmp_path)
+    key = sign_mod.generate_keypair(os.path.join(proj, ".pkapp"))[0]
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    text = ig.render({"site-packages/deps.zip": "a" * 64})
+    sig = ig.sign_manifest(text, key)
+    spk_path = str(tmp_path / "runtime.spk")
+    entries = sorted(
+        [(spk_mod.MANIFEST_ENTRY, b"format_version = 2\nsignature = unsigned\n")]
+        + ig.spk_sidecar_entries(text, sig),
+        key=lambda e: e[0].encode("utf-8"))
+    spk_mod.write_spk(spk_path, entries)
+    _extract_integrity_sidecar(spk_path, stage)
+    with open(os.path.join(stage, ig.SIDECAR_NAME), "rb") as f:
+        assert f.read() == text
+    with open(os.path.join(stage, ig.SIDECAR_SIG_NAME), "rb") as f:
+        assert f.read() == sig.encode("ascii")
+
+    old = str(tmp_path / "old.spk")   # format 1：无 _integrity/ 条目
+    spk_mod.write_spk(old, [(spk_mod.MANIFEST_ENTRY, b"format_version = 1\n")])
+    with pytest.raises(RuntimeError, match="重新 pkapp build windows"):
+        _extract_integrity_sidecar(old, stage)
+
+
 @pytest.mark.skipif(not os.path.isfile(_SHELL), reason="预编译壳未构建")
 def test_package_windows_gate_rejects_bad_spk(tmp_path, capsys):
     proj = _make_project(tmp_path)

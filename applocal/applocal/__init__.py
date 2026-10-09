@@ -23,6 +23,7 @@ if _os.environ.get("MYAPP_NATIVE_LIB_DIR"):
 from ._core import (bootstrap, build_asgi_app, diag, migrate, on_background,
                     pick_port, read_diag, set_process_title, start_heartbeat,
                     write_ready)
+from ._audit import record_event
 from ._env import ContractError, load_env
 
 __version__ = "0.1.0"
@@ -63,5 +64,5 @@ __all__ = [
     "migrate", "diag", "read_diag", "on_background", "build_asgi_app",
     "start_heartbeat", "write_ready",
     # 异常与工具（不算冻结函数，但属公开面）
-    "ContractError", "load_env", "pick_port",
+    "ContractError", "load_env", "pick_port", "record_event",
 ]

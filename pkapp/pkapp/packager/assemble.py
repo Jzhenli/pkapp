@@ -27,6 +27,7 @@ import zipfile
 from ..appspec import AppSpec
 from ..toolchain import cache_root
 from ..util import (SPK_DATE, atomic_write, copy_tree, tree_hash, walk_files)
+from . import integrity
 from . import manifest as mf
 from . import pe, runtime, sign, spk
 from .keybuild import produce_keylib
@@ -36,7 +37,10 @@ from .keylib import (KeyLib, KeyLibError, APPLOCAL_BOOT_MID, INDEX_FILE_NAME,
                      resolve_master_key)
 from .runtime import RuntimeResolveError, RuntimeSnapshot
 
-FORMAT_VERSION = "1"
+# spk format_version per-platform（★P0 Q2★）：windows 2 = integrity 侧车契约 + 固化环境
+# （旧壳读新 spk 在 format 检查处拒绝；新壳读旧 spk（无侧车）fail-closed）；android 保持 1
+# （Q3 不进 P0——APK 签名承担包体完整性）。
+FORMAT_VERSIONS = {"windows": "2", "android": "1"}
 
 # B.s 系统白名单（真 PBS 3.12.14 实测回填：Cabinet/msi 来自 _msi.pyd，PROPSYS 来自 _wmi.pyd）
 _SYSTEM_DLLS = frozenset("""
@@ -645,6 +649,207 @@ def _placeholder_ui(ui_dir: str) -> None:
                  b"<p>pkapp placeholder ui - replace with frontend build output</p>")
 
 
+# ---------------------------------------------------- ★P0 §4.1★ 引导面收拢
+
+_LAZY_SUFFIXES = (".md", ".rst", ".txt", ".pyi", ".json")
+
+
+def _is_lazy_file(rel: str) -> bool:
+    """惰性文件判定：deps.zip 内允许出现的非 .py 文件（不参与执行、无注入面）。
+
+    = 文档/类型桩（.md/.rst/.txt/.pyi/.json）+ dist-info 元数据（INSTALLER/
+    METADATA/RECORD/WHEEL/py.typed 等）+ 许可证前缀（LICENSE*/COPYING*/NOTICE*，
+    大小写不敏感）。原生件（.pyd/.so/.dll）与 .pth 不在列——前者必须散件化
+    （Windows 不能从 zip 加载 pyd），后者在隔离模式本就不执行、出现即判漏洞。
+    """
+    base = rel.rsplit("/", 1)[-1].lower()
+    if base.endswith(_LAZY_SUFFIXES):
+        return True
+    if base in {"py.typed", "installer", "metadata", "record", "wheel",
+                "zip-safe", "not-zip-safe", "requested"}:   # pip --target 写 REQUESTED
+        return True
+    return base.startswith(("license", "copying", "notice"))
+
+
+def _has_namespace_pkg(unit_dir: str) -> bool:
+    """PEP 420 命名空间形态检测：.py 的任一层祖先目录缺 __init__.py（含 unit root）。
+
+    deps.zip 内 zipimport 只认 `<dir>/__init__.pyc`（包）与 `<mod>.pyc`（模块）
+    两种认领形态——目录无 __init__ 标记（PEP 420 namespace 段，如 fastapi 0.142
+    的硬依赖 opentelemetry）在 zip 里无法被认领（PEP 420 需真实目录枚举），
+    `No module named` 必现（G12 实跑实证）→ 此类发行版整目录散件化。
+    """
+    init_cache: dict[str, bool] = {}    # 父目录 → __init__.py 存在性（大库 O(N×D) 次重复 stat 收敛为每目录 1 次）
+
+    def _has_init(parent: str) -> bool:
+        if parent not in init_cache:
+            init_cache[parent] = os.path.isfile(os.path.join(parent, "__init__.py"))
+        return init_cache[parent]
+
+    for rel in walk_files(unit_dir):
+        if not rel.endswith(".py"):
+            continue
+        parts = rel.split("/")
+        for i in range(len(parts) - 1):          # 全部祖先目录，含 root（i=0）
+            parent = os.path.join(unit_dir, *parts[:i]) if i else unit_dir
+            if not _has_init(parent):
+                return True
+    return False
+
+
+def _unit_needs_loose(unit_dir: str) -> bool:
+    """散件化判定：发行版目录是否必须落散件（不进 deps.zip）。
+
+    - applocal 恒散件：P2 前过渡形态 = flat pyc-only 目录（原 P0.5 并入 P0），
+      且是 _codekey 密文化 blob 的落盘位置（壳 pk_x4 按包内路径定位）；
+    - 含 .pyd/.so/.dll：Windows 不能从 zip 加载原生扩展 → 整目录散件；
+    - 含非惰性数据文件（运行期需按真实路径读，如 certifi/cacert.pem）→ 整目录散件；
+    - 含 PEP 420 命名空间包（G12 实跑实证）：zipimport 认领不了 → 整目录散件。
+    """
+    if os.path.basename(unit_dir) == "applocal":
+        return True
+    for rel in walk_files(unit_dir):
+        low = rel.rsplit("/", 1)[-1].lower()
+        if low.endswith((".pyd", ".so", ".dll")):
+            return True
+        if not (low.endswith((".py", ".pyc")) or _is_lazy_file(rel)):
+            return True
+    return _has_namespace_pkg(unit_dir)
+
+
+def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str) -> None:
+    """目录树 → flat pyc-only（★P0 落盘形态★）：UNCHECKED_HASH 编译整树 →
+    __pycache__/<mod>.<tag>.pyc 移成同目录 flat <mod>.pyc → 删全部 .py 与
+    __pycache__。
+
+    flat 布局依据：目录场景 SourcelessFileLoader 认 <dir>/<mod>.pyc（与
+    zipimport 只认 zip 内扁平 .pyc 条目同构）；UNCHECKED_HASH = pyc 头与
+    构建时间解耦（可复现，D4）。编译失败（语法错等）由 _compile_checked_hash
+    直接 BuildError；缺 pyc 视为编译不完整 → BuildError。pyc tag 与
+    python_dll 名的对齐由编译解释器版本闸（防线 A/B）保证，这里只验
+    "编译已产出"（mock/回退打包机场景 tag 可能与快照不同名，结构不受影响）。
+    """
+    _compile_checked_hash(root, python_exe, python_dll, unchecked=True)
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            cache = os.path.join(dirpath, "__pycache__")
+            produced = (os.path.isdir(cache)
+                        and any(f.startswith(fn[:-3] + ".") and f.endswith(".pyc")
+                                for f in os.listdir(cache)))
+            if not produced:
+                raise BuildError(f"flat 化缺编译产物（pyc 缺失）: "
+                                 f"{os.path.relpath(os.path.join(cache, fn), root)}")
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        cache = os.path.join(dirpath, "__pycache__")
+        if not os.path.isdir(cache):
+            continue
+        for fn in os.listdir(cache):
+            m = re.fullmatch(r"(.+)\.cpython-\d+\.pyc", fn)
+            if not m:
+                raise BuildError(f"__pycache__ 内非预期编译产物: {fn}")
+            shutil.move(os.path.join(cache, fn),
+                        os.path.join(dirpath, m.group(1) + ".pyc"))
+        os.rmdir(cache)
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.endswith(".py"):
+                os.remove(os.path.join(dirpath, fn))
+
+
+def _pack_deps_zip(zip_units: list[str], out: str,
+                   python_exe: str | None, python_dll: str, work: str) -> int:
+    """zip_units（纯 Python 发行版 + 顶层散 .py + dist-info）→ site-packages/deps.zip。
+
+    内 pyc-only：整树 UNCHECKED_HASH 编译成 flat <dir>/<mod>.pyc 条目（.py 不进
+    zip）；非 .py 条目必须 _is_lazy_file，否则 = 散件化判定漏洞 → BuildError
+    （fail-fast，防静默产出运行期才暴露的坏包）。条目时间戳钉死（SPK_DATE）。
+    返回条目数。
+    """
+    for u in zip_units:
+        dst = os.path.join(work, os.path.basename(u))
+        if os.path.isdir(u):
+            shutil.copytree(u, dst)
+        else:
+            shutil.copyfile(u, dst)
+    _compile_flat_tree(work, python_exe, python_dll)
+    n = 0
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel in walk_files(work):
+            src = os.path.join(work, rel.replace("/", os.sep))
+            if not (rel.endswith(".pyc") or _is_lazy_file(rel)):
+                raise BuildError(f"deps.zip 收入非惰性文件（散件化判定漏洞）: {rel}")
+            zi = zipfile.ZipInfo(rel, date_time=SPK_DATE)
+            zi.external_attr = 0o644 << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            with open(src, "rb") as f:
+                zf.writestr(zi, f.read())
+            n += 1
+    return n
+
+
+def _consolidate_site_packages(stage: str, sp_dir: str,
+                               python_exe: str | None, python_dll: str,
+                               stem: str) -> None:
+    """★P0 §4.1★ site-packages 收拢：pip 安装结果 → deps.zip（纯 Python 发行版，
+    内 pyc-only）+ loose/ 散件聚合目录（含原生扩展/数据文件/applocal）+ ._pth 收窄。
+
+    ._pth 终态（隔离模式封死 .pth/PYTHONPATH，无 `import site`）：
+        <stem>.zip / DLLs / site-packages/deps.zip / site-packages/loose
+    site-packages/ 本身不上 sys.path——.pth 自动执行面从源头消失（§1.2 攻击面3）。
+
+    散件走「聚合目录 loose/」而非各发行版目录逐条上 path：import 语义要求包
+    X 的父目录在 sys.path 上（path hook 对 <entry>/X/__init__ 认领），发行版
+    目录自身当 path entry 只对平铺模块形态有效——实测（G11 实跑）包形态
+    （applocal/pydantic_core）全部漏认领。loose/ 一条 entry 承载全部散件目录，
+    pyd 相邻依赖（loose/<dist>/x.pyd）与数据文件相对路径（certifi.where()）
+    均不受影响。pk_x4 的 blob 定位公式已同步（loose 优先 + 旧形态兜底）。
+    """
+    zip_units: list[str] = []
+    loose_units: list[str] = []
+    for name in sorted(os.listdir(sp_dir)):
+        full = os.path.join(sp_dir, name)
+        if name == "__pycache__":
+            shutil.rmtree(full)
+            continue
+        if name.endswith(".dist-info"):
+            zip_units.append(full)          # 元数据随 zip（pydantic 实证良性）
+            continue
+        if os.path.isfile(full):
+            if name.lower().endswith((".pyd", ".so", ".dll")):
+                raise BuildError(f"site-packages 顶层原生散件不支持收拢: {name}")
+            zip_units.append(full)          # 顶层散 .py 模块/存根 → zip flat pyc
+            continue
+        if _unit_needs_loose(full):
+            loose_units.append(full)
+        else:
+            zip_units.append(full)
+
+    work = tempfile.mkdtemp(prefix="pkapp-deps-")
+    try:
+        n = _pack_deps_zip(zip_units, os.path.join(sp_dir, "deps.zip"),
+                           python_exe, python_dll, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    loose_dir = os.path.join(sp_dir, "loose")
+    os.makedirs(loose_dir, exist_ok=True)
+    for u in loose_units:
+        _compile_flat_tree(u, python_exe, python_dll)
+        shutil.move(u, os.path.join(loose_dir, os.path.basename(u)))
+    for u in zip_units:
+        if os.path.isdir(u):
+            shutil.rmtree(u)
+        else:
+            os.remove(u)
+    lines = [f"{stem}.zip", "DLLs", "site-packages/deps.zip", "site-packages/loose"]
+    atomic_write(os.path.join(stage, f"{stem}._pth"),
+                 ("\n".join(lines) + "\n").encode("utf-8"))
+    print(f"[build] site-packages 收拢：deps.zip {n} 条目 + loose/ 散件 "
+          f"{len(loose_units)} 目录（{', '.join(os.path.basename(u) for u in loose_units) or '无'}）；"
+          f"._pth 收窄（无 import site）")
+
+
 def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
               private_key: str | None = None, wheels_dir: str | None = None) -> dict:
     """完整构建。返回 manifest dict（含 spk_hash）。windows/android M1-M2；linux M3。"""
@@ -687,9 +892,8 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         #    后统一扫描，扫描域含 app/（Q5），行为不变仅时序后移）
         shutil.copytree(os.path.join(snapshot.dir, "DLLs"),
                         os.path.join(stage, "DLLs"))
-        # 4) _pth 四行（B.x 派生式；app/ 不得写入——由 applocal bootstrap 运行时追加）
-        pth = "\n".join([f"{stem}.zip", "DLLs", "site-packages", "import site"]) + "\n"
-        atomic_write(os.path.join(stage, f"{stem}._pth"), pth.encode("utf-8"))
+        # 4) _pth 由 5b 收拢函数生成（★P0 §4.1★：path 收窄 + 无 import site，随
+        #    散件目录清单动态派生——先于收拢写死会与收拢结果脱钩）
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）
         #    wheels_dir 缺省 → 全局托管缓存（<cache_root>/wheels/windows，跨项目/跨次构建复用）
         index_url, extra_index = spec.wheels_index(platform)
@@ -699,6 +903,13 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
                                         index_url=index_url, extra_index_url=extra_index)
         if not os.path.isdir(os.path.join(sp_dir, "certifi")):
             raise BuildError("site-packages 缺 certifi（B.v 出网信任链硬约束，B.z⑥）")
+        # 5b) site-packages 收拢（★P0 §4.1★）：applocal_version 探测前移（dist-info
+        #     随后收进 deps.zip，importlib.metadata 扫不到散件形态）→ 纯 Python
+        #     发行版收 deps.zip（内 pyc-only、剥 .py）、含原生扩展/数据文件/applocal
+        #     散件化（flat pyc）、._pth 收窄（site-packages/ 本身不上 sys.path）
+        applocal_version = _detect_applocal(sp_dir)
+        _consolidate_site_packages(stage, sp_dir, _snapshot_exe,
+                                   snapshot.python_dll, stem)
         # 6) app/ 与 ui/（packager 永不改写 app 内容；ui 恒存在。包内契约目录名 ui）
         app_src = os.path.join(project_dir, spec.app_dir)
         if not os.path.isdir(app_src):
@@ -745,13 +956,19 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         # 8) 树哈希 + manifest + 签名 + spk（闭包自检扫描域含 app/，Q5）
         check_closure(stage, snapshot.python_dll, extra_dirs=(app_stage,))
         runtime_hash = tree_hash(stage, excludes=("app", "ui"))
-        fields = _manifest_fields(spec, snapshot.python_dll,
+        fields = _manifest_fields(spec, "windows", snapshot.python_dll,
                                   f"sha256:{runtime_hash}",
-                                  _detect_applocal(sp_dir),
+                                  applocal_version,
                                   app_hash,
                                   os.path.join(stage, "ui"),
                                   code_key_id=code_key_id, code_salt=code_salt)
-        return _emit_spk(stage, fields, out_path, private_key)
+        # ★P0 §4.2★ 引导面完整性清单 + Ed25519 签名：覆盖 stage 全树（= _runtime
+        # 落盘终态，含 site-packages 收拢后形态与 app/ui），随 spk 以 _integrity/
+        # 前缀条目携带（package 期提取落 exe 旁；壳每启验签 + 对称差，fail-closed）
+        itext = integrity.render(integrity.build_entries(stage))
+        isig = integrity.sign_manifest(itext, private_key)
+        return _emit_spk(stage, fields, out_path, private_key,
+                         integrity_sidecar=integrity.spk_sidecar_entries(itext, isig))
     finally:
         shutil.rmtree(stage, ignore_errors=True)
         shutil.rmtree(lib_work, ignore_errors=True)
@@ -857,27 +1074,44 @@ def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
                            python_exe: str | None, python_dll: str) -> None:
     """★期1 S2★ applocal 解密器密文化——解密根出 Python 明文面（§5.6）。
 
-    _codekey.py → 快照解释器单文件 pyc（UNCHECKED_HASH，剥头后无语义差别）→
-    剥 16 字节头 → pk_x1(K, APPLOCAL_BOOT_MID) 加密 → 回验闸（解密回读一致 +
-    marshal 载荷为 code object，纪律同 app/ 加密）→ 落
-    site-packages/applocal/<blob_name(mid)> → 才删明文 _codekey.py。
+    双源分支（★P0★ 收拢后形态变化）：
+    - `_codekey.pyc`（收拢后）：_compile_flat_tree 已产出的 flat UNCHECKED_HASH
+      pyc，直读剥 16 字节头 = marshal 载荷；
+    - `_codekey.py`（android / 未收拢形态）：快照解释器单文件现编译（原路径）。
+    → pk_x1(K, APPLOCAL_BOOT_MID) 加密 → 回验闸（解密回读一致 + marshal 载荷
+    为 code object，纪律同 app/ 加密）→ 落 site-packages/applocal/<blob_name(mid)>
+    → **两个明文形态都删**（flat pyc 同样可离线反编译，marshal 残留即明文面）。
     运行期：壳调 keylib pk_x4 定位并解密（停在 marshal.loads 之前）→ 壳 C 层
     marshal/exec 注入 sys.modules。mid/blob 名公式与 key.c 逐位一致（k_m1/k_m2
     偏置拼装 + sha256），漂移由 test_keylib blob_name 对拍拦截。
     明文包（code_encryption=false）不走本函数——壳侧 pk_x4 NOBLOB 静默跳过，
     Python 侧常规 wheel 装入的明文 _codekey 照常工作（双形态兼容）。
     """
-    sp_applocal = os.path.join(stage, "site-packages", "applocal")
-    src = os.path.join(sp_applocal, "_codekey.py")
-    if not os.path.isfile(src):
-        raise BuildError("applocal 缺 _codekey.py（解密器密文化无从进行）——"
+    sp_applocal = None                          # ★P0★ loose 聚合目录优先，顶层兜底
+    for cand in (os.path.join(stage, "site-packages", "loose", "applocal"),
+                 os.path.join(stage, "site-packages", "applocal")):
+        if os.path.isfile(os.path.join(cand, "_codekey.pyc")) or \
+                os.path.isfile(os.path.join(cand, "_codekey.py")):
+            sp_applocal = cand
+            break
+    if sp_applocal is None:
+        raise BuildError("applocal 缺 _codekey.py/.pyc（解密器密文化无从进行）——"
                          "applocal wheel 缺失或版本不符，请检查依赖收集")
-    with tempfile.TemporaryDirectory(prefix="pkapp-ckey-") as td:
-        pyc = os.path.join(td, "codekey.pyc")
-        _compile_one_pyc(python_exe, python_dll, src, pyc,
-                         "applocal/_codekey.py")
-        with open(pyc, "rb") as f:
+    src_py = os.path.join(sp_applocal, "_codekey.py")
+    src_pyc = os.path.join(sp_applocal, "_codekey.pyc")
+    if os.path.isfile(src_pyc):
+        with open(src_pyc, "rb") as f:          # ★P0★ 收拢后 flat pyc 直读
             raw = f.read()
+    elif os.path.isfile(src_py):
+        with tempfile.TemporaryDirectory(prefix="pkapp-ckey-") as td:
+            pyc = os.path.join(td, "codekey.pyc")
+            _compile_one_pyc(python_exe, python_dll, src_py, pyc,
+                             "applocal/_codekey.py")
+            with open(pyc, "rb") as f:
+                raw = f.read()
+    else:
+        raise BuildError("applocal 缺 _codekey.py/.pyc（解密器密文化无从进行）——"
+                         "applocal wheel 缺失或版本不符，请检查依赖收集")
     if len(raw) <= 16:
         raise BuildError("_codekey pyc 过短（不足 16 字节头）")
     payload = raw[16:]                          # 剥 pyc 头 = marshal 载荷（§5.3）
@@ -900,7 +1134,9 @@ def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
         raise BuildError("_codekey 载荷非 code object")
     with open(os.path.join(sp_applocal, blob_name(APPLOCAL_BOOT_MID)), "wb") as f:
         f.write(blob)
-    os.remove(src)
+    for p in (src_py, src_pyc):                 # ★P0★ 两个明文形态都删（防 marshal 残留）
+        if os.path.isfile(p):
+            os.remove(p)
     print(f"[build] applocal/_codekey 已密文化（解密根出明文面，"
           f"{len(payload)}B → {blob_name(APPLOCAL_BOOT_MID)}）")
 
@@ -972,11 +1208,12 @@ def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
     return kl.key_id()
 
 
-def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
-                     applocal_version: str, app_hash: str, ui_dir: str,
-                     code_key_id: str = "", code_salt: str = "") -> dict:
+def _manifest_fields(spec: AppSpec, platform: str, python_dll: str,
+                     runtime_hash: str, applocal_version: str, app_hash: str,
+                     ui_dir: str, code_key_id: str = "",
+                     code_salt: str = "") -> dict:
     fields = {
-        "format_version": FORMAT_VERSION,
+        "format_version": FORMAT_VERSIONS[platform],   # ★P0 Q2★ windows=2 / android=1
         "app_version": spec.version,
         "min_app_version": spec.min_app_version,
         "applocal_version": applocal_version,
@@ -996,8 +1233,13 @@ def _manifest_fields(spec: AppSpec, python_dll: str, runtime_hash: str,
 
 
 def _emit_spk(stage: str, fields: dict, out_path: str,
-              private_key: str | None) -> dict:
-    """stage → 树哈希 → spk_hash → 签名 → manifest → STORED spk（windows/android 共尾）。"""
+              private_key: str | None,
+              integrity_sidecar: list[tuple[str, bytes]] | None = None) -> dict:
+    """stage → 树哈希 → spk_hash → 签名 → manifest → STORED spk（windows/android 共尾）。
+
+    integrity_sidecar（★P0★）：_integrity/ 前缀条目（清单 + 签名）随 spk 携带——
+    spk_hash 签名面不含它们（循环引用规避），但条目整体受 spk Ed25519 验签覆盖。
+    """
     body_entries = sorted(
         [(rel, open(os.path.join(stage, rel.replace("/", os.sep)), "rb").read())
          for rel in _stage_files(stage)],
@@ -1011,6 +1253,8 @@ def _emit_spk(stage: str, fields: dict, out_path: str,
     fields["signature"] = signature
     manifest_text = mf.render(fields, signature)
     entries = body_entries + [(spk.MANIFEST_ENTRY, manifest_text.encode("utf-8"))]
+    if integrity_sidecar:
+        entries.extend(integrity_sidecar)
     entries.sort(key=lambda e: e[0].encode("utf-8"))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     spk.write_spk(out_path, entries)
@@ -1119,13 +1363,13 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
 
         # 4) manifest + 签名 + spk
         bundle = os.path.join(snapshot.dir, snapshot.abis[0], "libpythonbundle.so")
-        fields = _manifest_fields(spec, snapshot.python_dll,
+        fields = _manifest_fields(spec, "android", snapshot.python_dll,
                                   f"sha256:{_sha256_file(bundle)}",
                                   _detect_applocal(sp_dir),
                                   app_hash,
                                   os.path.join(stage, "ui"),
                                   code_key_id=code_key_id, code_salt=code_salt)
-        return _emit_spk(stage, fields, out_path, private_key)
+        return _emit_spk(stage, fields, out_path, private_key)   # android 无侧车（Q3 不进 P0）
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 

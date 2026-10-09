@@ -225,25 +225,57 @@ def test_zip_lib_pure_pyc(tmp_path):
     assert set(zipfile.ZipFile(out2).namelist()) == {"pkg/__init__.py", "lone.py"}
 
 
-def test_default_layout_py_sources(project, wheels_dir, tmp_path):
-    """★v0.7★ 默认布局：site-packages 恒只带 .py（无 pyc/__pycache__——目录树
-    首启自动建缓存，源码内省/RECORD 零副作用）；app/ 恒保留源码；golden B.z 仍过。
-    （stdlib zip 纯 pyc 断言在 test_zip_lib_pure_pyc——mock 快照 python.exe 为占位、
-    回退打包机 3.10 编译，集成里 pyc tag 与 cpython-312 不匹配走兜底写 .py。）"""
+def test_default_layout_p0_consolidated(project, wheels_dir, tmp_path):
+    """★P0 §4.1★ 收拢布局：site-packages = deps.zip（内 pyc-only，无 .py 源）
+    + 散件目录（applocal/certifi flat pyc，数据文件原样）；zip 与散件均无
+    __pycache__；app/ 恒保留源码；golden B.z 仍过；format_version = 2
+    （integrity 侧车契约）。（mock 快照 python.exe 为占位、回退打包机解释器编译。）"""
     out = str(tmp_path / "v7.spk")
     fields = _build(project, wheels_dir, out)
-    assert fields["format_version"] == "1"
+    assert fields["format_version"] == "2"
     with zipfile.ZipFile(out) as zf:
         stage = str(tmp_path / "stage")
         zf.extractall(stage)
     sp = os.path.join(stage, "site-packages")
-    assert os.path.isfile(os.path.join(sp, "applocal", "__init__.py"))
-    assert os.path.isfile(os.path.join(sp, "certifi", "cacert.pem"))  # 数据文件不动
+    deps = zipfile.ZipFile(os.path.join(sp, "deps.zip"))
+    names = deps.namelist()
+    assert names
+    assert not any(n.endswith(".py") for n in names)            # zip 内 pyc-only
+    assert any(n.endswith(".pyc") for n in names)
+    assert not any("__pycache__" in n for n in names)
+    assert os.path.isfile(os.path.join(sp, "loose", "applocal", "__init__.pyc"))  # 散件 flat pyc
+    assert os.path.isfile(os.path.join(sp, "loose", "certifi", "cacert.pem"))    # 数据文件原样
     sp_files = [os.path.join(dp, f) for dp, _dn, fs in os.walk(sp) for f in fs]
-    assert sp_files
-    assert not any(f.endswith(".pyc") for f in sp_files)
+    assert not any(f.endswith(".py") for f in sp_files)          # site-packages 无 .py 源
     assert not any("__pycache__" in f for f in sp_files)
-    assert os.path.isfile(os.path.join(stage, "app", "main.py"))      # app 源码恒保留
+    assert os.path.isfile(os.path.join(stage, "app", "main.py"))  # app 源码恒保留
+    golden_mod.assert_bz(stage, "python312.dll")
+
+
+def test_namespace_pkg_goes_loose(project, wheels_dir, tmp_path):
+    """★G12 实跑回归★ PEP 420 命名空间包（无 __init__.py 的多段 namespace，如
+    opentelemetry）不能进 deps.zip——zipimport 无法从 zip 认领（需真实目录枚举）
+    → 整目录散件化，导入语义由 loose 真实目录承担。"""
+    from pkapp.tools.mockkit import make_wheel
+
+    make_wheel(wheels_dir, "otelapi", "1.0.0", {
+        "nsotel/trace/__init__.py": "SPAN = 1\n",   # nsotel 目录无 __init__.py
+        "nsotel/trace/core.py": "def span():\n    return SPAN\n",
+    })
+    toml = os.path.join(project, "pkapp.toml")       # 依赖声明式供给：须声明才进闭包
+    with open(toml, encoding="utf-8") as f:
+        text = f.read()
+    with open(toml, "w", encoding="utf-8") as f:
+        f.write(text.replace('"uvicorn>=0.30"', '"uvicorn>=0.30",\n    "otelapi>=1.0.0"', 1))
+    out = str(tmp_path / "ns.spk")
+    _build(project, wheels_dir, out)
+    with zipfile.ZipFile(out) as zf:
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    dep = zipfile.ZipFile(os.path.join(stage, "site-packages", "deps.zip"))
+    assert not any(n.startswith("nsotel") for n in dep.namelist())
+    assert os.path.isfile(os.path.join(
+        stage, "site-packages", "loose", "nsotel", "trace", "__init__.pyc"))
     golden_mod.assert_bz(stage, "python312.dll")
 
 

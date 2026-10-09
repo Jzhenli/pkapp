@@ -1,6 +1,7 @@
 /* manifest.c — manifest 解析 / 规范化 / Ed25519+spk_hash 验签链（协议 B §2/§3/§6） */
 #include "manifest.h"
 #include "ed25519.h"
+#include "integrity.h"
 #include "sha256.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -118,6 +119,9 @@ static int hex_to_bytes(const char *hex, uint8_t *out, size_t outlen) {
 #endif
 static const char kPubHex[] = PKAPP_PUB_HEX;
 
+/* 公钥访问器：integrity 侧车验签复用同一枚（Q7 单密钥对） */
+const char *shell_pub_hex(void) { return kPubHex; }
+
 /* 仅签名链（keys→format→signature），供无 spk 场景复验已装 manifest；
    manifest_verify 在此之上追加 spk_hash 重算。 */
 int manifest_check_signature(const manifest_doc *doc, const char *manifest_text,
@@ -138,8 +142,10 @@ int manifest_check_signature(const manifest_doc *doc, const char *manifest_text,
         }
     }
     *err_stage = "format";
-    if (strcmp(doc->format_version, "1") != 0) {
-        snprintf(err_msg, err_cap, "未知 format_version: %s（需新版壳）", doc->format_version);
+    /* ★P0 Q2★ 双向拒绝：壳只认 format 2（integrity 侧车契约随此版本落地）。
+       旧 format 1 spk 无 _integrity 材料 → 在此拒绝（防"无校验降级路线"）。 */
+    if (strcmp(doc->format_version, "2") != 0) {
+        snprintf(err_msg, err_cap, "未知 format_version: %s（需匹配版本的应用包）", doc->format_version);
         return -1;
     }
     *err_stage = "signature";
@@ -201,14 +207,18 @@ int manifest_verify(const manifest_doc *doc, const char *manifest_text,
         return -1;
     *err_stage = "spk_hash";
     {
-        /* 排除 manifest 条目后按包内顺序重算 */
+        /* 排除 manifest 与 _integrity/（★P0 Q7★ 侧车条目——spk_hash 签名面
+           不含 integrity 清单，循环引用规避）后按包内顺序重算 */
         spk_entry *tmp = (spk_entry *)malloc(sizeof(spk_entry) * (size_t)(entry_count > 0 ? entry_count : 1));
         char actual[65];
         const char *expect = doc->spk_hash;
         int m = 0, rv = 0;
         if (!tmp) { snprintf(err_msg, err_cap, "内存不足"); return -1; }
         for (i = 0; i < entry_count; i++)
-            if (strcmp(entries[i].path, SPK_MANIFEST_ENTRY) != 0) tmp[m++] = entries[i];
+            if (strcmp(entries[i].path, SPK_MANIFEST_ENTRY) != 0 &&
+                strncmp(entries[i].path, SPK_INTEGRITY_PREFIX,
+                        sizeof(SPK_INTEGRITY_PREFIX) - 1) != 0)
+                tmp[m++] = entries[i];
         spk_hash_hex(tmp, m, actual);
         free(tmp);
         if (strncmp(expect, "sha256:", 7) == 0) expect += 7;

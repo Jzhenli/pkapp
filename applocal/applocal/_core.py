@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 
+from . import _audit
 from . import _env
 from ._env import Cfg, ContractError
 
@@ -537,6 +538,7 @@ def bootstrap(entry: str = "app.main:app") -> int:
     except Exception:
         _tlog = None
     _t = _tmark("load_env", _t, _tlog)
+    _audit.report_integrity_purge()                # ★P0★ Q8：native 侧 purge 事实补落库
     rt = cfg.runtime
     if rt.platform == "linux":                     # 步骤 0（§4.2：仅 Linux）
         set_process_title("myapp")

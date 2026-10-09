@@ -33,9 +33,11 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <time.h>
 
 #include "ed25519.h"
+#include "integrity.h"
 #include "manifest.h"
 #include "sha256.h"
 #include "spk.h"
@@ -382,6 +384,11 @@ static int extract_all(spk_file *spk, const std::wstring &staging, char *err, si
         std::wstring full;
         HANDLE h;
         DWORD written = 0;
+        /* ★P0★ _integrity/* 是信任锚材料（随包携带、非受保护树内容）：
+           不落盘，只在 integrity_gate 需要自愈侧车时直接从 spk 内存取用 */
+        if (strncmp(spk->entries[i].path, SPK_INTEGRITY_PREFIX,
+                    sizeof(SPK_INTEGRITY_PREFIX) - 1) == 0)
+            continue;
         wide_path_from_entry(spk->entries[i].path, rel, 1024);
         full = join_path(staging, rel);
         mk_parent_dirs(full);
@@ -1284,6 +1291,18 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
     slog("Py_Initialize ok");
     set_splash("正在初始化应用…");
 
+    /* ★P0★ write_bytecode=0 等效（BOOTSTRAP_INTEGRITY_PLAN Q8）：Py_Initialize 后、
+       任何应用代码 import 前关闭 .pyc 落盘——防运行期对受保护树写入清单外 pyc
+       （下一次启动的对称差会把它们当注入件，fail-closed 变成必然事故）。
+       PyConfig 结构体 ABI 绑 minor 版本 → 改用 PyRun_SimpleString 设旗标（语义等效：
+       源加载器逐 import 检查 sys.dont_write_bytecode）。 */
+    if (pRun("import sys\nsys.dont_write_bytecode = True\n") != 0) {
+        _snprintf(err, cap - 1, "解释器配置失败（dont_write_bytecode）");
+        err[cap - 1] = 0;
+        diag_write("load", err, "", FALSE);
+        return -1;
+    }
+
     /* ★期1 S3★ 引导装载：applocal/_codekey blob → sys.modules
        （manifest 无 code_key_id = 明文包 → 零动作；-1 = 已写 diag，fail-closed） */
     {
@@ -1484,6 +1503,117 @@ static int run_selftest(void) {
     } else {
         printf("SELFTEST-OK ver-cmp\n");
     }
+    /* ★P0★ integrity 清单：解析排序 / 对称差 / purge 判定（§4.2/§4.3） */
+    {
+        /* sha256("hello") 做占位哈希 */
+        const char *H1 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        char mt[512];
+        integrity_doc idoc;
+        integrity_rec walk[3];
+        char ierr[256];
+        int iok = 0;
+        _snprintf(mt, sizeof(mt) - 1,
+                  "format_version = 1\nentry_count = 3\n"
+                  "%s site-packages/b/c.py\n%s site-packages/a.py\n%s ui/index.html\n",
+                  H1, H1, H1);
+        mt[sizeof(mt) - 1] = 0;
+        iok = integrity_parse(mt, strlen(mt), &idoc, ierr, sizeof(ierr)) == 0 &&
+              idoc.count == 3 &&
+              strcmp(idoc.recs[0].path, "site-packages/a.py") == 0 &&
+              strcmp(idoc.recs[1].path, "site-packages/b/c.py") == 0 &&
+              strcmp(idoc.recs[2].path, "ui/index.html") == 0;
+        printf(iok ? "SELFTEST-OK integrity-parse\n" : "SELFTEST-FAIL integrity-parse (%s)\n",
+               iok ? "" : ierr);
+        if (!iok) fail = -1;
+        /* 对称差四态：全对 / 缺失 / 多余 / 哈希不一致 */
+        hex_to_bytes_self(H1, walk[0].hash, 32);
+        walk[0].path = (char *)"site-packages/a.py";
+        walk[1].path = (char *)"site-packages/b/c.py";
+        walk[2].path = (char *)"ui/index.html";
+        hex_to_bytes_self(H1, walk[1].hash, 32);
+        hex_to_bytes_self(H1, walk[2].hash, 32);
+        if (integrity_diff(&idoc, walk, 3, ierr, sizeof(ierr)) == 0) {
+            printf("SELFTEST-OK integrity-diff-equal\n");
+        } else {
+            printf("SELFTEST-FAIL integrity-diff-equal (%s)\n", ierr);
+            fail = -1;
+        }
+        if (integrity_diff(&idoc, walk, 2, ierr, sizeof(ierr)) != 0) {
+            printf("SELFTEST-OK integrity-diff-missing\n");
+        } else {
+            printf("SELFTEST-FAIL integrity-diff-missing (accepted!)\n");
+            fail = -1;
+        }
+        walk[1].hash[0] ^= 1;
+        if (integrity_diff(&idoc, walk, 3, ierr, sizeof(ierr)) != 0) {
+            printf("SELFTEST-OK integrity-diff-hash\n");
+        } else {
+            printf("SELFTEST-FAIL integrity-diff-hash (accepted!)\n");
+            fail = -1;
+        }
+        walk[1].hash[0] ^= 1;
+        /* purge 判定（Q8）：*.pyc / __pycache__/ 段 → 删；其余清单外件 → fail-closed */
+        if (integrity_is_purge_candidate("lone.pyc") &&
+            integrity_is_purge_candidate("site-packages/x/__pycache__/a.pyc") &&
+            !integrity_is_purge_candidate("site-packages/data.json") &&
+            !integrity_is_purge_candidate("site-packages/__pycache__x/y") &&
+            integrity_find(&idoc, "site-packages/a.py") &&
+            !integrity_find(&idoc, "site-packages/z.py")) {
+            printf("SELFTEST-OK integrity-purge-classify\n");
+        } else {
+            printf("SELFTEST-FAIL integrity-purge-classify\n");
+            fail = -1;
+        }
+        /* ★G12 回归★ 大清单（path blob > 4096 触发 realloc）：悬空指针防线——
+           生产清单 127 条/5KB 时 blob 搬家致 rec->path 全悬空（find 失灵 → purge
+           误删 pyc + 伪"清单外"）。本向量 150 条/15KB，强制两轮 realloc。 */
+        {
+            static char big[16384];
+            static char big_paths[150][48];
+            static integrity_rec bigwalk[150];
+            integrity_doc bdoc;
+            size_t used = 0;
+            int bok;
+            used += (size_t)_snprintf(big + used, sizeof(big) - used - 1,
+                                      "format_version = 1\nentry_count = 150\n");
+            for (int k = 0; k < 150; k++) {
+                _snprintf(big_paths[k], sizeof(big_paths[k]) - 1,
+                          "site-packages/loose/pkg%03d/mod%03d.pyc", k, k);
+                used += (size_t)_snprintf(big + used, sizeof(big) - used - 1,
+                                          "%s %s\n", H1, big_paths[k]);
+                hex_to_bytes_self(H1, bigwalk[k].hash, 32);
+                bigwalk[k].path = big_paths[k];
+            }
+            bok = integrity_parse(big, used, &bdoc, ierr, sizeof(ierr)) == 0 &&
+                  bdoc.count == 150 &&
+                  integrity_find(&bdoc, big_paths[0]) != NULL &&
+                  integrity_find(&bdoc, big_paths[75]) != NULL &&
+                  integrity_find(&bdoc, big_paths[149]) != NULL &&
+                  !integrity_find(&bdoc, "site-packages/loose/pkg999/mod999.pyc") &&
+                  integrity_diff(&bdoc, bigwalk, 150, ierr, sizeof(ierr)) == 0;
+            printf(bok ? "SELFTEST-OK integrity-bigblob-realloc\n"
+                       : "SELFTEST-FAIL integrity-bigblob-realloc (%s)\n",
+                   bok ? "" : ierr);
+            if (!bok) fail = -1;
+            integrity_free(&bdoc);
+        }
+        /* 畸形清单必须拒绝：format_version 不认。★review 修复★独立 doc——parse
+           入口 memset(out) 会覆盖传入 doc 已持有的 recs/blob（复用 idoc = 泄漏） */
+        {
+            integrity_doc bad_doc;
+            const char *bad_mt =
+                "format_version = 9\nentry_count = 1\n"
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824 a.py\n";
+            if (integrity_parse(bad_mt, strlen(bad_mt), &bad_doc, ierr, sizeof(ierr)) != 0) {
+                printf("SELFTEST-OK integrity-parse-badfmt\n");
+            } else {
+                printf("SELFTEST-FAIL integrity-parse-badfmt (accepted!)\n");
+                fail = -1;
+                integrity_free(&bad_doc);   /* 意外通过分支：资源在手须释放 */
+            }
+        }
+        integrity_free(&idoc);
+    }
     printf(fail ? "SELFTEST-RESULT FAIL\n" : "SELFTEST-RESULT OK\n");
     return fail;
 }
@@ -1522,12 +1652,16 @@ static int run_selftest_spk(const char *spk_path) {
         }
     }
     {
-        /* 输出排除 manifest 后的重算 hash，pytest 与 packager 对拍 */
+        /* 输出排除 manifest 与 _integrity/ 后的重算 hash，pytest 与 packager 对拍
+           （★P0★ 侧车条目不入 spk_hash 签名面，与 manifest_verify 同规则） */
         char actual_hash[65];
         spk_entry *tmp = (spk_entry *)malloc(sizeof(spk_entry) * (size_t)sf.count);
         int m = 0;
         for (int i = 0; i < sf.count; i++)
-            if (strcmp(sf.entries[i].path, SPK_MANIFEST_ENTRY) != 0) tmp[m++] = sf.entries[i];
+            if (strcmp(sf.entries[i].path, SPK_MANIFEST_ENTRY) != 0 &&
+                strncmp(sf.entries[i].path, SPK_INTEGRITY_PREFIX,
+                        sizeof(SPK_INTEGRITY_PREFIX) - 1) != 0)
+                tmp[m++] = sf.entries[i];
         spk_hash_hex(tmp, m, actual_hash);
         free(tmp);
         printf("SPK-VERIFY-OK app_version=%s spk_hash=%s\n", doc.app_version, actual_hash);
@@ -1535,6 +1669,250 @@ static int run_selftest_spk(const char *spk_path) {
     free(text);
     spk_free(&sf);
     return 0;
+}
+
+/* ================= 引导面完整性门（P0，BOOTSTRAP_INTEGRITY_PLAN §4.3） ================= */
+
+/* 二进制读全文（malloc 缓冲 + NUL 收尾；缺失/超限返回 NULL）。侧车与清单同量级，
+   16MB 防御上限远超需要。 */
+static char *integrity_read_bin(const std::wstring &path, size_t *len_out) {
+    FILE *f = _wfopen(path.c_str(), L"rb");
+    char *buf;
+    long sz;
+    size_t n;
+    *len_out = 0;
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 || sz > 16 * 1024 * 1024) {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    n = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[n] = 0;
+    *len_out = n;
+    return buf;
+}
+
+static const spk_entry *spk_find_entry(const spk_file *sf, const char *path) {
+    for (int i = 0; i < sf->count; i++)
+        if (strcmp(sf->entries[i].path, path) == 0) return &sf->entries[i];
+    return NULL;
+}
+
+/* 单文件 SHA-256（大小来自目录枚举；读不满视为并发改动 → fail-closed） */
+static int integrity_hash_file(const std::wstring &path, ULONGLONG sz, uint8_t out[32]) {
+    FILE *f;
+    uint8_t *buf;
+    size_t n;
+    if (sz > (512ull << 20)) return -1;   /* 受保护树不应出现巨件（防御性拒绝） */
+    f = _wfopen(path.c_str(), L"rb");
+    if (!f) return -1;
+    buf = (uint8_t *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    n = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if ((ULONGLONG)n != sz) { free(buf); return -1; }
+    pkapp_sha256(buf, n, out);
+    free(buf);
+    return 0;
+}
+
+/* 受保护树递归枚举（rel 用 '/' 分隔 UTF-8——与清单同构；宿主侧平台相关半区） */
+struct IntegrityItem {
+    std::string rel;
+    std::wstring full;
+    uint8_t hash[32];
+};
+
+static int integrity_collect(const std::wstring &dir, const std::wstring &rel_prefix,
+                             std::vector<IntegrityItem> &items, char *err, size_t cap) {
+    std::wstring pattern = join_path(dir, L"*");
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return 0;   /* 空目录；整树缺失由调用方兜底 */
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring full = join_path(dir, fd.cFileName);
+        std::wstring rel = rel_prefix.empty()
+                               ? std::wstring(fd.cFileName)
+                               : rel_prefix + L"/" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (integrity_collect(full, rel, items, err, cap) != 0) {
+                FindClose(find);
+                return -1;
+            }
+            continue;
+        }
+        {
+            std::string rel8 = wide_to_utf8(rel);
+            ULONGLONG sz = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            /* SKIP_FILES（构建侧 build_entries 同规则）：根级清单/记账件不入受保护面 */
+            if (rel8 == "manifest" || rel8 == "runtime.version") continue;
+            IntegrityItem it;
+            if (integrity_hash_file(full, sz, it.hash) != 0) {
+                _snprintf(err, cap - 1, "受保护树文件读取失败: %s", rel8.c_str());
+                err[cap - 1] = 0;
+                FindClose(find);
+                return -1;
+            }
+            it.rel = rel8;
+            it.full = full;
+            items.push_back(std::move(it));
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return 0;
+}
+
+/* 引导面完整性门（§4.3：①验侧车签名 → ②定向 purge → ③对称差）。
+ * 每启必过，且在第一条应用代码 import 之前；任何失配 fail-closed。
+ * sf 非空时侧车缺失可自愈（从已验签 spk 回写，Q7）；purged_out 回传清理数
+ * （经 MYAPP_INTEGRITY_PURGE env 交 applocal 补审计，Q8）。 */
+static int integrity_gate(const spk_file *sf, int *purged_out, char *err, size_t cap) {
+    ULONGLONG t0 = GetTickCount64();
+    std::wstring side_m = join_path(g_install, utf8_to_wide(INTEGRITY_SIDECAR_NAME).c_str());
+    std::wstring side_s = join_path(g_install, utf8_to_wide(INTEGRITY_SIDECAR_SIG).c_str());
+    char *m_text, *s_text;
+    size_t m_len = 0, s_len = 0;
+    integrity_doc idoc;
+    char det[1024];
+    int purged = 0;
+    int rv = -1;
+
+    *purged_out = 0;
+    m_text = integrity_read_bin(side_m, &m_len);
+    s_text = integrity_read_bin(side_s, &s_len);
+    if (!m_text || !s_text) {
+        /* 侧车缺失/损坏 → 从已验签 spk 自愈（Q7）；无 spk 可用 = fail-closed */
+        free(m_text);
+        free(s_text);
+        {
+            const spk_entry *em = sf ? spk_find_entry(sf, SPK_INTEGRITY_MANIFEST) : NULL;
+            const spk_entry *es = sf ? spk_find_entry(sf, SPK_INTEGRITY_SIG) : NULL;
+            if (!em || !es) {
+                _snprintf(err, cap - 1, "完整性清单缺失（需放回 .spk 全量重建）");
+                err[cap - 1] = 0;
+                diag_write("integrity", err, "sidecar 缺失且无可自愈来源", FALSE);
+                return -1;
+            }
+            if (!atomic_write_utf8(side_m, (const char *)em->data, em->size) ||
+                !atomic_write_utf8(side_s, (const char *)es->data, es->size)) {
+                _snprintf(err, cap - 1, "完整性清单回写失败（安装目录不可写）");
+                err[cap - 1] = 0;
+                diag_write("integrity", err, "", FALSE);
+                return -1;
+            }
+            slog("integrity sidecar healed from spk");
+            m_text = (char *)malloc(em->size + 1);
+            s_text = (char *)malloc(es->size + 1);
+            if (!m_text || !s_text) {
+                free(m_text);
+                free(s_text);
+                _snprintf(err, cap - 1, "内存不足");
+                err[cap - 1] = 0;
+                return -1;
+            }
+            memcpy(m_text, em->data, em->size);
+            m_text[em->size] = 0;
+            m_len = em->size;
+            memcpy(s_text, es->data, es->size);
+            s_text[es->size] = 0;
+            s_len = es->size;
+        }
+    }
+
+    if (integrity_parse(m_text, m_len, &idoc, det, sizeof(det)) != 0) {
+        _snprintf(err, cap - 1, "完整性清单解析失败");
+        err[cap - 1] = 0;
+        diag_write("integrity", err, det, FALSE);
+        goto done;
+    }
+    {
+        /* 签名文件首尾空白容忍（写入器保证无；防编辑器手滑）后按原始字节验签 */
+        char *sb = s_text, *se = s_text + s_len;
+        while (sb < se && (*sb == ' ' || *sb == '\t' || *sb == '\r' || *sb == '\n')) sb++;
+        while (se > sb && (se[-1] == ' ' || se[-1] == '\t' || se[-1] == '\r' || se[-1] == '\n'))
+            se--;
+        *se = 0;
+        if (integrity_verify_sig(m_text, m_len, sb, det, sizeof(det)) != 0) {
+            _snprintf(err, cap - 1, "完整性清单验签失败");
+            err[cap - 1] = 0;
+            diag_write("integrity", err, det, FALSE);
+            goto done;
+        }
+    }
+
+    /* ②③：受保护树枚举 + 定向 purge + 对称差（R1-2：集合严格相等 + 逐件哈希） */
+    {
+        std::vector<IntegrityItem> items;
+        if (integrity_collect(g_runtime, L"", items, det, sizeof(det)) != 0) {
+            _snprintf(err, cap - 1, "受保护树枚举失败");
+            err[cap - 1] = 0;
+            diag_write("integrity", err, det, FALSE);
+            goto done;
+        }
+        if (items.empty()) {
+            _snprintf(err, cap - 1, "受保护树为空（需放回 .spk 全量重建）");
+            err[cap - 1] = 0;
+            diag_write("integrity", err, "", FALSE);
+            goto done;
+        }
+        /* Q8 定向 purge：清单外 *.pyc / __pycache__/ 段内文件 → 删除并计数；
+           删除失败保留 → 交对称差 fail-closed。其余清单外件一律不删。 */
+        {
+            std::vector<IntegrityItem> kept;
+            kept.reserve(items.size());
+            for (auto &it : items) {
+                if (!integrity_find(&idoc, it.rel.c_str()) &&
+                    integrity_is_purge_candidate(it.rel.c_str())) {
+                    SetFileAttributesW(it.full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    if (DeleteFileW(it.full.c_str())) {
+                        purged++;
+                        continue;
+                    }
+                }
+                kept.push_back(std::move(it));
+            }
+            items.swap(kept);
+        }
+        std::sort(items.begin(), items.end(),
+                  [](const IntegrityItem &a, const IntegrityItem &b) {
+                      return integrity_path_cmp(a.rel.c_str(), b.rel.c_str()) < 0;
+                  });
+        {
+            /* 指针在排序后落定（IntegrityItem::rel 不再变动） */
+            std::vector<integrity_rec> walk(items.size());
+            for (size_t i = 0; i < items.size(); i++) {
+                walk[i].path = (char *)items[i].rel.c_str();
+                memcpy(walk[i].hash, items[i].hash, 32);
+            }
+            if (integrity_diff(&idoc, walk.empty() ? NULL : &walk[0],
+                               (int)walk.size(), det, sizeof(det)) != 0) {
+                _snprintf(err, cap - 1, "应用文件完整性校验未通过（防篡改拦截）");
+                err[cap - 1] = 0;
+                diag_write("integrity", err, det, FALSE);
+                goto done;
+            }
+        }
+    }
+    rv = 0;
+    *purged_out = purged;
+    {
+        char line[160];
+        _snprintf(line, sizeof(line) - 1,
+                  "integrity gate ok entries=%d purge=%d (%llu ms)",
+                  idoc.count, purged, (unsigned long long)(GetTickCount64() - t0));
+        line[sizeof(line) - 1] = 0;
+        slog(line);
+    }
+done:
+    integrity_free(&idoc);
+    free(m_text);
+    free(s_text);
+    return rv;
 }
 
 /* ================= 主流程（九步顺序） ================= */
@@ -1590,6 +1968,7 @@ static int run_shell(void) {
     manifest_doc doc;
     char *manifest_text = NULL;
     BOOL doc_valid = FALSE;
+    int purge_count = 0;   /* integrity 定向 purge 计数（Q8 → MYAPP_INTEGRITY_PURGE） */
 
     if (!setup_paths()) {
         MessageBoxW(NULL, L"路径初始化失败（LOCALAPPDATA 缺失）", g_appname.c_str(), MB_ICONERROR);
@@ -1679,6 +2058,13 @@ static int run_shell(void) {
             }
         }
         doc_valid = TRUE;
+        /* 步骤 2.5：引导面完整性门（P0 红线：第一条应用代码 import 之前 fail-closed。
+           sf 仍在手——侧车缺失/损坏可从已验签 spk 自愈，Q7） */
+        if (integrity_gate(&sf, &purge_count, err, sizeof(err)) != 0) {
+            show_error_ui_at_startup(err, FALSE);
+            spk_free(&sf);
+            return 2;
+        }
         spk_free(&sf);
         slog("runtime staging ready");
     } else {
@@ -1689,6 +2075,11 @@ static int run_shell(void) {
             return 2;
         }
         doc_valid = TRUE;
+        /* 步骤 2.5：完整性门（无 spk——侧车必须已在位，无自愈来源） */
+        if (integrity_gate(NULL, &purge_count, err, sizeof(err)) != 0) {
+            show_error_ui_at_startup(err, FALSE);
+            return 2;
+        }
     }
 
     /* 步骤 3：预清理旧 ready 与旧握手码（避免存活假象 / 陈旧码） */
@@ -1713,6 +2104,14 @@ static int run_shell(void) {
         SetEnvironmentVariableW(L"MYAPP_NATIVE_LIB_DIR", L"");
         SetEnvironmentVariableW(L"MYAPP_STRICT_AUTH", L"1");
         SetEnvironmentVariableW(L"MYAPP_HANDSHAKE_FILE", g_handshake.c_str());
+        /* ★P0 Q8★ purge 事实交 applocal 补审计：恒写真值（含 0）——同时清除
+           父进程可能注入的伪值，防审计通道被 env 污染 */
+        {
+            wchar_t pnum[16];
+            _snwprintf(pnum, 15, L"%d", purge_count);
+            pnum[15] = 0;
+            SetEnvironmentVariableW(L"MYAPP_INTEGRITY_PURGE", pnum);
+        }
         if (random_hex64(token))
             SetEnvironmentVariableW(L"MYAPP_TOKEN", utf8_to_wide(token).c_str());
     }

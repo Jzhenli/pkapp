@@ -60,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="环境诊断（runtime 快照 B.t 断言 / WebView2 / JDK / SDK）")
     _add_project(p)
+    p.add_argument("--integrity", default=None, metavar="DIR",
+                   help="★P0★ 离线审计已部署包目录（exe/integrity.manifest/_runtime 同级）："
+                        "验签 + 对称差，免启动应用；退出码 0=通过 1=失配")
 
     p = sub.add_parser("fetch", help="工具链托管（唯一网络入口）：下载/离线导入运行时与构建工具链")
     p.add_argument("platform", choices=["windows", "android", "all"],
@@ -108,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "check":
             return cmd_check_mod.cmd_check(args.project)
         if args.cmd == "doctor":
-            return cmd_doctor_mod.cmd_doctor(args.project)
+            return cmd_doctor_mod.cmd_doctor(args.project, integrity_dir=args.integrity)
         if args.cmd == "fetch":
             platforms = (["windows", "android"] if args.platform == "all"
                          else [args.platform])
