@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- watchdog spike：验证文档三假设（STICKY 重建 / setAlarmClock 复活 / receiver 经服务中转）。
+     SCHEDULE_EXACT_ALARM 首版未声明实测被证伪后补上（见下方权限注释）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- spike 实测发现：API 31 上 setAlarmClock 也需要 SCHEDULE_EXACT_ALARM（文档 §4.2.2 假设被证伪）。
+         API 31-32 声明即授予；API 33+ 需 canScheduleExactAlarms() 检查 + 引导授权或 USE_EXACT_ALARM -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <application
+        android:label="SPIKE"
+        android:allowBackup="false">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".WatchdogService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="watchdog-kiosk" />
+        </service>
+
+        <receiver android:name=".AlarmReceiver" android:exported="false" />
+        <!-- 确定性僵死模拟：主线程 onReceive sleep 120s，等价真机观察到的崩溃后 FocusEvent 僵死形态 -->
+        <receiver android:name=".ZombieReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.pkapp.spike.ZOMBIE" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
