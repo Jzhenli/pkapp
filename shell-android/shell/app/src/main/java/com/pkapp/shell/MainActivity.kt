@@ -3,15 +3,19 @@ package com.pkapp.shell
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -43,7 +47,10 @@ class MainActivity : Activity() {
         // 进程级防重入：MagicOS 息屏会销毁 Activity 但保留进程（FGS 托底），解锁后在同进程
         // 重建 Activity → 第二次 onCreate → 二次 engineBoot 对活解释器再初始化 → libpython
         // SIGSEGV（实测 PyUnicode_New ← PyRun_SimpleString ← engineBoot，Magic6 Pro）。
-        @Volatile private var runtimeLive = false
+        // 进程内公开只读位：BootService 心跳 writer 据此判断"runtime 是否活在本进程"
+        //（§4.1 写条件；STICKY 重建后仅服务起来时 = false → 停写 → L2 复活）。
+        @Volatile var runtimeLive = false
+            private set
         private val bootGate = AtomicBoolean(false)       // 冷启引导锁：engineBoot 全程独占
         private const val REATTACH_LIVENESS_MS = 15_000L  // re-attach 等 ready 复现上限（≈3×默认心跳）
         private const val PH_COLD = 0
@@ -90,6 +97,9 @@ class MainActivity : Activity() {
         logFile = File(logDir, "$appName-${java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())}.log")
 
         buildUi()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // §5 L1：kiosk 常亮
+        Watchdog.scheduleNextAlarm(this)   // §4.2-2 ★R2★ 首条闹钟排程（幂等，每入口都排）
+        manualWatchdogReset(intent)        // §4.4 ★S3★ 人工语义清零 + L1 部署引导
         // BootService 本身 startForeground（通知栏保活）——startForegroundService 才是
         // 与其实现匹配的启动方式；Android 12+ 后台启动限制下 startService 直接抛
         // BackgroundServiceStartNotAllowedException 炸掉 onCreate（实测 Motorola adb
@@ -117,6 +127,86 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         main.removeCallbacksAndMessages(null)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        // singleTask 已存活时再启动走这里（点熔断通知/桌面图标）：人工语义同样要清零（★S3★）
+        manualWatchdogReset(intent)
+    }
+
+    // ---------------------------------------------------------------- watchdog 接入（§4.4/§5）
+    /** ★S3★ 人工清零：intent 无 EXTRA_FROM_WATCHDOG（点图标/点熔断通知）= 用户在场 →
+     *  熔断计数/标志全清 + 撤求救通知。自动复活链的投递带 extra，不清零。 */
+    private fun manualWatchdogReset(intent: Intent?) {
+        if (intent?.hasExtra(Watchdog.EXTRA_FROM_WATCHDOG) == true) return
+        Watchdog.cancelAlert(this)
+        val st = Watchdog.readState(this)
+        if (st != null && (st.open || st.count > 0 || st.pendingRevive)) {
+            Watchdog.mergeWrite(this) {
+                put("circuit_count", 0)
+                put("circuit_window_start_ts", 0L)
+                put("circuit_open", false)
+                put("pending_revive", false)
+            }
+            Watchdog.audit(this, "circuit_reset")
+        }
+        // L1 部署引导（§5）：仅人工启动时提示——自动复活链投递不打扰无人值守现场
+        requestNotificationPermissionIfNeeded()
+        requestExactAlarmIfNeeded()
+        requestBatteryWhitelistIfNeeded()
+        requestOverlayIfNeeded()
+    }
+
+    private fun requestOverlayIfNeeded() {
+        // 软引导（一次性）：SWO（悬浮窗）是复活链 Activity 拉起的"严格 ROM 保底通道"——
+        // BAL 限制强度 ROM 相关（测试机 Motorola 12/13 实测 FGS 直启与闹钟 PI 双拦，
+        // 唯 SWO 豁免恒通）；工控平板等宽松 ROM 闹钟 PI 直接可用，SWO 属可选增强，
+        // 未授权不影响部署。因此只首启提示一次，不反复打扰。
+        val flag = File(cache, "overlay_prompted")
+        if (android.provider.Settings.canDrawOverlays(this) || flag.isFile) return
+        try {
+            startActivity(Intent(
+                android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")))
+            flag.writeText("1")   // 跳转成功才记账——失败（罕见 ROM 裁剪）时下次人工启动可重试
+        } catch (e: Exception) {
+            slog("overlay permission prompt failed: $e")
+        }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        // 熔断求救通知依赖此权限（API 33+ 运行时授予）
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+    }
+
+    private fun requestExactAlarmIfNeeded() {
+        // ★SPIKE★ setAlarmClock 依赖"闹钟和提醒"授权（API 34+ 新装默认拒绝 → 引导授予）
+        if (Build.VERSION.SDK_INT >= 31) {
+            val am = getSystemService(ALARM_SERVICE) as android.app.AlarmManager
+            if (!am.canScheduleExactAlarms()) {
+                startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                    Uri.parse("package:$packageName")))
+            }
+        }
+    }
+
+    private fun requestBatteryWhitelistIfNeeded() {
+        // §5 电池优化白名单：未授权时 Doze 下闹钟可能延迟（setAlarmClock 主案下影响已收窄）
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                startActivity(Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")))
+            }
+        } catch (e: Exception) {
+            slog("battery whitelist prompt failed: $e")
+        }
     }
 
     // ---------------------------------------------------------------- UI（加载层/错误页，§9 绝不黑屏）

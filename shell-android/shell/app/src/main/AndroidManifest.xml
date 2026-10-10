@@ -7,6 +7,18 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- L2 看门狗（§4.2）：setAlarmClock 也需 SCHEDULE_EXACT_ALARM（★SPIKE 证伪★，API31 缺权限
+         直接 SecurityException）；USE_EXACT_ALARM 兜 API 34+ 新装默认拒绝档。 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- §4.2-4 开机自启（断电恢复；OEM 门禁拦截属 R-10 部署盲区，验收必查） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- §5 电池优化白名单引导授权 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- L2 复活链 Activity 拉起（§4.2-3）：SYSTEM_ALERT_WINDOW 是 Android 12+ BAL 官方豁免项
+         （真机两连证伪 FGS 直启与闹钟 PI 通道后唯一合规通道）；须声明本权限才出现在
+         设置「显示在其他应用上层」列表。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:label="${pkappLabel}"
@@ -30,7 +42,8 @@
             </intent-filter>
         </activity>
 
-        <!-- 前台服务：把进程抬出 cached 桶，保证前后台切换/息屏时 uvicorn 与心跳不死（M2 验收项） -->
+        <!-- 前台服务：把进程抬出 cached 桶，保证前后台切换/息屏时 uvicorn 与心跳不死（M2 验收项）；
+             同时是 L2 复活中转（§4.2-3 ★C2★，方案 WatchdogService 职责并入）与心跳 writer 宿主 -->
         <service
             android:name=".BootService"
             android:exported="false"
@@ -39,5 +52,15 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="embedded-python-local-server" />
         </service>
+
+        <!-- L2 闹钟 receiver（§4.1）：短命进程只判活分流，复活经 BootService 中转 -->
+        <receiver android:name=".WatchdogReceiver" android:exported="false" />
+
+        <!-- 开机自启（§4.2-4 ★N3★）：后台上下文直拉 Activity 被静默拦截，同经 BootService 中转 -->
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
