@@ -1229,6 +1229,7 @@ def _manifest_fields(spec: AppSpec, platform: str, python_dll: str,
     if code_salt:
         fields["code_salt"] = code_salt        # per_build_salt 档（壳忽略未知键）
     fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
+    fields.update(spec.android_watcher_manifest_keys())   # §8 watcher 透传（未配置 = 零键，壳默认值兜底）
     return fields
 
 

@@ -21,7 +21,12 @@ _PYVER_RE = re.compile(r"^3\.\d+\.\d+$")
 # 平台段白名单：未知键报错（同 [network] 精神——拼写错误静默丢弃 = 配置悄悄失效，B.w 兜住）
 _PLAT_KEYS = {"dependencies", "icon", "setproctitle", "package", "abis",
               "keystore", "python_version", "runtime_dir",
-              "index_url", "extra_index_url"}
+              "index_url", "extra_index_url", "watcher"}
+
+# [platforms.android.watcher]（ANDROID_7x24_WATCHDOG_PLAN §8）：键名即壳 manifest 扩展键
+# 后缀（watcher_<key>），int 秒/次数；缺省键不投影 → 壳侧 §8 默认值兜底
+_WATCHER_KEYS = {"alarm_interval", "heartbeat_ttl", "healthz_interval",
+                 "revive_burst_window", "revive_burst_limit", "healthy_reset_window"}
 
 
 class SpecError(ValueError):
@@ -95,6 +100,7 @@ class AppSpec:
     platform_index: dict = field(default_factory=dict)        # [platforms.*].index_url（主源；缺省 PyPI）
     platform_extra_index: dict = field(default_factory=dict)  # [platforms.*].extra_index_url（补充源，如 flet）
     network: NetworkSpec = field(default_factory=NetworkSpec)  # [network] 段（§5）
+    android_watcher: dict = field(default_factory=dict)  # [platforms.android.watcher]（§8）
     raw: dict = field(default_factory=dict, repr=False, compare=False)
 
     def deps_for(self, platform: str) -> tuple[str, ...]:
@@ -113,6 +119,11 @@ class AppSpec:
         for extra in self.platform_deps.values():
             out.extend(extra)
         return tuple(out)
+
+    def android_watcher_manifest_keys(self) -> dict:
+        """[platforms.android.watcher] → spk manifest 扩展键（ANDROID_7x24_WATCHDOG_PLAN §8；
+        键名 watcher_<key>，随签名覆盖；未配置 = 零键，壳侧 §8 默认值兜底）。"""
+        return {f"watcher_{k}": str(v) for k, v in self.android_watcher.items()}
 
 
 def _ver_tuple(v: str) -> tuple:
@@ -159,6 +170,10 @@ def validate(spec: AppSpec) -> list[str]:
         for p, u in pmap.items():
             if not u.startswith(("http://", "https://")):
                 problems.append(f"[platforms.{p}].{key} 须为 http(s) URL: {u!r}")
+    for k, v in spec.android_watcher.items():
+        if v <= 0:
+            problems.append(f"[platforms.android.watcher].{k} 必须 >= 1（秒/次数）: {v}"
+                            "（0/负值会引发闹钟风暴或永久熔断）")
     net = spec.network
     if net.present:
         bad = [m for m in net.auth if m not in ("login", "provision", "none")]
@@ -237,6 +252,24 @@ def load(path: str) -> AppSpec:
         provision_roles=("*",) if pr is None else tuple(_str_list(pr)),
     )
 
+    # [platforms.android.watcher]（ANDROID_7x24_WATCHDOG_PLAN §8）：int 秒/次数 →
+    # manifest 扩展键 watcher_<key>；缺省键不投影，壳侧默认值兜底。
+    # watcher 仅 android 有效（§8 看门狗为 Android 专属）——其他平台段出现即报错
+    #（拼写正确但放错段的静默失效，同平台段白名单精神）
+    for p in ("windows", "linux"):
+        if (plat.get(p) or {}).get("watcher") is not None:
+            raise SpecError(f"[platforms.{p}].watcher 仅 android 平台支持"
+                            "（看门狗为 Android 专属，请移至 [platforms.android.watcher]）")
+    watcher_toml = android.get("watcher") or {}
+    watcher_unknown = sorted(set(watcher_toml) - _WATCHER_KEYS)
+    android_watcher = {}
+    for k in sorted(set(watcher_toml) & _WATCHER_KEYS):
+        try:
+            android_watcher[k] = int(watcher_toml[k])
+        except (TypeError, ValueError) as e:
+            raise SpecError(f"[platforms.android.watcher].{k} 必须是整数: "
+                            f"{watcher_toml[k]!r}") from e
+
     # [build] 段已废除（★v0.7★ 打包布局固化为默认行为）——残留报错（防配置静默失效）
     if "build" in data:
         raise SpecError('[build] 段已废除（v0.7 起打包布局固化：stdlib zip 纯 pyc、'
@@ -281,6 +314,7 @@ def load(path: str) -> AppSpec:
         platform_index=platform_index,
         platform_extra_index=platform_extra_index,
         network=network,
+        android_watcher=android_watcher,
         raw=data,
     )
     problems = validate(spec)
@@ -290,6 +324,8 @@ def load(path: str) -> AppSpec:
         problems.append(f"{k} 未知配置键（检查拼写）")
     for p in net_unknown:
         problems.append(f"[network].{p} 未知配置键（检查拼写）")
+    for k in watcher_unknown:
+        problems.append(f"[platforms.android.watcher].{k} 未知配置键（检查拼写）")
     if problems:
         raise SpecError("AppSpec 校验失败:\n  " + "\n  ".join(problems))
     return spec

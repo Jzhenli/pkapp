@@ -31,7 +31,8 @@ def render(fields: dict, signature: str | None = None) -> str:
     """
     lines = [f"{k} = {fields[k]}" for k in KEYS if k in fields]
     lines += [f"{k} = {fields[k]}" for k in fields
-              if k.startswith("network_") and k not in KEYS]
+              if (k.startswith("network_") or k.startswith("watcher_"))
+              and k not in KEYS]   # watcher_*：§8 看门狗透传（ANDROID_7x24_WATCHDOG_PLAN）
     lines += [f"{k} = {fields[k]}" for k in fields
               if k in EXT_KEYS and k not in KEYS]
     if signature is not None:
