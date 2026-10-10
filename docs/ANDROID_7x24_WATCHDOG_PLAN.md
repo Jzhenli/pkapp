@@ -1,6 +1,14 @@
 # 安卓 7×24 不间断运行方案（Watchdog 守护栈）
 
-> 状态：v1.5 **LOCKED**（v1.4 五轮评审闭环 + v1.5 spike 实测回写。可以进实现）
+> 状态：v1.6（v1.5 LOCKED + 阶段 1+2 实装证伪回写。可以进实现）
+> v1.5 → v1.6 关键变化（**阶段 1+2 实装真机回写**，测试机 XT2125_4 Android 12/13；
+> 复活链/熔断/人工复位/健康清零全链路验证通过）：
+> ① **★实装证伪★ 复活拉起通道两连证伪**——FGS 内 startActivity 被 Android 12+ BAL
+> 拦截（原稿"前台上下文豁免"不成立）、setAlarmClock 直发 activity PI 亦拦（§4.2-3b）；
+> **定性：BAL 限制强度是 ROM 相关的**（证伪限于测试机，工控平板等宽松 ROM 可能不受限）；
+> ② 复活拉起定稿**多通道渐进**：直启恒先做（SWO=BAL 官方豁免项作严格 ROM 保底）→
+> 闹钟 PI 兜一手 → 求救通知人工兜底（§4.2-3b/§12-8）；SWO 一次性软引导 + manifest
+> 须声明 SYSTEM_ALERT_WINDOW（§5）；③ 新增风险 R-11（严格 ROM 复活拉起失效）。
 > v1.4 → v1.5 关键变化（**spike 实测**，工程 spikes/watchdog-spike/，真机 XT2125_4 API 31）：
 > ① setAlarmClock **也需要** `SCHEDULE_EXACT_ALARM`——原"免权限"口径被实测证伪（§4.2/§10）；
 > ② 新增 §6.6 主线程看门狗线程——僵死进程会吃掉闹钟广播，L2 对"活着但僵死"全盲；
@@ -154,7 +162,8 @@ files/heartbeat.json   ←──  读文件判新鲜度
    receiver（后台上下文）→ startForegroundService(WatchdogService)
    → 服务内：Process.killProcess(Process.myPid()) 终止自身（若判僵死）
      → 进程属"意外死亡"，STICKY 前台服务由系统重建
-     → 重建路径拉起 MainActivity（前台上下文，豁免后台启动限制）
+     → 重建路径经「复活拉起通道」（★实装证伪回写★ FGS 上下文不再视为
+       天然豁免，见下 3b 多通道渐进）
    ```
    - 禁止 receiver 直接 `startActivity`：Android 10+ 后台 Activity 启动限制会静默拦截
    - **自杀方式钉死（★N1★）**：进程内自杀只用 `Process.killProcess(myPid())`
@@ -175,6 +184,30 @@ files/heartbeat.json   ←──  读文件判新鲜度
    - 僵死进程必须先终止再启动（★C2★：`am start` 对僵死进程只是拉起
      已有 Activity，等于没复活）
    - `launchMode="singleTask"` 防 am start 堆叠多个 MainActivity
+   - **3b. 复活拉起 MainActivity 的通道（★实装证伪回写，v1.6★）**——原稿"重建路径
+     在前台上下文拉起 MainActivity，豁免后台启动限制"不成立：
+     - **★实装证伪①★**：FGS 内 `startActivity` 在 Android 12+ 被
+       ActivityTaskManager 拦截（logcat `Abort background activity starts`，
+       `callingUidProcState: FOREGROUND_SERVICE` 不豁免）——测试机 Motorola
+       XT2125_4（Android 12/13）实测，前台服务中转后仍到不了前台。
+     - **★实装证伪②★**：`setAlarmClock` 直发 activity PendingIntent（期望借
+       "系统代发豁免"）同样被拦——`realCallingUid: 1000`（system_server、
+       PERSISTENT）仍 `Abort`。同机实测。
+     - **定性：BAL 限制强度是 ROM 相关的**——证伪结论限于该测试机；工控平板等
+       宽松 ROM 上 FGS 直启 / 闹钟 PI 可能直接可用（低版本 < 12 限制亦弱）。
+       复活拉起因此**不做单通道硬依赖**，实装定稿为多通道渐进：
+       ```
+       ① 直启恒先做：SWO 已授权（SYSTEM_ALERT_WINDOW 是 Android 12+ BAL
+         官方豁免项）→ 任何 ROM 恒通 = 严格 ROM 保底；宽松 ROM 未授权同样命中
+       ② SWO 未授权 → 再排闹钟 PI 兜一手（部分 ROM 豁免；与直启双到无碍，
+         singleTask 吸收重复投递）
+       ③ 全部落空（严格 ROM 且未授权）→ 求救通知常驻引导 + 下一闹钟重试
+         （熔断器兜住循环）；用户授权 SWO 后链条即闭环
+       ```
+     - SWO 授权引导为**一次性软引导**（首启 `cache/overlay_prompted` 标志），
+       不反复弹设置页；宽松 ROM 上 SWO 属可选增强，未授权不影响部署。
+     - manifest 须声明 `SYSTEM_ALERT_WINDOW`：未声明时应用不出现在设置
+       「显示在其他应用上层」列表，`appops set` 亦不生效（同机实测）。
 4. **开机自启**：`BOOT_COMPLETED` receiver → **同样经 WatchdogService 中转**
    （★N3★：Boot receiver 同为后台上下文，直接拉 Activity 会被静默拦截）→
    服务内 start MainActivity（断电恢复场景必配）。
@@ -252,6 +285,7 @@ on-disk schema（★N6★——receiver 每次均为短命进程，窗口判断�
 | 前台服务 | `START_STICKY` + 常驻通知 | 工控场景常驻通知合理 |
 | foregroundServiceType | **API 34+：`specialUse`**；< 34 无需声明 type（★M3★） | 注意 Android 15 对 `dataSync` 有 6h 上限——工控常驻场景 targetSdk 34+ 走 `specialUse` 是正解，不回退 dataSync。**分发边界（★P5★）**：specialUse 若经 Google Play 分发需提交用途说明且可能不批——kiosk 工控为侧载分发，不受影响；未来若上 Play 需重新评估 |
 | 电池优化白名单 | 启动时 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 引导授权一次 | 未授权时 Doze 下闹钟可能延迟；`setAlarmClock` 主案下影响已收窄 |
+| 悬浮窗权限（SWO） | 首启一次性软引导 `ACTION_MANAGE_OVERLAY_PERMISSION`（★实装回写★ §4.2-3b） | 严格 ROM 上是复活拉起的保底豁免通道；宽松 ROM（工控平板）属可选增强，未授权不影响部署 |
 | 屏幕常亮 | kiosk 页面 `FLAG_KEEP_SCREEN_ON` | 工控面板通常要求常亮 |
 | 锁定任务模式 | 可选：`startLockTask()` | 固定 kiosk，防误触退出；兼防 M1 清理器（见 §9） |
 
@@ -466,6 +500,7 @@ watchdog_stuck_threshold = 3     # ★SPIKE★ 连续 N 次无心跳 → killPro
 | R-8 | 热/功耗（★M4★） | 常亮 + 前台服务 + WebView 长跑热节流 | 工控通常供电；部署规范：散热间隙、高温告警阈值；可选夜间降频窗口 |
 | R-9 | L0 误杀 | 瞬时尖峰触发重建 | 连续 2 次越线防抖 + 阈值可配 |
 | R-10 | **OEM 自启动门禁**（★SPIKE 实测★） | 深度定制 ROM（Moto DeviceGuard）拦截 BOOT_COMPLETED；Doze 白名单 + RUN_ANY_IN_BACKGROUND 均无效、无用户开关；闹钟不跨重启 → **重启后复活链全灭** | 部署选型门禁：验收必测 §7.3；对策 HOME 化 / device-owner / 换支持自启的工控设备 |
+| R-11 | **BAL 严格 ROM 复活拉起失效**（★实装证伪★） | Android 12+ 严格 ROM 拦 FGS 直启与闹钟 PI（Motorola 12/13 实测 §4.2-3b）——复活的记账/中转全通但 MainActivity 到不了前台；宽松 ROM（工控平板）可能不受限 | 多通道渐进（§4.2-3b）：SWO 保底豁免 + 一次性软引导 + 求救通知人工兜底；部署验收加查复活后 `mCurrentFocus` 落点 |
 
 ---
 
@@ -477,7 +512,8 @@ watchdog_stuck_threshold = 3     # ★SPIKE★ 连续 N 次无心跳 → killPro
 | setAlarmClock（L2 主案） | ✓ | ✓ | ✓（★SPIKE 证伪修订：也需 SCHEDULE_EXACT_ALARM 声明，实测 API 31 缺权限直接 SecurityException） | 同左 |
 | SCHEDULE_EXACT_ALARM | — | — | 声明即得（可被用户撤销） | 新装默认拒绝——引导授予"闹钟和提醒"或 USE_EXACT_ALARM |
 | foregroundServiceType | 无需 | 无需 | 无需 | **specialUse**（dataSync 有 6h 上限，勿回退） |
-| 后台启动 Activity | 限制弱 | **限制起**（C2：复活必须经前台服务中转） | 同左 | 同左 |
+| 后台启动 Activity | 限制弱 | **限制起**（C2：复活必须经前台服务中转） | **★实装证伪★：FGS 内直启同样被拦**（`Abort background activity starts`，Motorola 12/13 实测；闹钟 activity PI 亦拦）——复活拉起走多通道渐进（§4.2-3b） | 同左 |
+| SYSTEM_ALERT_WINDOW | 需声明 + 用户授予 | 同左 | 同左（BAL 官方豁免项，复活拉起严格 ROM 保底通道） | 同左 |
 | phantom process killer | 无 | 无 | 12+ 有（内嵌 Python 天然免疫） | 同左 |
 
 **目标档位建议**：targetSdk 34、minSdk 28（工控新机）；API 26-27 旧设备降级运行
@@ -529,3 +565,17 @@ watchdog_stuck_threshold = 3     # ★SPIKE★ 连续 N 次无心跳 → killPro
    内存泄漏 → L0 思路（healthz + PSS 自愈）直接复用；WebView 挂起 →
    任务计划/服务包装为现成方案。L1/L2 同构移植是搬运不需要的复杂度；
    需求出现时按"任务计划重启 + L0 复用"另议，不搬守护栈。
+8. **复活拉起 MainActivity 的 BAL 通道（★实装证伪回写，v1.6 新增★）**——
+   **决议：多通道渐进 + SWO 一次性软引导，关闭**。
+   阶段 1+2 实装真机验证发现两连证伪（测试机 Motorola XT2125_4 / Android
+   12/13）：① FGS 内 startActivity 被 `Abort background activity starts`
+   拦截（原稿"前台上下文豁免"不成立）；② `setAlarmClock` 直发 activity PI
+   同样被拦（system_server 代发仍 Abort）。**定性：BAL 限制强度是 ROM 相关
+   的**——证伪结论限于该测试机，工控平板等宽松 ROM 上两条通道可能直接可用，
+   故不做单通道硬依赖。定稿策略（§4.2-3b）：直启恒先做（SWO 已授权 = BAL
+   官方豁免项 → 任何 ROM 恒通；未授权时宽松 ROM 同样命中）→ SWO 未授权再排
+   闹钟 PI 兜一手 → 全部落空求救通知人工兜底（熔断器兜住重试循环）。
+   SWO 引导为一次性软引导，宽松 ROM 上属可选增强；manifest 须声明
+   `SYSTEM_ALERT_WINDOW`（未声明则设置列表不可见、appops 不生效，实测）。
+   真机验证记录：死亡复活链/熔断/人工复位/健康清零全链路绿（含 MainActivity
+   前台落点复核）；负例全部按 §7.2/§7.4 语义走通。
