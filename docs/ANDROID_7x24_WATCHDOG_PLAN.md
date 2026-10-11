@@ -33,7 +33,7 @@
 > 中转（force-stop + 后台启动限制）、新增 boot-loop 熔断（§4.4）、PSS 口径改 smaps_rollup（§6.2）、
 > L0 快路径改服务实例重建（§6.1，Py_Initialize 重初始化不采用——官方不支持嵌入式重复初始化）
 > 适用范围：pkapp 打包的安卓应用（内嵌 Python + uvicorn/FastAPI 本机服务 + WebView 渲染）
-> 参考实测：out/helloApp 于真机 XT2125_4（arm64-v8a，5.5GB RAM）的打包与挂机验证
+> 参考实测：examples/helloapp 于真机 XT2125_4（arm64-v8a，5.5GB RAM）的打包与挂机验证
 > 关联文档：docs/BOOTSTRAP_INTEGRITY_PLAN.md（引导面完整性，与本方案正交）
 
 ---

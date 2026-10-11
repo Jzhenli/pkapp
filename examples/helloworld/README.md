@@ -29,4 +29,4 @@ pkapp package windows          :: 产物：release\helloworld-0.1.0-windows-x86_
 打包产物解压后直接双击 exe 即可（Windows 壳 + WebView2，包内置壳自动配对项目
 公钥）。Android 打包（`pkapp fetch android` → `build android` → `package android`）
 见仓库根 README 与 shell-android/README.md；全栈形态（Vue 前端 + 登录门 + 图标 +
-固定端口）见 [../hiapp](../hiapp/)。
+RBAC）见 [../helloapp](../helloapp/)。

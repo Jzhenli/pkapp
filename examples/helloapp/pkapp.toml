@@ -1,17 +1,20 @@
 # pkapp AppSpec（协议 B B.w 校验；字段含义见 docs/PACKAGER_SPEC.md §2）
 [app]
-name = "hiapp"
+name = "helloApp"
 version = "0.1.0"
 entry = "app.main:app"
 min_app_version = "0.1.0"      # V9 防回滚地板：低于此版本的签名包将被壳拒绝
 min_pkapp_version = "0.1.0"
 coexist = false                # 升级共存开关（默认关闭）
+code_encryption = true         # 代码保护②（CODE_PROTECTION_DESIGN §8）：app/ 加密+壳持钥
+code_obfuscation = true        # 代码保护§13：AST 改名/docstring 剥离/字符串加密（与②加密正交）
 
 [dependencies]
 python = [
     "applocal>=0.1.0",         # 契约层（协议 A/C）；必装件
     "uvicorn>=0.30",           # ASGI server（用户应用自带，applocal 惰性导入）
     "fastapi>=0.115",          # 后端框架（纯 ASGI callable；applocal 静态/鉴权包裹层照常生效）
+    "pydantic>=2",             # schemas.py 直接 import（fastapi 传递依赖，显式声明为最佳实践）
                                # 注意：打安卓包时 pydantic_core 需用 flet 维护的 android wheel
 ]
 
@@ -21,12 +24,12 @@ timeout_s = 30
 cold_start_timeout_s = 120     # 冷启动独立档（计时起点 = bootstrap 返回）
 
 [dist]
-dir = "ui"                     # 前端产物目录（恒存在；空缺时 build 生成占位页）
+dir = "ui"                     # 前端产物目录（web/ 下 npm run build 生成）
 
 [network]                      # lan 门（NETWORK_AUTH_DESIGN §5）：账号密码登录，会话走 Cookie
 lan = true                     # 总开关；false 视同未配置（绑定 0.0.0.0，局域网可访问）
 auth = ["login"]               # 登录入口；门首启自动种子 admin/123456（登录后请改密）
-port = 18080                   # 0 = OS 自选；1024–65535 = 固定端口（被占 fail-fast）
+# port = 18080                 # 固定端口示例（1024–65535，被占 fail-fast）；缺省 0 = OS 自选
 # session_days = 7             # Cookie 会话有效期
 # local_auth = true            # 本机壳同样强制登录（缺省 true；false = 本机免登、仅局域网需登录）
 
@@ -35,14 +38,23 @@ port = 18080                   # 0 = OS 自选；1024–65535 = 固定端口（�
 python_version = "3.12.14"     # 运行时意图声明 → pkapp fetch windows（托管缓存锁定同版本）
 # runtime_dir = "D:/runtimes/pbs-cpython-3.12.14+20260929"   # 逃生门：显式覆盖托管快照
 # dependencies = [ "pywin32>=306", ]   # 仅 Windows 装的依赖
-icon = "icons/windows/xplay.ico"             # ship 图标默认值（--icon 参数优先）
+icon = "icons/windows/app.ico" # ship 图标（--icon 参数优先；单源 .ico，多尺寸内嵌）
 [platforms.android]
 python_version = "3.12.14"     # → pkapp fetch android（py-android 运行时同版本锁定）
-package = "com.example.hiapp"   # applicationId（同机多应用共存，build android 必填）
+package = "com.example.helloapp"   # applicationId（同机多应用共存，build android 必填；name 中 - 已转 _）
 # keystore = "signing/release.keystore"  # 可选:release 签名路径（密码走 env PKAPP_KEYSTORE_PASS）
 abis = ["arm64-v8a"]
 extra_index_url = "https://pypi.flet.dev/"   # flet 索引：android 二进制 wheel 源（pydantic_core/numpy 等按 abi 供包）
-icon = "icons/android/xplay.png"     # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；
-                                      #  自动生成全密度 mipmap + 自适应图标，Briefcase 同式）
+icon = "icons/android/app.png"     # 启动器图标（单源 PNG ≥432×432，建议 1024；打包时自动生成
+                                   # 全密度 mipmap + 自适应图标，Briefcase 同式）
+
+# 看门狗（ANDROID_7x24_WATCHDOG_PLAN §8）：测试档 60s 闹钟节奏（生产档 alarm=300/ttl=180/healthz=30）
+[platforms.android.watcher]
+alarm_interval = 60
+heartbeat_ttl = 45
+healthz_interval = 15
+revive_burst_window = 1800
+revive_burst_limit = 3
+healthy_reset_window = 120
 # [platforms.linux]                    # M3 预留；dependencies 同样追加
 # setproctitle = true

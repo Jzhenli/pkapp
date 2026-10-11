@@ -74,9 +74,9 @@ pkapp fetch windows
 
 **最小示例**：[examples/helloworld](examples/helloworld/) —— 纯 ASGI + 一次性握手鉴权
 + 前端自检页的完整打包样例。
-**全栈示例**：[examples/hiapp](examples/hiapp/) —— Vue 3 / Vite 前端 + FastAPI 后端
-+ lan 登录门 + 固定端口 + Windows/Android 图标与安卓打包的完整样例；
-即 `pkapp create --template fullstack` 的模板来源，可对照阅读。
+**全栈示例**：[examples/helloapp](examples/helloapp/) —— Vue 3 / Vite 前端 + FastAPI 后端
++ lan 登录门 + RBAC + SQLite/审计 + 代码加密混淆 + Windows/Android 图标与安卓看门狗
++ 安卓打包的完整样例（即 `pkapp create --template fullstack` 模板的参照源）。
 
 **安全模型**：spk 用 Ed25519 签名，验签公钥烧进壳；`pkapp build` 首次构建自动生成
 项目级 `.pkapp/sign.key`（已默认进 .gitignore，绝不入库）。包内置壳在 package 时
