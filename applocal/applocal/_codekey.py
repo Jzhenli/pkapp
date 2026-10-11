@@ -151,8 +151,13 @@ class _EncFinder:
         if fullname not in self._mids:
             return None
         loader = _EncLoader(self, fullname)
-        return importlib.util.spec_from_loader(fullname, loader,
+        spec = importlib.util.spec_from_loader(fullname, loader,
                                                origin=self.blob_path(fullname))
+        # ★修复★ has_location 置位：_init_module_attrs 据此为模块注入 __file__（=
+        # blob 路径）。明文态 SourceFileLoader 恒有 __file__，加密态缺失会让依赖
+        # Path(__file__) 做资源/相对定位的应用（如 XAgent）在 import 即崩。
+        spec.has_location = True
+        return spec
 
     def blob_path(self, mid: str) -> str:
         return os.path.join(self._app_dir,

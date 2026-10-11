@@ -73,7 +73,9 @@ android {
     // libpython 与扩展 .so 需解压到 nativeLibraryDir（applocal _inject_native 经
     // MYAPP_NATIVE_LIB_DIR 按目录预载 + sys.path 注入，协议 §4.4 W^X 形态）
     packaging { jniLibs { useLegacyPackaging = true } }
-    androidResources { noCompress += "spk" }
+    // spk 不进 noCompress（★分发瘦身★）：STORED spk 在 APK 内由 aapt2 deflate，
+    // APK 下载体积减半；壳侧 assets.open() 流读取由 AssetManager 自动解压，
+    // ZipInputStream 拿到的仍是原始字节，spk 硬校验/验签语义不变
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

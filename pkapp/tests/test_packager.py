@@ -849,3 +849,16 @@ def test_build_xmod_rename_pipeline(project, wheels_dir, tmp_path):
     with zipfile.ZipFile(out2) as zf2:
         for n, raw in raws.items():
             assert zf2.read(n) == raw, f"G5: {n} 两跑不一致"
+
+
+def test_consolidate_top_level_same_stem_clash_fails_fast(tmp_path):
+    """★同名遮蔽闸门★：顶层 .py 与 .pyd 同 stem → 构建期 BuildError（deps.zip 按
+    ._pth 顺序先于 loose/，flat pyc 会静默遮蔽 loose/ 根的原生扩展）。闸门须在
+    打包重活之前触发——python_exe 传空串，若被触达会以其他错误先炸。"""
+    sp = tmp_path / "sp"
+    sp.mkdir()
+    (sp / "x.py").write_text("# shadow source", encoding="utf-8")
+    (sp / "x.cp312-win_amd64.pyd").write_bytes(b"MZ\x90\x00\x03")
+    with pytest.raises(assemble.BuildError, match="顶层同名冲突"):
+        assemble._consolidate_site_packages(
+            str(tmp_path / "stage"), str(sp), "", "", "py")

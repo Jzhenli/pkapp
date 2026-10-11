@@ -23,7 +23,7 @@ shell-android/
 ├── shell/                        # gradle 工程根
 │   ├── settings.gradle.kts / build.gradle.kts / gradle.properties
 │   └── app/
-│       ├── build.gradle.kts      # abiFilters / useLegacyPackaging / noCompress "spk"
+│       ├── build.gradle.kts      # abiFilters / useLegacyPackaging（spk 不 noCompress：APK 内 aapt2 deflate，分发体积减半）
 │       ├── src/main/
 │       │   ├── AndroidManifest.xml   # singleTask + configChanges 全收 + BootService FGS
 │       │   ├── cpp/engine.c          # JNI 引擎：env 应用→Py_InitializeEx(0)→bootstrap→SaveThread

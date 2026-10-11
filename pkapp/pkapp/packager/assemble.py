@@ -834,9 +834,19 @@ def _consolidate_site_packages(stage: str, sp_dir: str,
     （applocal/pydantic_core）全部漏认领。loose/ 一条 entry 承载全部散件目录，
     pyd 相邻依赖（loose/<dist>/x.pyd）与数据文件相对路径（certifi.where()）
     均不受影响。pk_x4 的 blob 定位公式已同步（loose 优先 + 旧形态兜底）。
+
+    顶层原生散件（单文件 .pyd/.so，如 cffi 的 _cffi_backend.cp312-…pyd
+    ——xknx→cryptography→cffi 链实测）→ loose/ 根：原生件 zipimport 装不了
+    （deps.zip 只收 pyc/惰性文件），而 loose/ 本身是 ._pth 路径项，PathFinder
+    对 <entry>/_cffi_backend.*.pyd 平铺形态直接命中；LOAD_WITH_ALTERED_SEARCH
+    语义下相邻 DLL 以 .pyd 自身目录解析，与包内 pyd 同安全性。顶层 .dll 不在
+    放行之列（fail-fast 维持）：它是依赖库而非可导入模块，且包内 pyd 在
+    DLL_LOAD_DIR 语义下解析不到 loose/ 根的依赖 dll，放行只会把构建期错误
+    推迟成运行期 ImportError。
     """
     zip_units: list[str] = []
     loose_units: list[str] = []
+    native_units: list[str] = []
     for name in sorted(os.listdir(sp_dir)):
         full = os.path.join(sp_dir, name)
         if name == "__pycache__":
@@ -846,14 +856,34 @@ def _consolidate_site_packages(stage: str, sp_dir: str,
             zip_units.append(full)          # 元数据随 zip（pydantic 实证良性）
             continue
         if os.path.isfile(full):
-            if name.lower().endswith((".pyd", ".so", ".dll")):
-                raise BuildError(f"site-packages 顶层原生散件不支持收拢: {name}")
+            lower = name.lower()
+            if lower.endswith((".pyd", ".so")):
+                native_units.append(full)   # 顶层原生散件 → loose/ 根（见 docstring）
+                continue
+            if lower.endswith(".dll"):
+                raise BuildError(
+                    f"site-packages 顶层 .dll 不支持收拢: {name}（依赖库无 import "
+                    f"语义，PathFinder 不认领；包内 pyd 在 loose/<dist>/ 下解析不到 "
+                    f"loose/ 根的相邻 dll——请将其并入消费方包目录后重构建）")
             zip_units.append(full)          # 顶层散 .py 模块/存根 → zip flat pyc
             continue
         if _unit_needs_loose(full):
             loose_units.append(full)
         else:
             zip_units.append(full)
+
+    # ★同名遮蔽闸门★：._pth 顺序 deps.zip 先于 loose/——同 stem 的顶层 .py（flat
+    # pyc）会静默遮蔽 loose/ 根的原生扩展，与 CPython 同目录扩展件优先语义相反；
+    # 宁构建期 fail-fast，不把语义漂移推迟到运行期 import（pip 语义下罕见，纯防御）
+    py_stems = {os.path.basename(u)[:-3] for u in zip_units
+                if os.path.isfile(u) and u.lower().endswith(".py")}
+    native_stems = {os.path.basename(u).split(".")[0] for u in native_units}
+    clash = sorted(py_stems & native_stems)
+    if clash:
+        raise BuildError(
+            f"site-packages 顶层同名冲突: {', '.join(clash)}（顶层 .py 进 deps.zip "
+            f"flat pyc，按 ._pth 顺序会遮蔽 loose/ 根的原生 .pyd/.so——请移除其一"
+            f"或将原生件并入消费方包目录后重构建）")
 
     work = tempfile.mkdtemp(prefix="pkapp-deps-")
     try:
@@ -870,6 +900,8 @@ def _consolidate_site_packages(stage: str, sp_dir: str,
             print(f"[build] applocal 混淆：改名 {st['renamed']} 符号/"
                   f"剥离 {st['stripped']} docstring")
         shutil.move(u, os.path.join(loose_dir, os.path.basename(u)))
+    for u in native_units:                           # 顶层原生散件平铺落 loose/ 根
+        shutil.move(u, os.path.join(loose_dir, os.path.basename(u)))
     for u in zip_units:
         if os.path.isdir(u):
             shutil.rmtree(u)
@@ -879,8 +911,10 @@ def _consolidate_site_packages(stage: str, sp_dir: str,
     atomic_write(os.path.join(stage, f"{stem}._pth"),
                  ("\n".join(lines) + "\n").encode("utf-8"))
     print(f"[build] site-packages 收拢：deps.zip {n} 条目 + loose/ 散件 "
-          f"{len(loose_units)} 目录（{', '.join(os.path.basename(u) for u in loose_units) or '无'}）；"
-          f"._pth 收窄（无 import site）")
+          f"{len(loose_units)} 目录（{', '.join(os.path.basename(u) for u in loose_units) or '无'}）"
+          + (f" + 顶层原生 {len(native_units)} 件（"
+             f"{', '.join(os.path.basename(u) for u in native_units)}）" if native_units else "")
+          + f"；._pth 收窄（无 import site）")
 
 
 def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
