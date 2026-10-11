@@ -298,6 +298,8 @@ def build_lan_app(user_app, cfg, *, roles_table=None, route_perms=None):
         #    未持会话的首航应整体 302 /login（登录页自包含，不受影响）。
         if not (require_session and want_login) and _handshake_ok(
                 scope, cfg.paths.handshake_file):
+            scope["identity"] = None   # 豁免≠无门：显式匿名（姿势 A require_perm 以
+                                       # "identity" 键在场判别门的存在，§9.2）
             return await inner(scope, receive, send)
 
         # ── 5) 会话解析（§7 唯一校验点：Cookie 或 header 任一载体）────────────
