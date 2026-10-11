@@ -549,9 +549,14 @@ def bootstrap(entry: str = "app.main:app") -> int:
                                                        # ——finder 是 app.* 唯一供给方（§7.1
                                                        # 两分支互斥，防 PathFinder 判成
                                                        # namespace 包）
-    elif os.path.isdir(cfg.paths.app_dir) and cfg.paths.app_dir not in sys.path:
-        sys.path.append(cfg.paths.app_dir)         # 步骤 1：追加到最后（§2.1③ stdlib/依赖优先；
-                                                   # insert(0) 会让用户目录 shadow 标准库——已实证）
+    elif os.path.isdir(cfg.paths.app_dir) and \
+            os.path.dirname(cfg.paths.app_dir) not in sys.path:
+        sys.path.append(os.path.dirname(cfg.paths.app_dir))   # 步骤 1：追加 app/ 的
+        # 父目录到最后（§2.1③ stdlib/依赖优先；insert(0) 会让用户目录 shadow 标准库
+        # ——已实证）。★勘误★：PathFinder 对 sys.path 条目 d 找 d/<顶层名>/，
+        # append app_dir 本身只能命中 app_dir/app/（不存在）→ 嵌入态（_pth 收窄、
+        # 无 cwd 兜底）import app 必炸 No module named 'app'（真壳实证）；
+        # dev 态靠 cwd 在项目根侥幸掩盖。append 父目录 = manifest 同级根，两态同语义。
     _inject_native(rt.native_lib_dir)              # 步骤 2：Android so 注入
     diag("bootstrap", f"starting version={rt.version} platform={rt.platform}")
     try:

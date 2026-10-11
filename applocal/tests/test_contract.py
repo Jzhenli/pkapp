@@ -646,6 +646,9 @@ def _fake_uvicorn(monkeypatch, captured):
 def _prep_entry(env):
     app_dir = env / "runtime" / "app"
     app_dir.mkdir(parents=True, exist_ok=True)
+    # ★sys.path 勘误后语义★：bootstrap append 的是 app_dir 父目录（PathFinder 找
+    # <父>/app/<mod>.py）——entry 须为 app.main:app 的真实嵌入形态
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
     (app_dir / "main.py").write_text("app = object()\n", encoding="utf-8")
 
 
@@ -655,7 +658,7 @@ def test_bootstrap_hands_bound_socket_to_uvicorn(env, monkeypatch):
     _fake_uvicorn(monkeypatch, captured)
     monkeypatch.setattr(sys, "argv", list(sys.argv))                  # bootstrap 会改写 argv/path
     monkeypatch.setattr(sys, "path", list(sys.path))
-    port = applocal.bootstrap("main:app")
+    port = applocal.bootstrap("app.main:app")
     deadline = time.time() + 3
     while "sockets" not in captured and time.time() < deadline:
         time.sleep(0.05)
@@ -670,6 +673,6 @@ def test_bootstrap_missing_uvicorn_writes_diag(env, monkeypatch):
     monkeypatch.setattr(sys, "argv", list(sys.argv))
     monkeypatch.setattr(sys, "path", list(sys.path))
     with pytest.raises(ImportError):
-        applocal.bootstrap("main:app")
+        applocal.bootstrap("app.main:app")
     d = applocal.read_diag()
     assert "uvicorn" in d["error"] and d["recoverable"] is False       # 错误页有因可查（§6）

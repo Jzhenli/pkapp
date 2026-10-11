@@ -332,6 +332,7 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
                           python_dll: str | None = None, *,
                           unchecked: bool = False,
                           obfuscate: bool = False,
+                          rft: bool = True,
                           obf_key: bytes | None = None,
                           protected_pairs: frozenset = frozenset()) -> dict:
     """B.u：hash 失效模式（源 hash 进 pyc 头，不烧 mtime → 树 hash 稳定）。
@@ -340,11 +341,15 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
     PEP 552 语义即"无源可信"；CHECKED_HASH 的契约是校验源，无源导入只是
     zipimport 对缺源的宽容行为，不作为源码式无源分发的依据。
 
-    obfuscate=True（★§13 混淆叠加层★，仅 app/）：逐模块源码经 obfuscate.transform
+    obfuscate=True（★§13 混淆叠加层★）：逐模块源码经 obfuscate.transform
     （符号改名 + docstring 剥离）后编译——source_hash 用原始源文件字节，磁盘 .py
-    不改写（staging app/ 恒保留源码，importlib checked-hash 校验对磁盘源重算哈希
-    ——自洽），traceback 行号对应原始源码行。unchecked 与 obfuscate 互斥
-    （stdlib 树不参与混淆）。
+    不改写，traceback 行号对应原始源码行。两种合法组合：
+    - checked + obfuscate（app/ 树）：staging app/ 恒保留源码，importlib
+      checked-hash 校验对磁盘源重算哈希——自洽；
+    - unchecked + obfuscate（★applocal flat 树专用★）：出货后 .py 缺席，
+      UNCHECKED_HASH = "无源可信"与 flat 树语义一致。
+    rft=True（缺省，app/）叠加期3 跨模块统一改名（build_rename_plan）；rft=False
+    （applocal）= 纯期1（plan=None，模块级名不参与——公共 API 零契约风险）。
 
     obf_key（★§13.3③ S7★）：32 字节混淆密钥——obfuscate 且 obf_key 同时给出才
     追加字符串加密 pass（keystream 的 module_id = 包内相对路径，与 co_filename
@@ -363,14 +368,13 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
     ★RFT 两遍★：obf 态先全树读源 → build_rename_plan（跨模块统一映射，G5 依据
     = sorted rel UTF-8 字节序 + symtable 序 + 全局计数器）→ 逐模块带 plan 编译。
     """
-    if unchecked and obfuscate:
-        raise BuildError("stdlib 树不参与混淆")
     child_mode = "unchecked" if unchecked else "checked"
     obf_flag = "obf" if obfuscate else "plain"
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     if python_exe and python_dll and os.path.isfile(python_exe):
-        argv_extra = ([f"{obf_key.hex()}" if obf_key else "",
-                       json.dumps(sorted(protected_pairs))] if obfuscate else [])
+        argv_extra = ([f"key={obf_key.hex()}" if obf_key else "key=",
+                       f"pairs={json.dumps(sorted(protected_pairs))}",
+                       "rft" if rft else "local"] if obfuscate else [])
         try:
             r = subprocess.run(
                 [python_exe, "-c", _COMPILE_CHILD, root, python_dll, child_mode,
@@ -403,7 +407,8 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
     renamed = stripped = strings = 0
     exempt: dict = {}
     if obfuscate:
-        # ★RFT 两遍★：先全树读源建统一改名计划，再逐模块带 plan 编译
+        # ★RFT 两遍★（rft=True）：先全树读源建统一改名计划，再逐模块带 plan 编译；
+        # rft=False（applocal flat 树）= 纯期1（plan=None，模块级名不参与改名）
         sources = {}
         raws = {}
         for rel in walk_files(root):
@@ -413,8 +418,9 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
                 enc = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
                 raws[rel] = raw
                 sources[rel] = raw.decode(enc)      # ★OB-2★ 解码与 py_compile 同语义
-        plan = build_rename_plan(sources, protected_pairs=protected_pairs)
-        exempt = dict(plan.stats)
+        plan = (build_rename_plan(sources, protected_pairs=protected_pairs)
+                if rft else None)
+        exempt = dict(plan.stats) if plan is not None else {}
         for rel in sorted(sources, key=lambda s: s.encode("utf-8")):
             src = os.path.join(root, rel.replace("/", os.sep))
             pyc = cache_from_source(src)
@@ -425,7 +431,8 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
             verify_parity(sources[rel], rel, code, st,       # ★R-13★ 每模块对拍闸
                           string_key=obf_key, module_id=rel)
             with open(pyc, "wb") as f:
-                f.write(_code_to_hash_pyc(code, source_hash(raws[rel]), checked=True))
+                f.write(_code_to_hash_pyc(code, source_hash(raws[rel]),
+                                          checked=not unchecked))
             renamed += st["renamed"]
             stripped += st["stripped"]
             strings += st.get("strings", 0)
@@ -459,13 +466,17 @@ def _parse_pyc_stats(stdout: str) -> dict:
 
 
 # 快照解释器子进程内执行：版本哨兵 + 整树 hash 模式编译（单一进程 → 确定性）。
-# argv = [-c, root, python_dll, child_mode, obf_flag, pkg_dir[, obf_key_hex[, pairs_json]]]；
+# argv = [-c, root, python_dll, child_mode, obf_flag, pkg_dir, <obf 自描述 flags>...]；
 # obf 分支 ★RFT 两遍★：先全树读源 → build_rename_plan（跨模块统一映射，G5 依据
 # = sorted rel UTF-8 字节序 + symtable 序 + 全局计数器）→ 逐模块带 plan 混淆编译
 # （_code_to_hash_pyc 产物与 py_compile.compile(CHECKED_HASH) 逐字节相等，已实测），
-# obf_key_hex 非空时透传字符串加密 pass（keystream 的 module_id = rel 包内相对路径），
-# pairs_json = sorted protected_pairs（entry 面 (mid, name) 保护对，RFT）；PYC-OK 行后
-# 打印 RENAME-EXEMPT 豁免统计。普通分支原 py_compile 逻辑不变。
+# flags 自描述（★消位置耦合★，无序、可选、可扩展）：
+#   key=<hex>   —— 混淆密钥（空值 = 仅改名+剥离；keystream 的 module_id = rel 路径）；
+#   pairs=<json> —— sorted protected_pairs（entry 面 (mid, name) 保护对，RFT）；
+#   rft / local —— 期3 跨模块统一改名 / ★applocal flat 树★ 纯期1（plan=None，
+#                  模块级名不参与改名）；
+# pyc 头 checked 与 child_mode 对齐（unchecked 组合 = applocal 无源语义）。
+# PYC-OK 行后打印 RENAME-EXEMPT 豁免统计。普通分支原 py_compile 逻辑不变。
 _COMPILE_CHILD = """\
 import os, sys
 expected = sys.argv[2]                     # 形如 python312.dll
@@ -475,25 +486,30 @@ if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     sys.exit(2)
 import importlib.util
 R = S = K = 0
-key = None                                 # 混淆密钥（argv[6]，"" = 仅改名+剥离）
-pairs = frozenset()                        # entry 保护对（argv[7] JSON，RFT）
 obf = sys.argv[4] == "obf"
 if obf:
     sys.path.insert(0, sys.argv[5])        # packager 包目录 → import obfuscate
     import obfuscate
     import importlib._bootstrap_external as _be
-    if len(sys.argv) > 6 and sys.argv[6]:
-        key = bytes.fromhex(sys.argv[6])
-    if len(sys.argv) > 7:
-        import json as _json
-        pairs = frozenset(tuple(p) for p in _json.loads(sys.argv[7]))
+    import json as _json
+    key = None                             # 混淆密钥（key=<hex>，空值 = 仅改名+剥离）
+    pairs = frozenset()                    # entry 保护对（pairs=<json>，RFT）
+    rft = True                             # 缺省期3；"local" = applocal 纯期1
+    for arg in sys.argv[6:]:               # ★自描述 flags★（无序可选，消位置耦合）
+        k, _, v = arg.partition("=")
+        if k == "key" and v:
+            key = bytes.fromhex(v)
+        elif k == "pairs":
+            pairs = frozenset(tuple(p) for p in _json.loads(v))
+        elif arg == "local":
+            rft = False
 else:
     import py_compile
     mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if sys.argv[3] == "unchecked"
             else py_compile.PycInvalidationMode.CHECKED_HASH)
 root = sys.argv[1]
 if obf:
-    # ★RFT 两遍★ 第一遍：全树读源建统一改名计划
+    # ★RFT 两遍★ 第一遍：全树读源建统一改名计划（rft=False = 纯期1，plan=None）
     import io as _io, tokenize as _tk
     sources = {}
     raws = {}
@@ -510,8 +526,9 @@ if obf:
             enc = _tk.detect_encoding(_io.BytesIO(raw).readline)[0]
             raws[rel] = raw
             sources[rel] = raw.decode(enc)
-    plan = obfuscate.build_rename_plan(sources, protected_pairs=pairs)
-    exempt = dict(plan.stats)
+    plan = (obfuscate.build_rename_plan(sources, protected_pairs=pairs)
+            if rft else None)
+    exempt = dict(plan.stats) if plan is not None else {}
     # 第二遍：sorted rel UTF-8 字节序逐模块带 plan 编译（与回退路径同序，G5 依据）
     for rel in sorted(sources, key=lambda s: s.encode("utf-8")):
         p = os.path.join(root, rel.replace("/", os.sep))
@@ -529,7 +546,8 @@ if obf:
             sys.exit(3)
         with open(pyc, "wb") as f:
             f.write(_be._code_to_hash_pyc(
-                code, importlib.util.source_hash(raws[rel]), checked=True))
+                code, importlib.util.source_hash(raws[rel]),
+                checked=(sys.argv[3] != "unchecked")))
         R += _st["renamed"]
         S += _st["stripped"]
         K += _st.get("strings", 0)
@@ -697,6 +715,10 @@ def _has_namespace_pkg(unit_dir: str) -> bool:
     return False
 
 
+APPLOCAL_UNIT = "applocal"   # 契约层 wheel 单元名：出货混淆（期1）判定位，
+                             # windows 收拢链与 android 链共用此常量
+
+
 def _unit_needs_loose(unit_dir: str) -> bool:
     """散件化判定：发行版目录是否必须落散件（不进 deps.zip）。
 
@@ -717,10 +739,15 @@ def _unit_needs_loose(unit_dir: str) -> bool:
     return _has_namespace_pkg(unit_dir)
 
 
-def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str) -> None:
+def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str, *,
+                       obfuscate: bool = False) -> dict:
     """目录树 → flat pyc-only（★P0 落盘形态★）：UNCHECKED_HASH 编译整树 →
     __pycache__/<mod>.<tag>.pyc 移成同目录 flat <mod>.pyc → 删全部 .py 与
     __pycache__。
+
+    obfuscate=True（★applocal 出货混淆★）：编译前过 §13 期1 混淆 pass（rft=False
+    纯期1——符号改名 + docstring 剥离，模块级名/公共 API 不参与）；unchecked 组合
+    合法（applocal flat 树无源语义）。返回 _compile_checked_hash 的混淆统计。
 
     flat 布局依据：目录场景 SourcelessFileLoader 认 <dir>/<mod>.pyc（与
     zipimport 只认 zip 内扁平 .pyc 条目同构）；UNCHECKED_HASH = pyc 头与
@@ -729,7 +756,8 @@ def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str) -> No
     python_dll 名的对齐由编译解释器版本闸（防线 A/B）保证，这里只验
     "编译已产出"（mock/回退打包机场景 tag 可能与快照不同名，结构不受影响）。
     """
-    _compile_checked_hash(root, python_exe, python_dll, unchecked=True)
+    st = _compile_checked_hash(root, python_exe, python_dll, unchecked=True,
+                               obfuscate=obfuscate, rft=False)
     for dirpath, _dirnames, filenames in os.walk(root):
         for fn in filenames:
             if not fn.endswith(".py"):
@@ -756,6 +784,7 @@ def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str) -> No
         for fn in filenames:
             if fn.endswith(".py"):
                 os.remove(os.path.join(dirpath, fn))
+    return st
 
 
 def _pack_deps_zip(zip_units: list[str], out: str,
@@ -835,7 +864,11 @@ def _consolidate_site_packages(stage: str, sp_dir: str,
     loose_dir = os.path.join(sp_dir, "loose")
     os.makedirs(loose_dir, exist_ok=True)
     for u in loose_units:
-        _compile_flat_tree(u, python_exe, python_dll)
+        obf = os.path.basename(u) == APPLOCAL_UNIT   # ★applocal 出货混淆★（期1）
+        st = _compile_flat_tree(u, python_exe, python_dll, obfuscate=obf)
+        if obf and st["renamed"] + st["stripped"] > 0:
+            print(f"[build] applocal 混淆：改名 {st['renamed']} 符号/"
+                  f"剥离 {st['stripped']} docstring")
         shutil.move(u, os.path.join(loose_dir, os.path.basename(u)))
     for u in zip_units:
         if os.path.isdir(u):
@@ -1342,6 +1375,17 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         if obf_stats.get("exempt"):
             parts = " ".join(f"{k}={v}" for k, v in sorted(obf_stats["exempt"].items()))
             print(f"[build] app/ 改名豁免：{parts}")
+
+        # 3′) applocal flat pyc-only + §13 期1 混淆（★applocal 出货混淆★）：android
+        #     不走收拢，site-packages 其余依赖保持 .py（v0.7 布局）；applocal 恒
+        #     pyc-only 与 windows loose/ 同形态（SourcelessFileLoader 目录 flat pyc
+        #     合法形态）——消灭 .py 明文源码面；_codekey.pyc 供
+        #     _encrypt_applocal_boot 直读分支（3b 加密前必须完成）。
+        al_st = _compile_flat_tree(os.path.join(sp_dir, APPLOCAL_UNIT), pyc_exe,
+                                   snapshot.python_dll, obfuscate=True)
+        if al_st["renamed"] + al_st["stripped"] > 0:
+            print(f"[build] applocal 混淆：改名 {al_st['renamed']} 符号/"
+                  f"剥离 {al_st['stripped']} docstring")
 
         # 3a) app_hash（★档位1 §3.2 解耦★）——必须在 3b 加密前（加密删明文）
         pyc_tag = "cpython-" + "".join(c for c in snapshot.python_dll if c.isdigit())

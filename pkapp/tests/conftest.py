@@ -90,7 +90,14 @@ def wheels_dir(tmp_path):
     wd = str(tmp_path / "wheels")
     os.makedirs(wd)
     make_wheel(wd, "applocal", "0.1.0", {
-        "applocal/__init__.py": '__version__ = "0.1.0"\n',
+        # 模块级名/参数名/真局部变量齐备：applocal 出货混淆（期1）断言的符号面——
+        # 局部名应被改 _o*，模块级名与参数名必须保留（纯期1 plan=None 豁免合同）
+        "applocal/__init__.py":
+            '__version__ = "0.1.0"\n'
+            'def _probe(seed=None):\n'
+            '    """probe doc."""\n'
+            '    marker = seed or "x"\n'
+            '    return marker\n',
         # ★期1 S2★ 解密器密文化的输入位（_encrypt_applocal_boot 契约：
         # code_encryption=true 时 site-packages/applocal/_codekey.py 必在）
         "applocal/_codekey.py": '"""code-key boot (test stub)."""\nSTUB = 1\n',

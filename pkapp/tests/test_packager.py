@@ -153,7 +153,9 @@ def test_android_build(project, mock_android_runtime, wheels_dir, tmp_path):    
     assert spk.MANIFEST_ENTRY in names
     assert "app/main.py" in names
     assert "ui/index.html" in names
-    assert "site-packages/applocal/__init__.py" in names
+    assert "site-packages/applocal/__init__.pyc" in names   # applocal flat pyc-only（出货混淆）
+    assert not any(n.startswith("site-packages/applocal/")
+                   and n.endswith(".py") for n in names)    # 无 .py 明文源码面
     assert not any(n.endswith("._pth") or n.startswith("DLLs/") for n in names)
     # G1 android：可复现
     out2 = str(tmp_path / "demo-android-2.spk")
@@ -376,7 +378,9 @@ def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
                    for n in app_entries)                   # 删明文闸：spk 内无源码
     assert any(n.startswith("app/") and n.endswith(".enc")
                and n != "app/index.enc" for n in names)    # 模块 blob 在
-    assert "site-packages/applocal/__init__.py" in names   # 加密只覆盖 app/
+    assert "site-packages/applocal/__init__.pyc" in names  # applocal pyc-only；加密只覆盖 app/
+    assert not any(n.startswith("site-packages/applocal/")
+                   and n.endswith(".py") for n in names)   # 无 .py 明文源码面
     assert "ui/index.html" in names                        # ui 恒存在
     # 密文可解：windows 件补丁 K 内嵌（运行期形态）→ index + 模块 blob 全打开
     patched = str(tmp_path / "pkapp_key.patched.dll")
@@ -487,6 +491,86 @@ def test_build_code_obfuscated_and_encrypted(project, wheels_dir, tmp_path,
     locals_ = _collect_local_names(code)
     assert "data_dir" not in locals_               # 混淆在加密之前已生效
     assert any(x.startswith("_o") for x in locals_)
+
+
+def test_compile_flat_tree_obfuscated(tmp_path):   # ★applocal 出货混淆★ 组合单测
+    """★_compile_flat_tree(obfuscate=True)★：fabricated 树 → flat pyc-only +
+    期1 混淆（unchecked+obf 组合合法化）；pyc 头 UNCHECKED_HASH（无源语义）；
+    模块级名/参数豁免、真局部改名 _o*、docstring 剥离（plan=None 纯期1 合同）；
+    G5 双跑字节级一致（纯改名路径进程内稳定）。"""
+    import marshal
+
+    def _fabricate(root):
+        os.makedirs(os.path.join(root, "applocal"))
+        with open(os.path.join(root, "applocal", "__init__.py"), "w",
+                  encoding="utf-8") as f:
+            f.write('__version__ = "0.1.0"\n'
+                    'def _probe(seed=None):\n'
+                    '    """probe doc."""\n'
+                    '    marker = seed or "x"\n'
+                    '    return marker\n')
+
+    root = str(tmp_path / "alx")
+    _fabricate(root)
+    st = assemble._compile_flat_tree(root, None, None, obfuscate=True)
+    assert st["renamed"] >= 1 and st["stripped"] >= 1
+    assert not os.path.exists(os.path.join(root, "applocal", "__init__.py"))
+    with open(os.path.join(root, "applocal", "__init__.pyc"), "rb") as f:
+        raw = f.read()
+    flags = int.from_bytes(raw[4:8], "little")
+    assert flags & 0b11 == 0b01    # UNCHECKED_HASH（bit0=hash-based，bit1=不校验源）
+    code = marshal.loads(raw[16:])                              # 剥 16 字节 pyc 头
+    probe = next(c for c in code.co_consts
+                 if isinstance(c, types.CodeType) and c.co_name == "_probe")
+    assert "seed" in probe.co_varnames                          # 参数豁免（期1 合同）
+    assert "marker" not in probe.co_varnames                    # 真局部已改名
+    assert any(x.startswith("_o") for x in probe.co_varnames)
+    assert {"__version__", "_probe"} <= set(code.co_names)      # 模块级名保留
+    assert "probe doc." not in probe.co_consts                  # docstring 剥离
+    # G5：同源双跑 pyc 字节级一致
+    root2 = str(tmp_path / "alx2")
+    _fabricate(root2)
+    assemble._compile_flat_tree(root2, None, None, obfuscate=True)
+    with open(os.path.join(root2, "applocal", "__init__.pyc"), "rb") as f:
+        assert f.read() == raw, "G5: flat 树混淆双跑不一致"
+
+
+def test_applocal_obfuscated_windows(project, wheels_dir, tmp_path):
+    """★applocal 期1混淆（Windows 收拢链端到端）★：loose/applocal flat pyc-only
+    无 .py；_probe 真局部改名 _o*、参数 seed 豁免、模块级名保留（plan=None 纯期1
+    ——公共 API 零契约风险）；docstring 剥离；certifi 照常走 deps.zip；G5 双跑
+    applocal pyc 字节级一致。"""
+    import marshal
+
+    out1, out2 = str(tmp_path / "al1.spk"), str(tmp_path / "al2.spk")
+    _build(project, wheels_dir, out1)
+    with zipfile.ZipFile(out1) as zf:
+        stage = str(tmp_path / "stage")
+        zf.extractall(stage)
+    al = os.path.join(stage, "site-packages", "loose", "applocal")
+    files = os.listdir(al)
+    assert "__init__.pyc" in files and "_codekey.pyc" in files
+    assert not any(f.endswith(".py") for f in files)         # flat pyc-only，无明文
+    with open(os.path.join(al, "__init__.pyc"), "rb") as f:
+        code = marshal.loads(f.read()[16:])                 # 剥 16 字节 pyc 头
+    probe = next(c for c in code.co_consts
+                 if isinstance(c, types.CodeType) and c.co_name == "_probe")
+    assert "seed" in probe.co_varnames                      # 参数豁免
+    assert "marker" not in probe.co_varnames
+    assert any(x.startswith("_o") for x in probe.co_varnames)
+    assert {"__version__", "_probe"} <= set(code.co_names)  # 模块级名/公共 API 不动
+    assert "probe doc." not in _const_strs(code)            # docstring 剥离
+    # G5：双跑 applocal pyc 字节级一致
+    _build(project, wheels_dir, out2)
+    with zipfile.ZipFile(out2) as zf2:
+        stage2 = str(tmp_path / "stage2")
+        zf2.extractall(stage2)
+    for fn in ("__init__.pyc", "_codekey.pyc"):
+        with open(os.path.join(stage2, "site-packages", "loose",
+                               "applocal", fn), "rb") as f:
+            got = f.read()
+        with open(os.path.join(al, fn), "rb") as f:
+            assert got == f.read(), f"G5: applocal/{fn} 两跑不一致"
 
 
 # ---------------------------------------------------------------- 字符串加密构建链（§13.3③ S7）
