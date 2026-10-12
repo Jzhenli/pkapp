@@ -33,6 +33,9 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <algorithm>
 #include <time.h>
 
@@ -77,6 +80,7 @@ static std::wstring g_title;
 static HWND g_hwnd;
 static HWND g_splash;      /* 启动加载层（STATIC 子窗口，覆盖客户区） */
 static HFONT g_splash_font;
+static volatile LONG g_boot_quit; /* 启动期泵到 WM_QUIT（用户关窗）→ 中止启动、错误 UI 免弹 */
 static ICoreWebView2Environment *g_env2;
 static ICoreWebView2Controller *g_ctl2;
 static ICoreWebView2 *g_web2;
@@ -376,38 +380,104 @@ static void mk_parent_dirs(const std::wstring &file) {
         CreateDirectoryW(file.substr(0, pos).c_str(), NULL);
 }
 
-/* 展开全部条目到 staging（manifest 条目落 staging 根，同协议 B §1 布局） */
+/* 线程池收尾 + 消息泵：join 期间主线程持续 PeekMessage，防启动期长阻塞
+ * （解压/完整性门 ~8-17s）出现"未响应"鬼影；泵到 WM_QUIT（用户点 X 关窗）
+ * 置 g_boot_quit，由调用方中止启动、show_error_ui_at_startup 免弹。 */
+static void join_pool_with_pump(std::vector<std::thread> &pool) {
+    std::vector<HANDLE> hs;
+    for (auto &th : pool) hs.push_back(th.native_handle());
+    while (!hs.empty()) {
+        DWORD w = MsgWaitForMultipleObjects((DWORD)hs.size(), hs.data(), FALSE,
+                                            INFINITE, QS_ALLINPUT);
+        if (w == WAIT_OBJECT_0 + (DWORD)hs.size()) {
+            MSG msg;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    g_boot_quit = 1;
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (g_boot_quit) break;
+        } else if (w >= WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + (DWORD)hs.size()) {
+            size_t i = w - WAIT_OBJECT_0;
+            hs[i] = hs.back();
+            hs.pop_back();
+        } else {
+            break; /* WAIT_FAILED 等异常：落入下方兜底 join */
+        }
+    }
+    for (auto &th : pool)
+        if (th.joinable()) th.join();
+}
+
+/* 展开全部条目到 staging（manifest 条目落 staging 根，同协议 B §1 布局）。
+ * 并行写出（独立条目间无依赖；CreateFileW/WriteFile 大头是 Defender 对新文件
+ * 的进程内同步扫描，线程池重叠之）。任一失败 → 原子置错并收敛。 */
 static int extract_all(spk_file *spk, const std::wstring &staging, char *err, size_t cap) {
     CreateDirectoryW(staging.c_str(), NULL);
-    for (int i = 0; i < spk->count; i++) {
-        wchar_t rel[1024];
-        std::wstring full;
-        HANDLE h;
-        DWORD written = 0;
-        /* ★P0★ _integrity/* 是信任锚材料（随包携带、非受保护树内容）：
-           不落盘，只在 integrity_gate 需要自愈侧车时直接从 spk 内存取用 */
-        if (strncmp(spk->entries[i].path, SPK_INTEGRITY_PREFIX,
-                    sizeof(SPK_INTEGRITY_PREFIX) - 1) == 0)
-            continue;
-        wide_path_from_entry(spk->entries[i].path, rel, 1024);
-        full = join_path(staging, rel);
-        mk_parent_dirs(full);
-        h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) {
-            _snprintf(err, cap - 1, "写出条目失败: %s (GetLastError=%lu)",
-                      spk->entries[i].path, (unsigned long)GetLastError());
-            err[cap - 1] = 0;
-            return -1;
-        }
-        if (!WriteFile(h, spk->entries[i].data, spk->entries[i].size, &written, NULL) ||
-            written != spk->entries[i].size) {
-            _snprintf(err, cap - 1, "条目写入不完整: %s", spk->entries[i].path);
-            err[cap - 1] = 0;
+    std::atomic<int> failed(0);
+    std::mutex e_mu;
+    std::string e_what;
+    unsigned hc = std::thread::hardware_concurrency();
+    int nthreads = hc ? (int)hc : 4;
+    if (nthreads > 8) nthreads = 8;
+    if (nthreads < 2 || spk->count < 64) nthreads = 1;
+
+    auto worker = [&](int tid) {
+        for (int i = tid; i < spk->count; i += nthreads) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            wchar_t rel[1024];
+            /* ★P0★ _integrity/* 是信任锚材料（随包携带、非受保护树内容）：
+               不落盘，只在 integrity_gate 需要自愈侧车时直接从 spk 内存取用 */
+            if (strncmp(spk->entries[i].path, SPK_INTEGRITY_PREFIX,
+                        sizeof(SPK_INTEGRITY_PREFIX) - 1) == 0)
+                continue;
+            wide_path_from_entry(spk->entries[i].path, rel, 1024);
+            std::wstring full = join_path(staging, rel);
+            mk_parent_dirs(full);
+            HANDLE h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h == INVALID_HANDLE_VALUE) {
+                std::lock_guard<std::mutex> lk(e_mu);
+                if (failed.load() == 0) {
+                    failed.store(1);
+                    char msg[512];
+                    _snprintf(msg, sizeof(msg) - 1, "写出条目失败: %s (GetLastError=%lu)",
+                              spk->entries[i].path, (unsigned long)GetLastError());
+                    msg[sizeof(msg) - 1] = 0;
+                    e_what = msg;
+                }
+                return;
+            }
+            DWORD written = 0;
+            BOOL wok = WriteFile(h, spk->entries[i].data, spk->entries[i].size, &written, NULL) &&
+                       written == spk->entries[i].size;
             CloseHandle(h);
-            return -1;
+            if (!wok) {
+                std::lock_guard<std::mutex> lk(e_mu);
+                if (failed.load() == 0) {
+                    failed.store(1);
+                    e_what = std::string("条目写入不完整: ") + spk->entries[i].path;
+                }
+                return;
+            }
         }
-        CloseHandle(h);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nthreads; t++) pool.emplace_back(worker, t);
+    join_pool_with_pump(pool);
+
+    if (g_boot_quit) {
+        _snprintf(err, cap - 1, "启动期间窗口被用户关闭");
+        err[cap - 1] = 0;
+        return -1;
+    }
+    if (failed.load() != 0) {
+        _snprintf(err, cap - 1, "%s", e_what.c_str());
+        err[cap - 1] = 0;
+        return -1;
     }
     return 0;
 }
@@ -981,6 +1051,7 @@ static void show_error_ui(const char *summary_utf8, int recoverable) {
 
 /* 启动早期失败路径：窗口可能尚未创建（§9 绝不黑屏——原生错误页兜底） */
 static void show_error_ui_at_startup(const char *summary, int recoverable) {
+    if (g_boot_quit) return; /* 用户启动期主动关窗：不弹错误 UI，随返回码退出 */
     show_error_ui(summary, recoverable);
     run_message_loop(); /* 阻塞至用户关闭/重启 */
 }
@@ -1702,28 +1773,38 @@ static const spk_entry *spk_find_entry(const spk_file *sf, const char *path) {
     return NULL;
 }
 
-/* 单文件 SHA-256（大小来自目录枚举；读不满视为并发改动 → fail-closed） */
+/* 单文件 SHA-256（流式分块读：不再整块 malloc；大小来自目录枚举，
+ * 读不满/读超视为并发改动 → fail-closed） */
 static int integrity_hash_file(const std::wstring &path, ULONGLONG sz, uint8_t out[32]) {
     FILE *f;
     uint8_t *buf;
     size_t n;
+    ULONGLONG total = 0;
+    pkapp_sha256_ctx c;
     if (sz > (512ull << 20)) return -1;   /* 受保护树不应出现巨件（防御性拒绝） */
     f = _wfopen(path.c_str(), L"rb");
     if (!f) return -1;
-    buf = (uint8_t *)malloc((size_t)sz + 1);
+    buf = (uint8_t *)malloc(256 * 1024);
     if (!buf) { fclose(f); return -1; }
-    n = fread(buf, 1, (size_t)sz, f);
+    pkapp_sha256_init(&c);
+    while ((n = fread(buf, 1, 256 * 1024, f)) > 0) {
+        pkapp_sha256_update(&c, buf, n);
+        total += n;
+    }
+    int err = ferror(f);
     fclose(f);
-    if ((ULONGLONG)n != sz) { free(buf); return -1; }
-    pkapp_sha256(buf, n, out);
     free(buf);
+    if (err || total != sz) return -1;
+    pkapp_sha256_final(&c, out);
     return 0;
 }
 
-/* 受保护树递归枚举（rel 用 '/' 分隔 UTF-8——与清单同构；宿主侧平台相关半区） */
+/* 受保护树递归枚举（rel 用 '/' 分隔 UTF-8——与清单同构；宿主侧平台相关半区）。
+ * 枚举与哈希分离：枚举（快）先建全清单，哈希随后并行（重叠 Defender 逐文件扫描税） */
 struct IntegrityItem {
     std::string rel;
     std::wstring full;
+    ULONGLONG sz;
     uint8_t hash[32];
 };
 
@@ -1752,18 +1833,59 @@ static int integrity_collect(const std::wstring &dir, const std::wstring &rel_pr
             /* SKIP_FILES（构建侧 build_entries 同规则）：根级清单/记账件不入受保护面 */
             if (rel8 == "manifest" || rel8 == "runtime.version") continue;
             IntegrityItem it;
-            if (integrity_hash_file(full, sz, it.hash) != 0) {
-                _snprintf(err, cap - 1, "受保护树文件读取失败: %s", rel8.c_str());
-                err[cap - 1] = 0;
-                FindClose(find);
-                return -1;
-            }
             it.rel = rel8;
             it.full = full;
+            it.sz = sz;
             items.push_back(std::move(it));
         }
     } while (FindNextFileW(find, &fd));
     FindClose(find);
+    return 0;
+}
+
+/* 并行哈希驱动（fail-closed 语义与原串行版逐位等价：任一文件读取失败/大小不符
+ * /超巨件 → 整门失败，err 带首个失败文件）。线程数按核数封顶 8；少文件退化为
+ * 单线程避免铺床开销。 */
+static int integrity_hash_parallel(std::vector<IntegrityItem> &items,
+                                   char *err, size_t cap) {
+    std::atomic<size_t> next(0);
+    std::atomic<int> failed(0);
+    std::mutex e_mu;
+    std::string e_what;
+    unsigned hc = std::thread::hardware_concurrency();
+    int nthreads = hc ? (int)hc : 4;
+    if (nthreads > 8) nthreads = 8;
+    if (nthreads < 2 || items.size() < 64) nthreads = 1;
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = next.fetch_add(1);
+            if (failed.load(std::memory_order_relaxed) || i >= items.size()) break;
+            IntegrityItem &it = items[i];
+            if (integrity_hash_file(it.full, it.sz, it.hash) != 0) {
+                std::lock_guard<std::mutex> lk(e_mu);
+                if (failed.load() == 0) {
+                    failed.store(1);
+                    e_what = std::string("受保护树文件读取失败: ") + it.rel;
+                }
+                break;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nthreads; t++) pool.emplace_back(worker);
+    join_pool_with_pump(pool);
+
+    if (g_boot_quit) {
+        _snprintf(err, cap - 1, "启动期间窗口被用户关闭");
+        err[cap - 1] = 0;
+        return -1;
+    }
+    if (failed.load() != 0) {
+        _snprintf(err, cap - 1, "%s", e_what.c_str());
+        err[cap - 1] = 0;
+        return -1;
+    }
     return 0;
 }
 
@@ -1852,6 +1974,13 @@ static int integrity_gate(const spk_file *sf, int *purged_out, char *err, size_t
             _snprintf(err, cap - 1, "受保护树枚举失败");
             err[cap - 1] = 0;
             diag_write("integrity", err, det, FALSE);
+            goto done;
+        }
+        set_splash("正在校验完整性…");
+        if (integrity_hash_parallel(items, det, sizeof(det)) != 0) {
+            _snprintf(err, cap - 1, "%s", det);
+            err[cap - 1] = 0;
+            diag_write("integrity", err, "", FALSE);
             goto done;
         }
         if (items.empty()) {
@@ -1988,6 +2117,14 @@ static int run_shell(void) {
         return 2;
     }
 
+    /* 窗口先立（★P2 首启观感★）：验签/解压/完整性门全程可见 splash 进度，
+     * 不再出现 40s 无窗口裸等。WebView2 环境创建仍须在 boot_python 之后
+     * （pCreate 完成回调依赖 STA 消息泵，见下方原注释）——这里只是普通
+     * Win32 窗口 + 加载层，无 WebView2 依赖，提前安全。 */
+    ensure_window();
+    set_splash("正在准备运行环境…");
+    slog("window up (early)");
+
     /* 步骤 1+2：验签 → 指纹比对 / 全量解压 */
     if (file_exists(g_spk)) {
         const char *spk_err = NULL;
@@ -2116,12 +2253,13 @@ static int run_shell(void) {
             SetEnvironmentVariableW(L"MYAPP_TOKEN", utf8_to_wide(token).c_str());
     }
 
-    /* 窗口先立（温启动观感）。WebView2 环境创建必须在 boot_python 之后：
+    /* 窗口已提前立于验签前（★P2★，见步骤 0 后）；此处仅切换 splash 文案。
+     * WebView2 环境创建必须在 boot_python 之后：
      * pCreate 的完成回调只能由创建线程的 STA 消息泵派发，而 boot_python 阻塞
      * 主线程数秒不泵消息——实测浏览器进程等待 ~4s 后整树干净退出（152/154 运
      * 行时同），宿主留下僵尸代理：白屏 + 最小化 put_Bounds AV（0xC0000005）。
      * 因此环境创建紧贴 run_message_loop，回调在首拍 GetMessage 即送达。 */
-    ensure_window();
+    set_splash("正在启动应用…");
     slog("window up");
 
     /* 步骤 6/7/8：LoadLibrary → 记账 → 引导装载 → bootstrap → SaveThread */

@@ -42,34 +42,68 @@ static void block(uint32_t st[8], const uint8_t p[64]) {
     st[4] += e; st[5] += f; st[6] += g; st[7] += h;
 }
 
-void pkapp_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
-    uint32_t st[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-                      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
-    uint8_t tail[72]; /* 64 分组缓冲 + 补齐余量 */
-    size_t i, rem = len % 64;
-    const uint64_t bits = (uint64_t)len * 8;
+/* ---------- 流式接口（分块喂入；tail 逻辑与单发版等价） ---------- */
 
-    for (i = 0; i + 64 <= len; i += 64)
-        block(st, data + i);
+void pkapp_sha256_init(pkapp_sha256_ctx *c) {
+    c->st[0] = 0x6a09e667u; c->st[1] = 0xbb67ae85u; c->st[2] = 0x3c6ef372u;
+    c->st[3] = 0xa54ff53au; c->st[4] = 0x510e527fu; c->st[5] = 0x9b05688cu;
+    c->st[6] = 0x1f83d9abu; c->st[7] = 0x5be0cd19u;
+    c->tlen = 0;
+    c->bits = 0;
+}
 
-    memcpy(tail, data + i, rem);
-    tail[rem] = 0x80;
+void pkapp_sha256_update(pkapp_sha256_ctx *c, const uint8_t *data, size_t len) {
+    c->bits += (uint64_t)len * 8;
+    if (c->tlen) {
+        size_t take = 64 - c->tlen;
+        if (take > len) take = len;
+        memcpy(c->tail + c->tlen, data, take);
+        c->tlen += take;
+        data += take;
+        len -= take;
+        if (c->tlen == 64) {
+            block(c->st, c->tail);
+            c->tlen = 0;
+        }
+    }
+    while (len >= 64) {
+        block(c->st, data);
+        data += 64;
+        len -= 64;
+    }
+    if (len) {
+        memcpy(c->tail, data, len);
+        c->tlen = len;
+    }
+}
+
+void pkapp_sha256_final(pkapp_sha256_ctx *c, uint8_t out[32]) {
+    size_t rem = c->tlen;
+    uint64_t bits = c->bits;
+    int i;
+    c->tail[rem] = 0x80;
     rem++;
     if (rem > 56) {
-        memset(tail + rem, 0, 64 - rem);
-        block(st, tail);
-        memset(tail, 0, 64);
+        memset(c->tail + rem, 0, 64 - rem);
+        block(c->st, c->tail);
+        memset(c->tail, 0, 64);
     } else {
-        memset(tail + rem, 0, 56 - rem);
+        memset(c->tail + rem, 0, 56 - rem);
     }
     for (i = 0; i < 8; i++)
-        tail[63 - i] = (uint8_t)(bits >> (8 * i));
-    block(st, tail);
-
+        c->tail[63 - i] = (uint8_t)(bits >> (8 * i));
+    block(c->st, c->tail);
     for (i = 0; i < 8; i++) {
-        out[4 * i] = (uint8_t)(st[i] >> 24);
-        out[4 * i + 1] = (uint8_t)(st[i] >> 16);
-        out[4 * i + 2] = (uint8_t)(st[i] >> 8);
-        out[4 * i + 3] = (uint8_t)st[i];
+        out[4 * i] = (uint8_t)(c->st[i] >> 24);
+        out[4 * i + 1] = (uint8_t)(c->st[i] >> 16);
+        out[4 * i + 2] = (uint8_t)(c->st[i] >> 8);
+        out[4 * i + 3] = (uint8_t)c->st[i];
     }
+}
+
+void pkapp_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    pkapp_sha256_ctx c;
+    pkapp_sha256_init(&c);
+    pkapp_sha256_update(&c, data, len);
+    pkapp_sha256_final(&c, out);
 }
