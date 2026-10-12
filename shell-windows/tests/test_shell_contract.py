@@ -39,7 +39,7 @@ def run_shell(spk_path: Path) -> str:
 # ---------------------------------------------------------------- 造包工具
 def make_fields(**over) -> dict:
     fields = {
-        "format_version": "1",
+        "format_version": "2",   # ★P0 Q2★ 壳只认 format 2（integrity 侧车契约版本）
         "app_version": "1.2.3",
         "min_app_version": "1.0.0",
         "applocal_version": "0.1.0",
@@ -195,7 +195,8 @@ def test_missing_required_key_rejected(tmp_path):
 
 
 def test_unknown_format_version_rejected(tmp_path):
-    out, _, _ = build_spk(tmp_path, fields_over={"format_version": "2"})
+    """legacy format 1 无 _integrity 材料 → 双向拒绝（防"无校验降级路线"，Q2）。"""
+    out, _, _ = build_spk(tmp_path, fields_over={"format_version": "1"})
     text = run_shell(out)
     assert text.startswith("SPK-VERIFY-FAIL stage=format"), text
 
