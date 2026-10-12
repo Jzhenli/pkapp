@@ -78,8 +78,7 @@ static std::wstring g_class;           /* 窗口类名（与互斥键同名约�
 static std::wstring g_title;
 
 static HWND g_hwnd;
-static HWND g_splash;      /* 启动加载层（STATIC 子窗口，覆盖客户区） */
-static HFONT g_splash_font;
+static HWND g_splash;      /* 启动加载层（自绘 pkSplash 子窗口，覆盖客户区） */
 static volatile LONG g_boot_quit; /* 启动期泵到 WM_QUIT（用户关窗）→ 中止启动、错误 UI 免弹 */
 static ICoreWebView2Environment *g_env2;
 static ICoreWebView2Controller *g_ctl2;
@@ -631,11 +630,132 @@ static void webview_teardown(void) {
 /* 启动加载层文案。boot_python 阻塞主线程期间消息泵不可用（WM_PAINT 不派发），
  * SetWindowText 对同线程窗口同步执行 + UpdateWindow 强制立即重绘，保证阶段
  * 文案在阻塞期也能上屏。 */
-static void set_splash(const char *utf8) {
-    if (!g_splash) return;
-    SetWindowTextW(g_splash, utf8_to_wide(utf8).c_str());
-    UpdateWindow(g_splash);
+/* ---------- 启动加载层（自绘深色 splash：图标/标题/版本/阶段进度条） ---------- */
+
+static int dpi_scaled(int dip, UINT dpi); /* 定义在 ensure_window 前（GUI 布局工具） */
+
+static HFONT g_splash_title_font, g_splash_meta_font;
+static HICON g_app_icon;                /* ensure_window 提取的应用大图标（复用） */
+static HBRUSH g_bg_brush;               /* 深色底（splash/错误页/窗口类背景共用） */
+static wchar_t g_splash_stage[128] = L"正在启动，请稍候…";
+static wchar_t g_splash_ver[32];        /* 验签通过后补显 */
+static int g_splash_pct = 6;            /* 阶段确定性进度（单调不回退） */
+static int g_splash_marquee;            /* 高亮段偏移（timer 驱动） */
+
+static void splash_set_version(const char *utf8) {
+    if (!g_splash || !utf8 || !*utf8) return;
+    _snwprintf(g_splash_ver, 31, L"v%s", utf8_to_wide(utf8).c_str());
+    g_splash_ver[31] = 0;
+    InvalidateRect(g_splash, NULL, FALSE);
 }
+
+static void set_splash_stage(int pct, const char *utf8) {
+    if (!g_splash) return;
+    if (pct > g_splash_pct) g_splash_pct = pct;
+    if (utf8 && *utf8) {
+        _snwprintf(g_splash_stage, 127, L"%s", utf8_to_wide(utf8).c_str());
+        g_splash_stage[127] = 0;
+    }
+    InvalidateRect(g_splash, NULL, FALSE);
+    UpdateWindow(g_splash); /* 无泵阶段也同步出帧 */
+}
+
+static void set_splash(const char *utf8) { set_splash_stage(0, utf8); }
+
+/* splash 自绘（GDI 双缓冲）：深色底 + 居中列 [图标/标题/版本/进度条/阶段文案] */
+static LRESULT CALLBACK splash_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1; /* WM_PAINT 全幅自绘，免闪烁 */
+    case WM_TIMER:
+        if (wp == 1) {
+            g_splash_marquee += 7;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        UINT dpi = GetDpiForWindow(hwnd);
+        int W = rc.right, H = rc.bottom;
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, W, H);
+        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+        FillRect(mem, &rc, g_bg_brush);
+        SetBkMode(mem, TRANSPARENT);
+        int y = H / 2 - dpi_scaled(130, dpi); /* 居中列顶部 */
+        if (g_app_icon) {
+            /* 图标垫品牌蓝圆角底板：应用图标多为深色，直贴深色底会隐形
+             * （浅灰底板 #262C3A 实测仍与 #15181F 背景不可分） */
+            int plate = dpi_scaled(92, dpi), icon = dpi_scaled(56, dpi);
+            int px = W / 2 - plate / 2;
+            HBRUSH pb = CreateSolidBrush(RGB(0x2F, 0x6F, 0xED));
+            HBRUSH pob = (HBRUSH)SelectObject(mem, pb);
+            RoundRect(mem, px, y, px + plate, y + plate, dpi_scaled(24, dpi),
+                      dpi_scaled(24, dpi));
+            SelectObject(mem, pob);
+            DeleteObject(pb);
+            DrawIconEx(mem, W / 2 - icon / 2, y + (plate - icon) / 2, g_app_icon, icon,
+                       icon, 0, NULL, DI_NORMAL);
+            y += dpi_scaled(108, dpi); /* 图标占位：仅在真的画了图标时推进 */
+        }
+        HFONT of = (HFONT)SelectObject(mem, g_splash_title_font);
+        SetTextColor(mem, RGB(0xE8, 0xEA, 0xF0));
+        RECT rt = {0, y, W, y + dpi_scaled(40, dpi)};
+        DrawTextW(mem, g_title.c_str(), -1, &rt, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        y += dpi_scaled(40, dpi);
+        SelectObject(mem, g_splash_meta_font);
+        SetTextColor(mem, RGB(0x9A, 0xA3, 0xB2));
+        rt = {0, y, W, y + dpi_scaled(22, dpi)};
+        DrawTextW(mem, g_splash_ver[0] ? g_splash_ver : L" ", -1, &rt,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        y += dpi_scaled(34, dpi);
+        /* 进度条：确定性阶段推进 + 滑动高亮段（marquee 表达"仍在工作"） */
+        int tw = dpi_scaled(220, dpi), th = dpi_scaled(4, dpi);
+        int tx = W / 2 - tw / 2;
+        RECT track = {tx, y, tx + tw, y + th};
+        FillRect(mem, &track, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        {
+            HBRUSH dark = CreateSolidBrush(RGB(0x2A, 0x2F, 0x3B));
+            FillRect(mem, &track, dark);
+            DeleteObject(dark);
+        }
+        int fill = tw * g_splash_pct / 100;
+        if (fill > 0) {
+            RECT fr = {tx, y, tx + fill, y + th};
+            HBRUSH blue = CreateSolidBrush(RGB(0x3B, 0x82, 0xF6));
+            FillRect(mem, &fr, blue);
+            DeleteObject(blue);
+            int seg = dpi_scaled(28, dpi);
+            int span = tw + seg;
+            int mx = tx + (g_splash_marquee % span) - seg;
+            if (mx < tx + fill) { /* 高亮段只在已填充区间内滑动 */
+                RECT mr = {mx < tx ? tx : mx, y,
+                           mx + seg > tx + fill ? tx + fill : mx + seg, y + th};
+                if (mr.right > mr.left) {
+                    HBRUSH lite = CreateSolidBrush(RGB(0x7E, 0xAA, 0xFB));
+                    FillRect(mem, &mr, lite);
+                    DeleteObject(lite);
+                }
+            }
+        }
+        y += th + dpi_scaled(14, dpi);
+        rt = {0, y, W, y + dpi_scaled(24, dpi)};
+        DrawTextW(mem, g_splash_stage, -1, &rt, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(mem, of);
+        BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 
 class EnvHandler : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
 public:
@@ -977,7 +1097,8 @@ static void ensure_window(void) {
     wc.hInstance = GetModuleHandleW(NULL);
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = g_class.c_str();
-    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    g_bg_brush = CreateSolidBrush(RGB(0x15, 0x18, 0x1F)); /* 深色底贯穿 splash/错误页 */
+    wc.hbrBackground = g_bg_brush;
     /* 窗口/任务栏图标：从 exe 自身资源取首个图标组（rcedit --set-icon 写入后即
        生效，资源 ID 无关）；裸壳无图标资源时 hIcon 为 NULL，行为同旧版。 */
     HICON icon_big = NULL, icon_small = NULL;
@@ -986,22 +1107,49 @@ static void ensure_window(void) {
         ExtractIconExW(exe_path, 0, &icon_big, &icon_small, 1) > 0) {
         wc.hIcon = icon_big ? icon_big : icon_small;
         wc.hIconSm = icon_small ? icon_small : icon_big;
+        g_app_icon = icon_big; /* splash 居中展示（大尺寸更好看） */
     }
     RegisterClassExW(&wc);
+    {
+        /* splash 自绘子窗口类 */
+        WNDCLASSEXW sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.cbSize = sizeof(sc);
+        sc.lpfnWndProc = splash_proc;
+        sc.hInstance = wc.hInstance;
+        sc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        sc.lpszClassName = L"pkSplash";
+        RegisterClassExW(&sc);
+    }
     g_hwnd = CreateWindowExW(0, g_class.c_str(), g_title.c_str(), WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, dpi_scaled(1280, dpi),
                              dpi_scaled(800, dpi), NULL, NULL, wc.hInstance, NULL);
-    /* 启动加载层：白底居中文案，随启动阶段更新（set_splash）；
-     * 页面渲染完成（nav completed）后销毁。ShowWindow 前创建保证首帧即有。 */
-    g_splash_font = CreateFontW(-dpi_scaled(30, dpi), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
-                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                                L"Microsoft YaHei UI");
-    g_splash = CreateWindowExW(0, L"STATIC", L"正在启动，请稍候…",
-                               WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
+    /* 启动加载层：深色自绘（图标/标题/版本/阶段进度条），随启动阶段更新
+     * （set_splash_stage）；页面渲染完成（nav completed）后销毁。ShowWindow 前
+     * 创建保证首帧即有。33ms timer 驱动 marquee 高亮段——boot_python 阻塞期无泵
+     * 自动停帧，泵恢复后续播。 */
+    g_splash_title_font = CreateFontW(-dpi_scaled(27, dpi), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                      CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                      L"Microsoft YaHei UI");
+    g_splash_meta_font = CreateFontW(-dpi_scaled(16, dpi), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                     L"Microsoft YaHei UI");
+    g_splash = CreateWindowExW(0, L"pkSplash", L"",
+                               WS_CHILD | WS_VISIBLE,
                                0, 0, dpi_scaled(1280, dpi), dpi_scaled(800, dpi),
                                g_hwnd, NULL, wc.hInstance, NULL);
-    SendMessageW(g_splash, WM_SETFONT, (WPARAM)g_splash_font, TRUE);
+    {
+        /* 显式对齐客户区：主窗口的 WM_SIZE 发生在 splash 创建前（创建期 WM_SIZE
+           时 g_splash 还是 NULL），跨屏 DPI 变化后若错过后续 WM_SIZE，splash 会
+           停留在创建尺寸 → 自绘内容整体偏离可见中心（实测条带中心 802,587 vs
+           窗口中心 640,400）。这里以客户区实测值为准兜底一次。 */
+        RECT crc;
+        GetClientRect(g_hwnd, &crc);
+        SetWindowPos(g_splash, NULL, 0, 0, crc.right, crc.bottom, SWP_NOZORDER);
+    }
+    SetTimer(g_splash, 1, 33, NULL);
     ShowWindow(g_hwnd, SW_SHOW);
 }
 
@@ -1360,7 +1508,7 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
         return -1;
     }
     slog("Py_Initialize ok");
-    set_splash("正在初始化应用…");
+    set_splash_stage(97, "正在初始化应用…");
 
     /* ★P0★ write_bytecode=0 等效（BOOTSTRAP_INTEGRITY_PLAN Q8）：Py_Initialize 后、
        任何应用代码 import 前关闭 .pyc 落盘——防运行期对受保护树写入清单外 pyc
@@ -1465,13 +1613,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      sug->bottom - sug->top, SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
-    case WM_CTLCOLORSTATIC:
-        if ((HWND)lp == g_splash) { /* 加载层：白底灰字，与窗口背景无缝 */
-            SetBkMode((HDC)wp, TRANSPARENT);
-            SetTextColor((HDC)wp, RGB(0x55, 0x55, 0x55));
-            return (LRESULT)GetStockObject(WHITE_BRUSH);
-        }
-        break;
+    case WM_CTLCOLOREDIT:
+        /* 错误页只读 EDIT：深色底浅字（与 splash 同套视觉） */
+        SetBkColor((HDC)wp, RGB(0x15, 0x18, 0x1F));
+        SetTextColor((HDC)wp, RGB(0xC8, 0xCE, 0xD8));
+        return (LRESULT)g_bg_brush;
     case WM_TIMER:
         if (wp == IDT_TICK) on_tick();
         return 0;
@@ -1976,7 +2122,7 @@ static int integrity_gate(const spk_file *sf, int *purged_out, char *err, size_t
             diag_write("integrity", err, det, FALSE);
             goto done;
         }
-        set_splash("正在校验完整性…");
+        set_splash_stage(85, "正在校验完整性…");
         if (integrity_hash_parallel(items, det, sizeof(det)) != 0) {
             _snprintf(err, cap - 1, "%s", det);
             err[cap - 1] = 0;
@@ -2122,7 +2268,7 @@ static int run_shell(void) {
      * （pCreate 完成回调依赖 STA 消息泵，见下方原注释）——这里只是普通
      * Win32 窗口 + 加载层，无 WebView2 依赖，提前安全。 */
     ensure_window();
-    set_splash("正在准备运行环境…");
+    set_splash_stage(20, "正在准备运行环境…");
     slog("window up (early)");
 
     /* 步骤 1+2：验签 → 指纹比对 / 全量解压 */
@@ -2160,6 +2306,7 @@ static int run_shell(void) {
             return 2;
         }
         /* 版本单调性：包内约束 + 双防线（floor）+ 本地记账 */
+        splash_set_version(doc.app_version); /* 验签即显：解压阶段可见版本号 */
         if (manifest_version_cmp(doc.app_version, doc.min_app_version) < 0) {
             diag_write("verify", "包内 app_version < min_app_version", doc.app_version, FALSE);
             show_error_ui_at_startup("应用版本低于最低要求（防回滚拦截）。", FALSE);
@@ -2184,6 +2331,7 @@ static int run_shell(void) {
                 /* 步骤 2：指纹不命中 → 全量解压（staging → 原子让位） */
                 std::wstring staging = stage_dir_with(L"new");
                 if (dir_exists(staging)) rm_tree(staging);
+                set_splash_stage(30, "正在解压运行时…");
                 if (extract_all(&sf, staging, err, sizeof(err)) != 0 ||
                     promote_staging(staging, err, sizeof(err)) != 0) {
                     diag_write("extract", err, "", TRUE);
@@ -2195,6 +2343,7 @@ static int run_shell(void) {
             }
         }
         doc_valid = TRUE;
+        splash_set_version(doc.app_version); /* 解压/完整性门期间即可显版本 */
         /* 步骤 2.5：引导面完整性门（P0 红线：第一条应用代码 import 之前 fail-closed。
            sf 仍在手——侧车缺失/损坏可从已验签 spk 自愈，Q7） */
         if (integrity_gate(&sf, &purge_count, err, sizeof(err)) != 0) {
@@ -2212,6 +2361,7 @@ static int run_shell(void) {
             return 2;
         }
         doc_valid = TRUE;
+        splash_set_version(doc.app_version);
         /* 步骤 2.5：完整性门（无 spk——侧车必须已在位，无自愈来源） */
         if (integrity_gate(NULL, &purge_count, err, sizeof(err)) != 0) {
             show_error_ui_at_startup(err, FALSE);
@@ -2219,6 +2369,7 @@ static int run_shell(void) {
         }
     }
 
+    splash_set_version(doc.app_version); /* manifest 就绪 → splash 尽早显版本号 */
     /* 步骤 3：预清理旧 ready 与旧握手码（避免存活假象 / 陈旧码） */
     DeleteFileW(g_ready.c_str());
     DeleteFileW(g_handshake.c_str());
