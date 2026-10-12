@@ -716,7 +716,6 @@ static LRESULT CALLBACK splash_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int tw = dpi_scaled(220, dpi), th = dpi_scaled(4, dpi);
         int tx = W / 2 - tw / 2;
         RECT track = {tx, y, tx + tw, y + th};
-        FillRect(mem, &track, (HBRUSH)GetStockObject(BLACK_BRUSH));
         {
             HBRUSH dark = CreateSolidBrush(RGB(0x2A, 0x2F, 0x3B));
             FillRect(mem, &track, dark);
@@ -923,6 +922,7 @@ public:
                 g_splash = NULL;
             }
         } else {
+            if (g_splash) KillTimer(g_splash, 1); /* 失败：停 marquee（失败≠仍在工作） */
             set_splash("页面加载失败，请查看诊断日志。");
         }
         return S_OK;
@@ -1614,10 +1614,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CTLCOLOREDIT:
-        /* 错误页只读 EDIT：深色底浅字（与 splash 同套视觉） */
-        SetBkColor((HDC)wp, RGB(0x15, 0x18, 0x1F));
-        SetTextColor((HDC)wp, RGB(0xC8, 0xCE, 0xD8));
-        return (LRESULT)g_bg_brush;
+        /* 错误页只读 EDIT（IDC_ERRTEXT）：深色底浅字（与 splash 同套视觉）；
+           按控件 ID 过滤，避免未来新增 EDIT 子控件被误染 */
+        if (GetDlgCtrlID((HWND)lp) == IDC_ERRTEXT) {
+            SetBkColor((HDC)wp, RGB(0x15, 0x18, 0x1F));
+            SetTextColor((HDC)wp, RGB(0xC8, 0xCE, 0xD8));
+            return (LRESULT)g_bg_brush;
+        }
+        break;
     case WM_TIMER:
         if (wp == IDT_TICK) on_tick();
         return 0;
