@@ -552,12 +552,18 @@ PKKEY_API int pk_x1(
          * "同 K + 同 module_id + 内容变更"的跨构建场景会重用 (K,nonce)（GCM 危险：
          * C1⊕C2=P1⊕P2）；掺 SHA256(payload)[:16] 后同模块不同内容 nonce 不同，
          * G5 不变（同内容→同 nonce）。解密端读 blob 头 nonce 不重算，零格式影响。 */
-        uint8_t ph[32], msg[PKKEY_MID_MAX + 16];
+        uint8_t ph[32], mac[32], msg[PKKEY_MID_MAX + 16];
         sha256(in, (size_t)in_len, ph);
         memcpy(msg, module_id, mid_len);
         memcpy(msg + mid_len, ph, 16);
-        hmac_sha256(key32, 32, msg, mid_len + 16, nonce);
+        /* 2026-10-20 修复：HMAC 全量 32 字节先落 mac[32]，再取前 12 字节进 nonce。
+         * 旧写法直接传 nonce[12] 导致 sha256_final 越界写 20 字节（gcc -O2
+         * -Wstringop-overflow 捕获；MSVC /W4 未报，windows dll 同样潜伏）。
+         * nonce 前 12 字节值不变，blob 兼容/G5 可复现不受影响。 */
+        hmac_sha256(key32, 32, msg, mid_len + 16, mac);
+        memcpy(nonce, mac, 12);
         pkkey_secure_zero(ph, sizeof ph);
+        pkkey_secure_zero(mac, sizeof mac);
     }
     memcpy(out, PKKEY_MAGIC, 4);
     out[4] = PKKEY_VER;
