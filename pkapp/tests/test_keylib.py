@@ -20,7 +20,8 @@ import types
 
 import pytest
 
-from pkapp.packager import assemble, keylib
+from pkapp.packager import encrypt, keylib, pyc
+from pkapp.packager.errors import BuildError
 from pkapp.packager.keylib import KeyLib, KeyLibError
 
 _DLL = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -385,7 +386,7 @@ def _make_stage_app(tmp_path):
 def test_encrypt_app_tree_stage_contract(lib, tmp_path, monkeypatch):
     """§6.1 + ★档位1★ 全契约：master→K_app 现场派生 → blob 落盘 ≡ 参照实现 →
     索引 → 删明文 → 资源保留；件 key_id ≡ derive 镜像；K 不持久化。"""
-    from pkapp.packager.assemble import _encrypt_app_tree
+    from pkapp.packager.encrypt import _encrypt_app_tree
 
     app = tmp_path / "app"
     _make_stage_app(tmp_path)
@@ -443,17 +444,15 @@ def _walk_all(root):
 def test_encrypt_app_tree_keylib_unavailable(tmp_path, monkeypatch):
     """构建期判定（§8）：keylib 件产出不可得（编译失败 × 预制件缺失）→ 构建
     报错，不做静默降级。"""
-    from pkapp.packager import assemble
-
     _make_stage_app(tmp_path)
     _set_master(monkeypatch)
 
     def boom(*_a, **_k):
         raise KeyLibError("key-holder 件缺失")
 
-    monkeypatch.setattr(assemble, "produce_keylib", boom)
-    with pytest.raises(assemble.BuildError, match="key-holder"):
-        assemble._encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, _APP)
+    monkeypatch.setattr(encrypt, "produce_keylib", boom)
+    with pytest.raises(BuildError, match="key-holder"):
+        encrypt._encrypt_app_tree(str(tmp_path), None, _RUNTIME_DLL, _APP)
 
 
 def test_appspec_code_encryption_flag(tmp_path):
@@ -749,7 +748,7 @@ def _encrypted_deploy(base, tmp_path, monkeypatch, master: bytes) -> str:
     内嵌件路径（运行期形态）。app_id 恒 _APP——与构建侧同源派生。"""
     _make_stage_app(base / "runtime")                    # app/ 树 → <runtime>/app
     monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())  # 构建侧 master 注入
-    from pkapp.packager.assemble import _encrypt_app_tree
+    from pkapp.packager.encrypt import _encrypt_app_tree
     _encrypt_app_tree(str(base / "runtime"), None, _RUNTIME_DLL, _APP)
     k_app = keylib.derive_k_app(master, _APP)
     (tmp_path / "patchwork").mkdir(exist_ok=True)
@@ -957,11 +956,11 @@ def test_mid_not_in_dll_strings():
 
 def test_dll_version_pair():
     """dll 名版本抽取：双平台命名 + basename 纪律（路径目录数字不污染）+ 异形态。"""
-    assert assemble._dll_version_pair("python312.dll") == (3, 12)
-    assert assemble._dll_version_pair("libpython3.12.so") == (3, 12)
-    assert assemble._dll_version_pair(os.path.join("D:", "rt", "3.13",
+    assert pyc._dll_version_pair("python312.dll") == (3, 12)
+    assert pyc._dll_version_pair("libpython3.12.so") == (3, 12)
+    assert pyc._dll_version_pair(os.path.join("D:", "rt", "3.13",
                                                    "python312.dll")) == (3, 12)
-    assert assemble._dll_version_pair("python.dll") == (0, 0)   # 无版本数字
+    assert pyc._dll_version_pair("python.dll") == (0, 0)   # 无版本数字
 
 
 def test_compile_one_pyc_fallback_version_guard(tmp_path):
@@ -970,11 +969,11 @@ def test_compile_one_pyc_fallback_version_guard(tmp_path):
     src = tmp_path / "m.py"
     src.write_text("X = 1\n", encoding="utf-8")
     bad = f"python{sys.version_info[0]}{sys.version_info[1] + 1}.dll"
-    with pytest.raises(assemble.BuildError, match="版本不符"):
-        assemble._compile_one_pyc(None, bad, str(src),
+    with pytest.raises(BuildError, match="版本不符"):
+        pyc._compile_one_pyc(None, bad, str(src),
                                   str(tmp_path / "m.pyc"), "m.py")
     ok = f"python{sys.version_info[0]}{sys.version_info[1]}.dll"
-    assemble._compile_one_pyc(None, ok, str(src),
+    pyc._compile_one_pyc(None, ok, str(src),
                               str(tmp_path / "m.pyc"), "m.py")
     assert isinstance(marshal.loads((tmp_path / "m.pyc").read_bytes()[16:]),
                       types.CodeType)
@@ -983,9 +982,9 @@ def test_compile_one_pyc_fallback_version_guard(tmp_path):
 def test_ensure_same_runtime_version():
     """防线 A：Windows 代编 Android pyc 的两端版本互等（比较粒度 minor——
     marshal 兼容粒度；patchlevel 差异放行）。"""
-    assemble._ensure_same_runtime_version("3.12.14", "3.12.7")   # minor 同 → 放行
-    with pytest.raises(assemble.BuildError, match="minor 版本一致"):
-        assemble._ensure_same_runtime_version("3.12.14", "3.13.1")
+    encrypt._ensure_same_runtime_version("3.12.14", "3.12.7")   # minor 同 → 放行
+    with pytest.raises(BuildError, match="minor 版本一致"):
+        encrypt._ensure_same_runtime_version("3.12.14", "3.13.1")
 
 
 # ------------------------------------------------- ★档位1 补充防线★（keybuild / 隔离对拍 / app_hash）
@@ -1118,7 +1117,7 @@ def test_cross_app_isolation(tmp_path):
 def test_app_hash_plaintext_contract(tmp_path):
     """§3.2 app_hash 新语义契约（加密前明文摘要）：确定性（G5）+ 重编译稳定 +
     源码变化敏感 + 资源原文变化敏感 + 缺 pyc fail-fast。"""
-    from pkapp.packager.assemble import _app_hash_plaintext
+    from pkapp.packager.pyc import _app_hash_plaintext
 
     app = tmp_path / "app"
     _make_stage_app(tmp_path)
@@ -1136,14 +1135,14 @@ def test_app_hash_plaintext_contract(tmp_path):
     (app / "data.bin").write_bytes(b"\x00\x01CHANGED")  # 非 .py 资源原文进摘要
     assert _app_hash_plaintext(str(app), tag) != h2
     (app / "__pycache__" / f"__init__.{tag}.pyc").unlink()
-    with pytest.raises(assemble.BuildError, match="app_hash 缺 pyc"):
+    with pytest.raises(BuildError, match="app_hash 缺 pyc"):
         _app_hash_plaintext(str(app), tag)
 
 
 def test_app_hash_plaintext_master_independent(tmp_path, monkeypatch):
     """app_hash 与 K_master 零耦合：无 master 环境照常工作且不触发 keygen
     （摘要在加密步骤之前算，派生链不参与——master 文件 0 落盘）。"""
-    from pkapp.packager.assemble import _app_hash_plaintext
+    from pkapp.packager.pyc import _app_hash_plaintext
 
     monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)
     _make_stage_app(tmp_path)

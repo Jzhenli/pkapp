@@ -11,6 +11,8 @@ from ..packager import assemble
 from ..packager import golden as golden_mod
 from ..packager import manifest as mf
 from ..packager import sign
+from ..packager.errors import BuildError
+from ..packager.deps import _wheels_cache
 from ..packager.runtime import RuntimeResolveError
 from ..util import atomic_write, sha256_file
 
@@ -23,17 +25,17 @@ def _seed_vendored_wheel(platform: str, abis: tuple[str, ...] = ()) -> None:
     """包内置 applocal wheel 播种托管缓存（wheel 安装形态的零配置入口）。
 
     applocal 不在 PyPI——托管缓存 allow_download 在线补齐永远装不到它，
-    "先入缓存"是唯一入口（assemble._uncached_deps 剔除语义）。缓存已有
+    "先入缓存"是唯一入口（deps._uncached_deps 剔除语义）。缓存已有
     applocal 则不覆盖（平台内多版本共存无害，pip 按需求挑）。android 缓存按
-    abi 分层（assemble._wheels_cache），各 abi 目录都要播种到。
+    abi 分层（deps._wheels_cache），各 abi 目录都要播种到。
     """
     from ..vendor import wheels_dir as vendored_wheels
     src = vendored_wheels()
     if not src:
         return
-    caches = ([assemble._wheels_cache(platform, abi) for abi in abis]
+    caches = ([_wheels_cache(platform, abi) for abi in abis]
               if platform == "android"
-              else [assemble._wheels_cache(platform)])
+              else [_wheels_cache(platform)])
     if platform == "android" and not abis:
         return   # 无 ABI 可播（abis=[] 畸形 spec 随后必被单 ABI 检查拒），避免播种到永不被读的顶层
     for cache in caches:
@@ -102,7 +104,7 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
     except RuntimeResolveError as e:
         print(f"[build] 失败: {e}")
         return 1
-    except (assemble.BuildError, sign.SignError) as e:
+    except (BuildError, sign.SignError) as e:
         print(f"[build] 失败: {e}")
         return 1
 
@@ -140,8 +142,6 @@ def _verify_stage_assertions(project_dir: str, spec, platform: str,
     """对 spk 复验 B.z①–⑥（读回 stage 形态：从 spk 解包到临时目录后走 golden.assert_bz）。"""
     import tempfile
     import zipfile
-
-    from ..packager import spk as spk_mod
 
     with tempfile.TemporaryDirectory(prefix="pkapp-bz-") as tmp:
         stage = os.path.join(tmp, "_runtime")

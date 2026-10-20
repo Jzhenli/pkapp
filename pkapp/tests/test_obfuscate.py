@@ -936,7 +936,7 @@ def test_escape_call_form_still_renamed():                  # OB-1③
 def test_obf_compile_bom_and_declared_encoding(tmp_path):   # OB-2
     """★OB-2★ obf 编译分支解码与 py_compile 同语义（tokenize.detect_encoding）：
     带 BOM / 声明 gbk 的源码经回退路径全链编译不炸（硬 utf-8 会当乱码炸掉）。"""
-    from pkapp.packager.assemble import _compile_checked_hash
+    from pkapp.packager.pyc import _compile_checked_hash
 
     root = tmp_path / "app"
     root.mkdir()

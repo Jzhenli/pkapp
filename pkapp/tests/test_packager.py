@@ -9,9 +9,13 @@ import pytest
 from pkapp.appspec import SpecError, load
 from pkapp.commands.create import cmd_create
 from pkapp.packager import assemble
+from pkapp.packager import consolidate as consolidate_mod
+from pkapp.packager import deps as deps_mod
 from pkapp.packager import golden as golden_mod
 from pkapp.packager import manifest as mf
+from pkapp.packager import pyc as pyc_mod
 from pkapp.packager import sign, spk
+from pkapp.packager.errors import BuildError
 from pkapp.packager.runtime import dll_stem
 
 
@@ -58,7 +62,7 @@ def test_managed_wheels_cache(project, wheels_dir, tmp_path, mock_runtime):
     <PKAPP_CACHE>/wheels/<platform> 并离线命中；二跑 G1 字节级一致。"""
     import shutil
 
-    cache = assemble._wheels_cache("windows")
+    cache = deps_mod._wheels_cache("windows")
     assert cache.startswith(os.environ["PKAPP_CACHE"])   # 全局托管根内，不入项目 build/
     os.makedirs(cache)
     for fn in os.listdir(wheels_dir):                    # 预置热缓存（fixture 同源）
@@ -77,7 +81,7 @@ def test_uncached_deps_version_aware(tmp_path):
     os.makedirs(wd)
     for fn in ("fastapi-0.110.0-py3-none-any.whl", "uvicorn-0.30.0-py3-none-any.whl"):
         open(os.path.join(wd, fn), "wb").close()
-    uncached = assemble._uncached_deps
+    uncached = deps_mod._uncached_deps
     # 精确 pin：版本不命中 → 补齐；版本命中 → 剔除
     assert uncached(["fastapi==0.115.0"], wd) == ["fastapi==0.115.0"]
     assert uncached(["fastapi==0.110.0"], wd) == []
@@ -121,7 +125,7 @@ def test_tamper_detected(project, wheels_dir, tmp_path):  # G4 负向
 def test_closure_negative(project, wheels_dir, tmp_path, mock_runtime):   # G7 负向
     # 摘掉 libcrypto → _ssl.pyd 闭包不完整 → 构建失败
     os.remove(os.path.join(mock_runtime, "DLLs", "libcrypto-3-x64.dll"))
-    with pytest.raises(assemble.BuildError, match="闭包不完整"):
+    with pytest.raises(BuildError, match="闭包不完整"):
         _build(project, wheels_dir, str(tmp_path / "x.spk"))
 
 
@@ -220,10 +224,10 @@ def test_zip_lib_pure_pyc(tmp_path):
     (lib / "pkg" / "__pycache__" / "__init__.cpython-312.pyc").write_bytes(b"fake")
     (lib / "lone.py").write_text("Y = 2\n", encoding="utf-8")   # 无 pyc → 兜底
     out = str(tmp_path / "lib.zip")
-    assemble._zip_lib(str(lib), out, pyc_tag="cpython-312")
+    pyc_mod._zip_lib(str(lib), out, pyc_tag="cpython-312")
     assert set(zipfile.ZipFile(out).namelist()) == {"pkg/__init__.pyc", "lone.py"}
     out2 = str(tmp_path / "lib2.zip")
-    assemble._zip_lib(str(lib), out2)
+    pyc_mod._zip_lib(str(lib), out2)
     assert set(zipfile.ZipFile(out2).namelist()) == {"pkg/__init__.py", "lone.py"}
 
 
@@ -512,7 +516,7 @@ def test_compile_flat_tree_obfuscated(tmp_path):   # ★applocal 出货混淆★
 
     root = str(tmp_path / "alx")
     _fabricate(root)
-    st = assemble._compile_flat_tree(root, None, None, obfuscate=True)
+    st = pyc_mod._compile_flat_tree(root, None, None, obfuscate=True)
     assert st["renamed"] >= 1 and st["stripped"] >= 1
     assert not os.path.exists(os.path.join(root, "applocal", "__init__.py"))
     with open(os.path.join(root, "applocal", "__init__.pyc"), "rb") as f:
@@ -530,7 +534,7 @@ def test_compile_flat_tree_obfuscated(tmp_path):   # ★applocal 出货混淆★
     # G5：同源双跑 pyc 字节级一致
     root2 = str(tmp_path / "alx2")
     _fabricate(root2)
-    assemble._compile_flat_tree(root2, None, None, obfuscate=True)
+    pyc_mod._compile_flat_tree(root2, None, None, obfuscate=True)
     with open(os.path.join(root2, "applocal", "__init__.pyc"), "rb") as f:
         assert f.read() == raw, "G5: flat 树混淆双跑不一致"
 
@@ -859,6 +863,6 @@ def test_consolidate_top_level_same_stem_clash_fails_fast(tmp_path):
     sp.mkdir()
     (sp / "x.py").write_text("# shadow source", encoding="utf-8")
     (sp / "x.cp312-win_amd64.pyd").write_bytes(b"MZ\x90\x00\x03")
-    with pytest.raises(assemble.BuildError, match="顶层同名冲突"):
-        assemble._consolidate_site_packages(
+    with pytest.raises(BuildError, match="顶层同名冲突"):
+        consolidate_mod._consolidate_site_packages(
             str(tmp_path / "stage"), str(sp), "", "", "py")

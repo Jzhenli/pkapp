@@ -13,7 +13,7 @@ import json
 import os
 import sys
 
-from ..packager.assemble import _is_system_dll as _is_system_dll_check
+from ..packager.closure import _is_system_dll as _is_system_dll_check
 from ..packager.pe import PEError, read_imports
 from ..packager.runtime import _detect_windows_dll
 

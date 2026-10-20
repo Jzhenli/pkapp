@@ -112,7 +112,7 @@ def test_seed_vendored_wheel(tmp_path, pkapp_cache, monkeypatch):
     """内置 wheel 播种托管缓存：首次拷入、重复幂等（已有同名包不覆盖）。"""
     from pkapp import vendor
     from pkapp.commands.build import _seed_vendored_wheel
-    from pkapp.packager.assemble import _wheels_cache
+    from pkapp.packager.deps import _wheels_cache
     from pkapp.tools.mockkit import make_wheel
 
     src = tmp_path / "vw"
