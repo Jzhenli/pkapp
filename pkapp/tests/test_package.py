@@ -213,11 +213,12 @@ def test_package_android_encrypted_stages_keylib_so(tmp_path, monkeypatch,
                                                     mock_android_runtime,
                                                     android_keylib_so):
     """加密 android 包全链（§5.5）：spk manifest 带 code_key_id → _stage_keylib
-    补丁 .so（android 件 key_id 走 Python 镜像比对）→ build_apk 拷入壳物化目录
-    jniLibs/<abi>/lib_pkapp_key.so（gradle mock，APK 组装链不受影响）。"""
+    现场编译落位 .so（android 件 key_id 走 Python 镜像比对；无预制件退化，H4）
+    → build_apk 拷入壳物化目录 jniLibs/<abi>/lib_pkapp_key.so（gradle mock，
+    APK 组装链不受影响）。"""
     from pkapp.packager import keylib
 
-    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 补丁路径走文件落位
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)    # 非模式 B：编译路径走文件落位
     master = hashlib.sha256(b"pkg-and").digest()         # ★档位1★ K 现场派生（不入项目）
     monkeypatch.setenv("PKAPP_MASTER_KEY", master.hex())
     key = keylib.derive_k_app(master, "myapp")           # app_id 与项目名同源
@@ -240,8 +241,8 @@ def test_package_android_encrypted_stages_keylib_so(tmp_path, monkeypatch,
     assert os.path.join("jniLibs", "arm64-v8a") in jni_so   # 单 ABI 与 spk 一致
     with open(jni_so, "rb") as f:
         data = f.read()
-    assert keylib.ANCHOR not in data                        # 补丁态（非通用件原样）
-    assert bytes(a ^ b for a, b in zip(key, keylib._MASK)) in data
+    assert keylib.ANCHOR not in data                        # compiled 件无锚点常量
+    assert key in data                                      # K 编译期烧入（fixture 模拟）
     # 交付物 APK 内 spk 原样在 assets（加密包不走壳验签，APK 签名承担完整性）
     apk_path = os.path.join(proj, "release", "myapp-0.1.0-android-arm64_v8a.apk")
     with zipfile.ZipFile(apk_path) as zf:

@@ -1,0 +1,194 @@
+"""scripts/vendor.py 收录矩阵 / --require 闸门 / android 预编译移除回归（★H4 fail-fast 2026-10★）。
+
+vendor.py 是仓库脚本（不在包内）——importlib 按路径加载，run(root=…) 注入假仓库树，
+applocal wheel 构建步骤 monkeypatch 掉（pip wheel 不在被测面）。
+
+被锁住的行为：
+- 收录矩阵逐条目 OK/SKIP+原因输出（消灭静默跳过）；
+- 硬闸门条目（shell-windows/keylib-windows/applocal-wheel）缺件直接非零退出；
+- --require 命中 SKIP 条目 → rc=2 并列缺口；未知条目 → rc=2；
+- android keylib 预编译件永不收录（单槽 so ABI 错配风险已移除）；
+- locate_dll("android") 仅认 PKAPP_KEYLIB env（keybuild 侧无退化路径配套）。
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import shutil
+
+import pytest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VENDOR_SCRIPT = os.path.join(os.path.dirname(_HERE), "scripts", "vendor.py")
+
+
+@pytest.fixture
+def vendor_mod():
+    spec = importlib.util.spec_from_file_location("pkapp_vendor_script",
+                                                  _VENDOR_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def fake_repo(tmp_path):
+    """假仓库树：五条目收录原料齐备。keylib/build 额外放 lib_pkapp_key.so
+    （android 预编译件——收录时必须被无视，回归锚）。"""
+    root = tmp_path / "repo"
+    sw = root / "shell-windows" / "build"
+    sw.mkdir(parents=True)
+    (sw / "MyApp.exe").write_bytes(b"MZ-fake-shell")
+    (sw / "WebView2Loader.dll").write_bytes(b"fake-loader-dll")
+    kb = root / "keylib" / "build"
+    kb.mkdir(parents=True)
+    (kb / "pkapp_key.dll").write_bytes(b"fake-key-holder-dll")
+    (kb / "lib_pkapp_key.so").write_bytes(b"android-single-slot-so")
+    ks = root / "keylib" / "src"
+    ks.mkdir(parents=True)
+    (ks / "key.c").write_text("/* fake key.c */", encoding="utf-8")
+    (ks / "key.h").write_text("/* fake key.h */", encoding="utf-8")
+    sa = root / "shell-android" / "shell" / "app" / "src" / "main"
+    sa.mkdir(parents=True)
+    (sa / "AndroidManifest.xml").write_text("<manifest/>", encoding="utf-8")
+    (root / "applocal").mkdir()
+    return str(root)
+
+
+@pytest.fixture
+def fake_wheel(monkeypatch):
+    """pip wheel 步骤替换：vroot/wheels 落一个假 wheel（保持矩阵 OK 语义）。"""
+    def _install(mod):
+        def _fake_build(vroot, root):
+            wd = os.path.join(vroot, "wheels")
+            os.makedirs(wd, exist_ok=True)
+            with open(os.path.join(wd, "applocal-0.0.0-py3-none-any.whl"), "wb") as f:
+                f.write(b"fake-wheel")
+            return "OK", "_vendor/wheels（1 wheel）"
+
+        monkeypatch.setattr(mod, "_build_applocal_wheel", _fake_build)
+    return _install
+
+
+def test_full_matrix_ok(vendor_mod, fake_repo, fake_wheel, capsys):
+    """五条目全齐 → rc=0，矩阵逐行 OK，产物落位正确。"""
+    fake_wheel(vendor_mod)
+    rc = vendor_mod.run(["--require",
+                         "shell-windows,keylib-windows,keylib-src,shell-android,"
+                         "applocal-wheel"], root=fake_repo)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.count("[vendor] OK:") == 5
+    vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor")
+    assert os.path.isfile(os.path.join(vroot, "shell", "MyApp.exe"))
+    assert os.path.isfile(os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"))
+    assert os.path.isfile(os.path.join(vroot, "keylib", "src", "key.c"))
+    assert os.path.isfile(os.path.join(vroot, "shell-android", "app",
+                                       "src", "main", "AndroidManifest.xml"))
+    assert os.path.isfile(os.path.join(vroot, "wheels",
+                                       "applocal-0.0.0-py3-none-any.whl"))
+
+
+def test_android_prebuilt_never_vendored(vendor_mod, fake_repo, fake_wheel):
+    """★H4 回归锚★：keylib/build/lib_pkapp_key.so 存在也不收录——
+    _vendor/keylib/android 必须不存在（单槽 so 无 ABI 语义，锚点补丁会把
+    错 ABI 件打进 APK）。"""
+    fake_wheel(vendor_mod)
+    assert vendor_mod.run([], root=fake_repo) == 0
+    vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor", "keylib")
+    assert not os.path.isdir(os.path.join(vroot, "android"))
+    assert sorted(os.listdir(vroot)) == ["src", "windows"]
+
+
+def test_optional_skip_without_require(vendor_mod, fake_repo, fake_wheel, capsys):
+    """可选条目（keylib-src）缺件：无 --require 时 rc=0，矩阵记 SKIP+原因。"""
+    fake_wheel(vendor_mod)
+    os.remove(os.path.join(fake_repo, "keylib", "src", "key.c"))
+    assert vendor_mod.run([], root=fake_repo) == 0
+    out = capsys.readouterr().out
+    assert "[vendor] SKIP: keylib-src" in out
+
+
+def test_require_gap_fails(vendor_mod, fake_repo, fake_wheel, capsys):
+    """--require 命中 SKIP 条目 → rc=2 + 缺口清单（消灭静默的最后防线）。"""
+    fake_wheel(vendor_mod)
+    os.remove(os.path.join(fake_repo, "keylib", "src", "key.c"))
+    assert vendor_mod.run(["--require", "keylib-src"], root=fake_repo) == 2
+    out = capsys.readouterr().out
+    assert "[vendor] --require 缺件" in out
+    assert "keylib-src" in out
+
+
+def test_require_unknown_entry_rejected(vendor_mod, fake_repo, fake_wheel, capsys):
+    """--require 未知条目 → rc=2（闸门参数本身先过校验，防拼错静默放行）。"""
+    assert vendor_mod.run(["--require", "keylib-android"], root=fake_repo) == 2
+    out = capsys.readouterr().out
+    assert "未知条目" in out
+
+
+def test_hard_gate_missing_shell(vendor_mod, fake_repo, fake_wheel, capsys):
+    """硬闸门条目缺件（MyApp.exe）→ 无 --require 也 rc=2（最小完整面前置）。"""
+    fake_wheel(vendor_mod)                            # 防 pip 子进程真跑（闸门测试不测 wheel）
+    os.remove(os.path.join(fake_repo, "shell-windows", "build", "MyApp.exe"))
+    assert vendor_mod.run([], root=fake_repo) == 2
+    out = capsys.readouterr().out
+    assert "[vendor] SKIP: shell-windows" in out
+
+
+def test_skip_clears_stale_artifacts(vendor_mod, fake_repo, fake_wheel, capsys):
+    """★review 修复回归★：SKIP 条目必须清掉旧 _vendor 产物——上次收录成功、
+    本次源缺失时，滞留旧件会照常进 wheel（静默陈旧），矩阵不可只是展示层。"""
+    fake_wheel(vendor_mod)
+    vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor")
+    # 预放"上一次收录"的旧产物
+    stale = {
+        os.path.join(vroot, "shell", "MyApp.exe"),
+        os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"),
+        os.path.join(vroot, "keylib", "src", "key.c"),
+        os.path.join(vroot, "shell-android", "app", "AndroidManifest.xml"),
+    }
+    for p in stale:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"stale")
+    # 源全部缺失（shell-windows / keylib-windows / keylib-src / shell-android）
+    os.remove(os.path.join(fake_repo, "shell-windows", "build", "MyApp.exe"))
+    os.remove(os.path.join(fake_repo, "keylib", "build", "pkapp_key.dll"))
+    os.remove(os.path.join(fake_repo, "keylib", "src", "key.c"))
+    shutil.rmtree(os.path.join(fake_repo, "shell-android", "shell"))
+    rc = vendor_mod.run([], root=fake_repo)
+    assert rc == 2                                    # shell-windows 硬闸门拦截
+    for p in stale:
+        assert not os.path.exists(p), f"旧产物滞留: {p}"
+
+
+def test_applocal_wheel_clears_stale_wheels(vendor_mod, fake_repo, monkeypatch):
+    """★review 修复回归★：_build_applocal_wheel 必须先清 _vendor/wheels——
+    applocal 版本 bump 后旧 wheel 滞留会打进 pkapp wheel（旧版 main() 有此清理，
+    矩阵化重构时曾遗漏）。pip 步骤 monkeypatch 掉，专测清理行为。"""
+    wheels_dir = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor", "wheels")
+    os.makedirs(wheels_dir, exist_ok=True)
+    with open(os.path.join(wheels_dir, "applocal-0.0.9-py3-none-any.whl"), "wb") as f:
+        f.write(b"stale-wheel")
+
+    class _R:                                        # pip 假跑：成功、不产 wheel
+        returncode = 0
+
+    monkeypatch.setattr(vendor_mod.subprocess, "run", lambda *_a, **_k: _R())
+    status, detail = vendor_mod._build_applocal_wheel(
+        os.path.join(fake_repo, "pkapp", "pkapp", "_vendor"), fake_repo)
+    assert status == "OK" and "0 wheel" in detail
+    assert not os.path.isfile(os.path.join(wheels_dir,
+                                           "applocal-0.0.9-py3-none-any.whl"))
+
+
+def test_locate_dll_android_env_only(monkeypatch):
+    """★H4★ locate_dll("android") 仅认 PKAPP_KEYLIB env——_vendor/仓库回退
+    已移除（与 vendor.py 不收录 android 配套，fallback 链两端同时拆除）。"""
+    from pkapp.packager import keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    assert keylib.locate_dll("android") is None
+    # env 指定（模式 B，用户明确意图）仍生效
+    monkeypatch.setenv("PKAPP_KEYLIB", "C:/nonexistent/lib.so")
+    assert keylib.locate_dll("android") is None

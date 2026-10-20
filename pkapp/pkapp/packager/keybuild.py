@@ -181,12 +181,24 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
     - "fallback"：预制通用件 + 锚点补丁（编译器不可得时的退化路径，保护面
       明示降级——§3.3"预制件分发模式退化为 fallback"）。
     两条路径产物 key_id 同为 SHA256(K_app)[:16] hex——闸门语义零差异。
+
+    ★android 例外（H4 fail-fast 2026-10）★：android 无 fallback——单槽预制
+    so 无 ABI 语义，锚点补丁会把错 ABI 件打进 APK（key_id 配对正确、目标机
+    dlopen 即崩），且能执行 android 打包的机器必已装 NDK（fetch android 必含）。
+    编译不可得 → KeyLibError；自管件（模式 B）经 PKAPP_KEYLIB 显式指定，
+    由调用方（_stage_keylib）处理。
     """
     try:
         compile_keylib(platform, k_app, out_path, abi=abi)
         return "compiled"
     except KeyLibError as e:
         reason = str(e).splitlines()[0]
+    if platform == "android":
+        raise KeyLibError(
+            f"android keylib 现场编译不可得（{reason}）——NDK 是 android 打包的"
+            "必需工具链（pkapp fetch android 或设 ANDROID_NDK_HOME）。android 无"
+            "预制件退化路径（单槽 so 会把错 ABI 件打进 APK）；自管件请设 "
+            "PKAPP_KEYLIB 显式指定")
     prefab = locate_dll(platform)
     if not prefab:
         raise KeyLibError(

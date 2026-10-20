@@ -140,7 +140,7 @@ def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
                                    key_id_hex, locate_dll, resolve_master_key)
     out_name = "pkapp_key.dll" if platform == "windows" else "lib_pkapp_key.so"
     expect_vendored = "_vendor/keylib/windows/pkapp_key.dll" if platform == "windows" \
-        else "_vendor/keylib/android/lib_pkapp_key.so"
+        else "PKAPP_KEYLIB 指定的 android 自管件（android 无包内置预制件）"
     try:
         try:
             salt = bytes.fromhex(salt_hex) if salt_hex else None

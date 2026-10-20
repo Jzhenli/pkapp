@@ -629,11 +629,11 @@ def test_stage_keylib_mode_b_no_patch(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- 阶段2b-android：异平台件落位
-def test_stage_keylib_android_patches_and_gates(tmp_path, monkeypatch,
-                                                android_keylib_so):
-    """android .so（构建机无法 dlopen ELF）：强制现场编译失手走锚点补丁（conftest
-    fixture），key_id 闸门用 Python 镜像 key_id_hex(K_app) 比对（ctypes 实测仅
-    windows 平台件可用）。"""
+def test_stage_keylib_android_compiles_and_gates(tmp_path, monkeypatch,
+                                                 android_keylib_so):
+    """android .so（构建机无法 dlopen ELF）：现场定制编译路径（conftest fixture
+    强制编译成功写出假产物——android 无预制件退化路径，H4），key_id 闸门用
+    Python 镜像 key_id_hex(K_app) 比对（ctypes 实测仅 windows 平台件可用）。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
@@ -647,18 +647,15 @@ def test_stage_keylib_android_patches_and_gates(tmp_path, monkeypatch,
     assert os.path.isfile(out)
     with open(out, "rb") as f:
         data = f.read()
-    with open(android_keylib_so, "rb") as f:
-        src = f.read()
-    i = src.index(keylib.ANCHOR)
-    assert keylib.ANCHOR not in data                     # 锚点已改写（不再含原值）
-    assert data[i:i + 32] == bytes(k ^ m for k, m in zip(k_app, keylib._MASK))
-    assert data[:i] == src[:i] and data[i + 32:] == src[i + 32:]   # 其余字节零扰动
+    assert data == b"\x00" * 256 + k_app + b"\x00" * 256   # 编译产物原样落位（无补丁环节）
+    assert keylib.ANCHOR not in data                     # compiled 件无锚点常量
+    assert k_app in data                                 # K 编译期烧入（fixture 模拟）
 
 
 def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
                                                      android_keylib_so):
     """android 闸门负向：manifest code_key_id 与 master 派生值不配对 → rc=2
-    （补丁件保留 staging 现场供排查，同 windows 语义）。"""
+    （件保留 staging 现场供排查，同 windows 语义）。"""
     from pkapp.commands.package import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
@@ -669,6 +666,27 @@ def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
     assert _stage_keylib(stage, keylib.key_id_hex(kb), "android",
                          app_id=_APP) == 2
     assert os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
+
+
+def test_stage_keylib_android_compile_fail_fails_hard(tmp_path, monkeypatch):
+    """android 编译不可得（NDK 缺失）→ rc=2 fail-fast，绝无预制件退化（H4：
+    单槽 so 错 ABI 打包风险已移除—— locate_dll("android") 仅认 PKAPP_KEYLIB）。"""
+    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager import keybuild, keylib as kl
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    _set_master(monkeypatch)
+
+    def _no_compile(*_a, **_k):
+        raise kl.KeyLibError("测试强制：现场编译不可得（NDK 缺失模拟）")
+
+    monkeypatch.setattr(keybuild, "compile_keylib", _no_compile)
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    k_app = kl.derive_k_app(kl.resolve_master_key(create=False)[0], "myapp")
+    assert _stage_keylib(stage, kl.key_id_hex(k_app), "android",
+                         app_id="myapp") == 2
+    assert not os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
 
 
 # ---------------------------------------------------------------- 阶段2c：applocal 运行期 finder（跨包契约）

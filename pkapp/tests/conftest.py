@@ -58,31 +58,22 @@ def _master_key_isolation(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def android_keylib_so(tmp_path, monkeypatch):
-    """android key-holder 件落位测试锚：locate_dll("android") 定向到 tmp 假件
-    （patch_dll 纯字节定位替换，不解析容器结构——测试契约允许伪造容器），
-    仓库树零写入（假件不进 keylib/build/，杜绝硬杀残留污染 vendor 收录）。
+def android_keylib_so(monkeypatch):
+    """android key-holder 件落位测试锚：强制现场定制编译成功——写出假"编译产物"
+    （K 烧入态字节模拟，C 编译器行为不在 Python 测试面）。android 无预制件退化
+    路径（★H4 2026-10★ 单槽 so 会把错 ABI 件打进 APK，已移除）——fixture 令
+    compiled 路径不依赖 NDK 在位。假件落 tmp，仓库树零写入。
     不走 PKAPP_KEYLIB env——那会被 _stage_keylib 判为模式 B 改变被测行为。
-    ★档位1★ 同时强制现场编译失手（keybuild.compile_keylib）——NDK 在位与否
-    不改变被测路径，fallback 锚点补丁链（假件字节对拍）恒定可断言。"""
-    from pkapp.packager import keybuild, keylib
+    假产物形态 = 256 零字节 + K_app + 256 零字节（用例可对 staging 落位件做
+    内容断言）。"""
+    from pkapp.packager import keybuild
 
-    fake = str(tmp_path / "lib_pkapp_key.so")
-    with open(fake, "wb") as f:
-        f.write(b"\x00" * 256 + keylib.ANCHOR + b"\x00" * 256)
-    real = keylib.locate_dll
+    def _fake_compile(platform, k_app, out_path, *, abi="arm64-v8a"):
+        assert platform == "android"
+        with open(out_path, "wb") as f:
+            f.write(b"\x00" * 256 + k_app + b"\x00" * 256)   # K 编译期烧入模拟
 
-    def _locate(platform="windows"):
-        return fake if platform == "android" else real(platform)
-
-    monkeypatch.setattr(keylib, "locate_dll", _locate)
-    monkeypatch.setattr(keybuild, "locate_dll", _locate)   # produce_keylib 回退定位
-
-    def _no_compile(*_a, **_k):
-        raise keylib.KeyLibError("测试强制：现场编译不可得（android fallback 路径）")
-
-    monkeypatch.setattr(keybuild, "compile_keylib", _no_compile)
-    return fake
+    monkeypatch.setattr(keybuild, "compile_keylib", _fake_compile)
 
 
 @pytest.fixture

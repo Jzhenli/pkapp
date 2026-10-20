@@ -38,7 +38,8 @@ jobs:
         working-directory: keylib
         run: .\build.bat
       - name: Vendor _vendor (shell + keylib + applocal wheel)
-        run: python pkapp/scripts/vendor.py
+        # 全量 require：发布件完整性闸门（H4 fail-fast）——任何条目缺件拒绝出制品
+        run: python pkapp/scripts/vendor.py --require shell-windows,keylib-windows,keylib-src,shell-android,applocal-wheel
       - name: Build pkapp wheel
         run: |
           python -m pip install -q build

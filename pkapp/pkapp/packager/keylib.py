@@ -286,12 +286,19 @@ def _ensure_gitignore(project_dir: str) -> None:
 
 
 def locate_dll(platform: str = "windows") -> str | None:
-    """key-holder 通用件定位（PKAPP_KEYLIB > 包内置 _vendor > 仓库 build 产物）。"""
+    """key-holder 通用件定位（PKAPP_KEYLIB > 包内置 _vendor > 仓库 build 产物）。
+
+    ★android 恒 None（env 除外，H4 fail-fast 2026-10）★：单槽 so 无 ABI 语义，
+    预制件回退会把错 ABI 件补进任意 ABI 的 APK——android 默认路径只剩现场定制
+    编译（能执行 android 打包的机器必已装 NDK）；模式 B 自管件经 PKAPP_KEYLIB
+    显式指定（env 对任意平台生效，属用户明确意图，不属静默回退）。
+    """
     env = os.environ.get("PKAPP_KEYLIB")
     if env:
         return env if os.path.isfile(env) else None
-    fname = {"windows": "pkapp_key.dll", "linux": "pkapp_key.so",
-             "android": "lib_pkapp_key.so"}.get(platform)
+    if platform == "android":
+        return None
+    fname = {"windows": "pkapp_key.dll", "linux": "pkapp_key.so"}.get(platform)
     if not fname:
         return None
     vendored = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
