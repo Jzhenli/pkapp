@@ -23,6 +23,7 @@ from pathlib import Path
 from pkapp.appspec._network import NetworkSpec
 from pkapp.appspec._platforms import AndroidSpec, _WATCHER_KEYS
 from pkapp.packager import manifest
+from pkapp.packager.winshell import _SHELL_DEFAULT_PUB
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -98,3 +99,21 @@ def test_ext_keys_consumed_by_packager():
                      if re.fullmatch(r"code_[a-z_]+", s)}
     missing = [k for k in manifest.EXT_KEYS if k not in consumed]
     assert not missing, f"EXT_KEYS 中无 packager 消费方字面量的键: {missing}"
+
+
+# ---------------------------------------- ⑤ 出厂默认公钥：壳 C ↔ 补丁精确锚
+
+def test_shell_default_pub_vs_manifest_c():
+    """_SHELL_DEFAULT_PUB == 壳 C PKAPP_PUB_HEX（补丁精确锚与出厂公钥同源）。
+
+    漂移后果：精确锚静默 miss → 补丁退化为 64-hex 全文扫描 fallback——
+    唯一段改写靠运气、多段/零段报错、误命中靠 --selftest-spk 闸门兜底。
+    """
+    src = _text("shell-windows/src/manifest.c")
+    m = re.search(r'#define\s+PKAPP_PUB_HEX\s+"([0-9a-fA-F]{64})"', src)
+    assert m, "manifest.c 中找不到 PKAPP_PUB_HEX 定义（壳侧结构变更，请同步本对账锚）"
+    assert _SHELL_DEFAULT_PUB == m.group(1), (
+        "壳出厂默认公钥与 winshell._SHELL_DEFAULT_PUB 漂移——补丁精确锚将静默 miss，"
+        "退化为 hex 扫描 fallback；两侧必须同步更新")
+    assert re.fullmatch(r"[0-9a-f]{64}", _SHELL_DEFAULT_PUB), \
+        "_SHELL_DEFAULT_PUB 须为 64 位小写 hex（补丁改写同长度 ASCII 改写依赖）"
