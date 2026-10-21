@@ -11,13 +11,22 @@ wheel 内置 _vendor/shell-android（android_shell.vendored_template_dir）。
 资产增量陷阱（真机踩坑沉淀）：拷贝保留源文件 mtime，构建后拷入的 assets 可能被
 增量 mergeDebugAssets 漏掉——拷入后必须 touch assets 目录，且组装完成后以
 "APK 内 assets/runtime.spk 与源 spk 字节一致"作硬校验，漏掉即报错而非真机白屏。
+
+package 编排（_package_android，★H2★ 自 commands/package.py 下沉）：spk 入壳工程
+assets → gradle → APK 内 spk 字节校验 → release/；android 壳不做 spk 验签——APK
+签名承担（协议 §10.2）。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
 import zipfile
+
+from ..util import sha256_file
+from .keybuild import _stage_keylib
+from .spk import _spk_manifest_fields
 
 # 壳工程随仓库分发，默认取仓库内 shell-android/shell（apk.py 位于 <repo>/pkapp/pkapp/packager/）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -260,3 +269,104 @@ def _verify_asset_in_apk(apk_path: str, spk_bytes: bytes) -> None:
                            "重跑一次或 clean 后重试）")
         if zf.read("assets/runtime.spk") != spk_bytes:
             raise ApkError("APK 内 runtime.spk 与源 spk 字节不一致（陈旧资产？）")
+
+
+def _package_android(project: str, spec, *, shell_dir: str | None,
+                     variant: str, out: str | None, arch: str | None = None) -> int:
+    spk_dir = os.path.join(project, "build", "platform-android")
+    spk = os.path.join(spk_dir, "runtime.spk")
+    if not os.path.isfile(spk):
+        print(f"[package] 未找到 spk: {spk}（先 pkapp build android）")
+        return 2
+    # ABI 决策链：build-meta.json（最后一次 build 记录）> TOML（旧构建兼容）。
+    # spk 按单 ABI 装配（assemble 既定约束）——package 的 ABI 必须跟随"最后一次
+    # build"而非 TOML 当前值，否则产生壳/包 ABI 错配的静默坏包（dlopen 才炸）
+    abis = spec.android_abis
+    meta_path = os.path.join(spk_dir, "build-meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            abis = tuple(meta.get("abis") or ())
+        except (ValueError, OSError) as e:
+            print(f"[package] build-meta.json 不可读: {e}（删除该文件可回退 TOML abis）")
+            return 2
+        if not abis:
+            print("[package] build-meta.json 无 abis 字段——重新 pkapp build android")
+            return 2
+        # spk 配对校验：meta 的 ABI 记录只对当时那次 spk 有效——spk 被替换
+        # （隔次构建/手动覆盖）而 meta 未跟上时，这里拦下 ABI 错配的静默坏包
+        # （android 壳不做 spk 验签，本闸门是唯一拦截点，对齐 windows 配对自检）
+        want = (meta.get("spk_sha256") or "").strip()
+        if want and want != "sha256:" + sha256_file(spk):
+            print(f"[package] build-meta.json 与 runtime.spk 不匹配（spk_sha256 不符）——"
+                  f"重新 pkapp build android 后再 package")
+            return 2
+    assert_arch = (arch or "").strip()
+    if assert_arch and list(abis) != [assert_arch]:
+        print(f"[package] --arch {assert_arch} 与 spk 构建记录不符（abis={list(abis)}）——"
+              f"重新 pkapp build android --arch {assert_arch}")
+        return 2
+    icon = ""
+    if spec.android_icon:
+        icon = spec.android_icon if os.path.isabs(spec.android_icon) else os.path.join(
+            os.path.abspath(project), spec.android_icon)
+        if not os.path.isfile(icon):
+            print(f"[package] 图标文件不存在: {spec.android_icon}（[platforms.android].icon）")
+            return 2
+    out_dir = os.path.abspath(out or os.path.join(project, "release"))
+    # keystore 链（★v1.2★）：PKAPP_KEYSTORE env > TOML [platforms.android].keystore
+    #（相对项目根）；密码/别名只走 env（PKAPP_KEYSTORE_PASS / _ALIAS），永不入 AppSpec
+    keystore = os.environ.get("PKAPP_KEYSTORE") or ""
+    if not keystore and spec.android_keystore:
+        keystore = os.path.normpath(os.path.join(
+            os.path.abspath(project), spec.android_keystore))
+    keystore_pass = os.environ.get("PKAPP_KEYSTORE_PASS") or ""
+    keystore_alias = os.environ.get("PKAPP_KEYSTORE_ALIAS") or "pkapp"
+    # android 运行时快照 = 壳模板注入的数据源；解析失败降级 None（上方已透出原因），
+    # 由 apk.py fail-fast 指向 fetch
+    runtime_dir = None
+    try:
+        from . import runtime as _rt
+        runtime_dir = _rt.resolve(spec, "android", abis=abis).dir
+    except Exception as e:
+        runtime_dir = None
+        # 静默降级会让"快照在场但校验失败"（python_version 不一致等）伪装成缺快照，
+        # 误导用户重跑 fetch——透出真实原因一行
+        print(f"[package] android 运行时快照未解析: {e}")
+    # 代码加密（②）：spk manifest 带 code_key_id = 加密构建 → key-holder .so
+    # 现场派生/补丁 + key_id 闸门后交 build_apk 进 APK jniLibs（§5.5）；
+    # 明文产物零改动（G6）。salt 从 spk manifest code_salt 读（per_build_salt 档）。
+    spk_fields = _spk_manifest_fields(spk) or {}
+    code_key_id = spk_fields.get("code_key_id", "")
+    keylib_so = None
+    keylib_stage = None
+    if code_key_id:
+        import tempfile
+        keylib_stage = tempfile.mkdtemp(prefix="pkapp-keylib-android-")
+        rc_kl = _stage_keylib(keylib_stage, code_key_id, "android",
+                              app_id=spec.name,
+                              salt_hex=spk_fields.get("code_salt", ""))
+        if rc_kl != 0:
+            shutil.rmtree(keylib_stage, ignore_errors=True)
+            return rc_kl
+        keylib_so = os.path.join(keylib_stage, "lib_pkapp_key.so")
+    try:
+        apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
+                             out_dir=out_dir, variant=variant,
+                             app_id=spec.android_package,
+                             version=spec.version, abis=abis,
+                             keystore=keystore, keystore_pass=keystore_pass,
+                             keystore_alias=keystore_alias, icon=icon,
+                             runtime_dir=runtime_dir, keylib_so=keylib_so)
+    except ApkError as e:
+        print(f"[package] APK 组装失败: {e}")
+        return 1
+    finally:
+        if keylib_stage:
+            shutil.rmtree(keylib_stage, ignore_errors=True)
+    print(f"[package] {apk_path}  ({os.path.getsize(apk_path):,} B)")
+    print(f"[package] 变体={variant}"
+          f"{'（已用 keystore 签名）' if keystore else '（debug 自动签名；release 需 keystore：TOML [platforms.android].keystore + env PKAPP_KEYSTORE_PASS）'}；"
+          "android 壳不做 spk 验签——APK 签名承担（协议 §10.2）")
+    return 0

@@ -41,3 +41,20 @@ def read_spk(path: str) -> list[tuple[str, bytes]]:
     """读回全部条目（校验用）。"""
     with zipfile.ZipFile(path) as zf:
         return [(i.filename, zf.read(i.filename)) for i in zf.infolist()]
+
+
+def _spk_manifest_fields(spk_path: str) -> dict:
+    """读 spk 内 manifest 字段（package 期判定加密态：code_key_id 存在 = 加密产物）。
+
+    读取失败按非加密处理（明文流程零新增失败模式，G6）——损坏 spk 由壳配对
+    自检闸门兜底拦截。
+    """
+    from . import manifest as mf
+    try:
+        entries = read_spk(spk_path)
+        entry = next((e for e in entries if e[0] == MANIFEST_ENTRY), None)
+        if entry is None:
+            return {}
+        return mf.parse(entry[1].decode("utf-8"))
+    except Exception:                     # BadZipFile 等损坏包 → 按明文处理（壳自检兜底）
+        return {}

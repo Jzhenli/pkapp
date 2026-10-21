@@ -1,0 +1,243 @@
+"""Windows 壳域（package windows 终产物的壳侧资产）：预编译壳定位 / 公钥原位补丁 /
+配对自检（--selftest-spk）/ rcedit 资源增强 + 终产物组装编排。
+
+模式 A（零编译壳）：仓库默认壳 / 包内置壳（_vendor/shell）是 pkapp 分发件，package
+时在 staging 副本上原位补丁内置公钥为项目公钥——任意项目密钥 × 零编译壳；显式
+--shell / PKAPP_SHELL_EXE 指定的壳归用户管（模式 B 自编壳公钥自定），不做补丁。
+出货前用壳的 --selftest-spk 做配对自检（壳内置公钥 × spk 签名），验不过不出货。
+
+组装编排（_package_windows，★H2★ 自 commands/package.py 下沉）：预编译壳 + spk +
+WebView2Loader 三件套一次性组装到 staging（build/staging-windows/，成功即焚毁、
+失败保留现场），公钥补丁/配对自检/完整性侧车/keylib 闸门/rcedit 可选增强通过后
+打 zip（内含 <name>/ 一层目录）到 release/。
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import zipfile
+
+from .. import toolchain
+from . import integrity, sign
+from .apk import artifact_name
+from .integrity import _extract_integrity_sidecar
+from .keybuild import _stage_keylib
+from .spk import _spk_manifest_fields
+
+# manifest.c 出厂默认公钥（build.bat 不带第 2 参编译即此值）——补丁精确定位的首选锚点
+_SHELL_DEFAULT_PUB = "74420a2d95acd1f090719a5041f64d923a75fb37557b021f3aeeff04821ef432"
+
+
+def _find_shell(explicit: str | None) -> tuple[str | None, bool]:
+    """预编译壳定位：--shell / PKAPP_SHELL_EXE / 仓库内默认 build/MyApp.exe / 包内置壳。
+
+    返回 (壳路径, 可否公钥补丁)：显式指定的壳归用户管（模式 B，公钥编译期自定），
+    不补丁；仓库默认壳与包内置壳是 pkapp 分发件，package 时可改写内置公钥。
+    """
+    if explicit:
+        return (explicit if os.path.isfile(explicit) else None), False
+    env = os.environ.get("PKAPP_SHELL_EXE")
+    if env:
+        return (env if os.path.isfile(env) else None), False
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    default = os.path.join(repo, "shell-windows", "build", "MyApp.exe")
+    if os.path.isfile(default):
+        return default, True
+    from ..vendor import shell_exe
+    vendored = shell_exe()
+    return (vendored, True) if vendored else (None, False)
+
+
+def _find_rcedit(explicit: str | None) -> str | None:
+    """rcedit 定位：--rcedit / PKAPP_RCEDIT / 托管缓存（pkapp fetch windows）/ PATH。"""
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    env = os.environ.get("PKAPP_RCEDIT")
+    if env and os.path.isfile(env):
+        return env
+    try:
+        managed = toolchain.rcedit_path()
+    except toolchain.ToolchainError:      # PINS 无 rcedit pin（防御）：走 PATH 降级
+        managed = ""
+    if managed and os.path.isfile(managed):
+        return managed
+    return shutil.which("rcedit") or shutil.which("rcedit-x64")
+
+
+def _shell_accepts(shell: str, spk: str) -> tuple[bool, str]:
+    """壳内置公钥 × spk 签名配对自检（--selftest-spk，契约测试同款差分入口）。"""
+    try:
+        r = subprocess.run([shell, "--selftest-spk", spk], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=60)
+    except OSError as e:
+        return False, f"壳自检进程启动失败: {e}"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def _patch_shell_pubkey(exe: str, pub_hex: str) -> None:
+    """壳内置公钥原位补丁（staging 副本上调用，绝不触碰分发原件）。
+
+    kPubHex 在 exe 内是 64 字符 ASCII hex 常量（manifest.c）——先精确命中出厂默认
+    公钥；未命中（自定义 pub 编译的壳）再全文扫 64-hex 连续段，唯一段才改写
+    （零段/多段 = 定位不可靠，报错引导走模式 B）。同长度改写，文件其余字节零扰动。
+    """
+    if len(pub_hex) != 64 or re.fullmatch(r"[0-9a-fA-F]{64}", pub_hex) is None:
+        raise RuntimeError(f"公钥非法（须 64 位 hex）: {pub_hex[:16]}…")
+    with open(exe, "rb") as f:
+        data = f.read()
+    new = pub_hex.lower().encode("ascii")
+    needle = _SHELL_DEFAULT_PUB.encode("ascii")
+    offsets = [m.start() for m in re.finditer(re.escape(needle), data)]
+    if not offsets:
+        hex_runs = list(re.finditer(rb"[0-9a-f]{64}", data))
+        if len(hex_runs) != 1:
+            raise RuntimeError(
+                f"壳内置公钥定位失败（64-hex 连续段 ×{len(hex_runs)}）——该壳无法自动配对，"
+                "请自编壳（shell-windows/build.bat <AppName> <项目公钥>）后 --shell 指定（模式 B）")
+        offsets = [m.start() for m in hex_runs]
+    for off in offsets:
+        data = data[:off] + new + data[off + 64:]
+    with open(exe, "wb") as f:
+        f.write(data)
+
+
+def _rcedit_apply(rcedit: str, exe: str, icon: str | None, desc: str, version: str) -> int:
+    """rcedit 改资源；单项失败即中止（资源半改状态比全不改更难排查）。"""
+    steps: list[list[str]] = []
+    if icon:
+        steps.append(["--set-icon", icon])
+    steps += [["--set-version-string", k, v] for k, v in
+              (("FileDescription", desc), ("ProductName", desc),
+               ("FileVersion", version), ("ProductVersion", version))]
+    for s in steps:
+        r = subprocess.run([rcedit, exe, *s], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"[package] rcedit {' '.join(s[:1])} 失败: {(r.stdout + r.stderr).strip()}")
+            return 1
+    return 0
+
+
+def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
+                     desc: str | None, rcedit: str | None, out: str | None) -> int:
+    name, version = spec.name, spec.version
+    icon = icon or spec.platform_icon  # --icon 优先；回退 [platforms.windows].icon
+    if icon and not os.path.isfile(os.path.join(project, icon) if not os.path.isabs(icon) else icon):
+        print(f"[package] 图标文件不存在: {icon}（[platforms.windows].icon / --icon）")
+        return 2
+    if icon and not os.path.isabs(icon):
+        icon = os.path.join(project, icon)
+
+    spk = os.path.join(project, "build", "platform-windows", "runtime.spk")
+    if not os.path.isfile(spk):
+        print(f"[package] 未找到 spk: {spk}（先 pkapp build windows）")
+        return 2
+    shell_exe, patchable = _find_shell(shell)
+    if not shell_exe:
+        print("[package] 未找到预编译壳：设 PKAPP_SHELL_EXE 或 --shell <shell.exe>"
+              "（wheel 安装形态由包内置壳兜底，缺失时重装 pkapp）")
+        return 2
+    loader = os.path.join(os.path.dirname(shell_exe), "WebView2Loader.dll")
+    if not os.path.isfile(loader):
+        print(f"[package] 壳旁缺 WebView2Loader.dll: {loader}")
+        return 2
+    # 代码加密（②）：manifest 带 code_key_id = 加密构建产物 → key-holder 件补丁进
+    # staging（exe 旁）+ key_id 配对闸门；明文产物零改动（G6）
+    fields = _spk_manifest_fields(spk)
+    encrypted = bool(fields.get("code_key_id"))
+
+    # 一次性组装 staging：build/staging-windows/——壳是共用预编译件，公钥补丁 /
+    # rcedit 资源改写都必须在副本上做；staging 成功打 zip 后即焚毁（release/ 只放
+    # 终产物 zip），失败保留现场（错误信息指向该目录），下次 package 先清残留。
+    stage = os.path.join(project, "build", "staging-windows")
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage, exist_ok=True)
+    exe_path = os.path.join(stage, f"{name}.exe")
+    shutil.copyfile(shell_exe, exe_path)
+    shutil.copyfile(spk, os.path.join(stage, f"{name}.spk"))
+    shutil.copyfile(loader, os.path.join(stage, "WebView2Loader.dll"))
+
+    # 公钥补丁：分发壳（仓库默认 / 包内置）的烧录公钥改写为项目公钥——
+    # 任意项目密钥 × 零编译壳；定位失败或私钥缺失时不阻断（配对自检闸门兜底）。
+    if patchable:
+        try:
+            key_path = sign.resolve_private_key(None, project)
+        except sign.SignError as e:
+            print(f"[package] {e}")
+            key_path = None
+        if key_path is None:
+            print("[package] 未定位到签名私钥（PKAPP_SIGN_KEY / .pkapp/sign.key）——"
+                  "壳公钥补丁跳过，若 spk 用他钥签名配对自检会拦下")
+        else:
+            pub = sign.public_key_hex(key_path)
+            try:
+                _patch_shell_pubkey(exe_path, pub)
+                print(f"[package] 壳公钥已配对项目密钥（{pub[:12]}…）")
+            except (RuntimeError, OSError) as e:   # OSError：杀软/Defender 句柄锁等
+                print(f"[package] 壳公钥补丁失败: {e}")
+                print(f"[package] 组装 staging 保留现场: {stage}")
+                return 2
+
+    # 出货闸门：壳内置公钥必须验得过这个 spk（补丁后自检 = 验证最终出货字节）
+    ok, detail = _shell_accepts(exe_path, spk)
+    if not ok:
+        print("[package] 配对自检失败——壳验不过该 spk（壳内置公钥 ≠ 签名公钥）。\n"
+              "  模式 A：pkapp build windows（私钥缺失会自动 keygen）后重跑 package\n"
+              "  模式 B：自编壳 build.bat <AppName> <项目公钥>，--shell 指定使用")
+        if detail:
+            print(f"  壳输出: {detail}")
+        print(f"[package] 组装 staging 保留现场: {stage}")
+        return 2
+
+    # ★P0★ 完整性侧车落 exe 旁（壳每启校验的信任锚，Q7 读取合同）；旧 format 1
+    # spk 无侧车在此拦下——新壳也会拒收，提前到组装期给可行动指引
+    try:
+        _extract_integrity_sidecar(spk, stage)
+    except RuntimeError as e:
+        print(f"[package] {e}")
+        print(f"[package] 组装 staging 保留现场: {stage}")
+        return 2
+
+    # key-holder 件（仅加密产物）：现场派生 K + 专属件产出 + key_id 配对闸门
+    # （★档位1★；失败保留现场）
+    if encrypted:
+        rc = _stage_keylib(stage, fields["code_key_id"], app_id=name,
+                           salt_hex=fields.get("code_salt", ""))
+        if rc != 0:
+            print(f"[package] 组装 staging 保留现场: {stage}")
+            return rc
+
+    rc_tool = _find_rcedit(rcedit)
+    if rc_tool:
+        if _rcedit_apply(rc_tool, exe_path, icon, desc or name, version) != 0:
+            print(f"[package] 组装 staging 保留现场: {stage}")
+            return 1
+        print(f"[package] rcedit 资源已更新（icon={bool(icon)} desc/版本={version}）")
+    else:
+        print("[package] 未找到 rcedit（可选增强）：图标/版本资源未改；"
+              "运行 `pkapp fetch windows` 或设 PKAPP_RCEDIT / --rcedit 后重跑")
+
+    out_dir = os.path.abspath(out or os.path.join(project, "release"))
+    os.makedirs(out_dir, exist_ok=True)
+    zip_path = os.path.join(out_dir, artifact_name(name, version, "windows"))
+    zip_tmp = zip_path + ".tmp"
+    files = [f"{name}.exe", f"{name}.spk", "WebView2Loader.dll",
+             integrity.SIDECAR_NAME, integrity.SIDECAR_SIG_NAME]
+    if encrypted:
+        files.append("pkapp_key.dll")          # exe 旁（§5.5；applocal ctypes 取用）
+    with zipfile.ZipFile(zip_tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(os.path.join(stage, f), arcname=f"{name}/{f}")
+    os.replace(zip_tmp, zip_path)
+
+    sizes = [(f, os.path.getsize(os.path.join(stage, f))) for f in files]
+    shutil.rmtree(stage, ignore_errors=True)   # 成功即焚：staging 只服务本次组装
+
+    print(f"[package] {zip_path}  ({os.path.getsize(zip_path):,} B)")
+    for f, sz in sizes:
+        print(f"  {name}/{f}  ({sz:,} B)")
+    print(f"[package] 运行时身份随 exe 文件名派生：数据目录 %LOCALAPPDATA%\\{name}")
+    return 0

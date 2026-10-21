@@ -39,8 +39,8 @@ def test_package_windows_requires_spk(tmp_path, capsys):
 def test_package_sidecar_extract_and_format1_rejected(tmp_path):
     """★P0★ 侧车提取：spk _integrity/* → exe 旁两文件；旧 format 1（无侧车）
     → RuntimeError 引导重 build（新壳拒收，组装期提前给可行动错误）。"""
-    from pkapp.commands.package import _extract_integrity_sidecar
     from pkapp.packager import integrity as ig
+    from pkapp.packager.integrity import _extract_integrity_sidecar
     from pkapp.packager import sign as sign_mod
     from pkapp.packager import spk as spk_mod
 
@@ -91,7 +91,7 @@ def test_find_rcedit_fallback_chain(tmp_path, monkeypatch):
     """_find_rcedit 查找序：--rcedit > PKAPP_RCEDIT > 托管缓存 > PATH；
     PINS 无 rcedit pin 时 ToolchainError 被接住降级 PATH（不崩，可选增强契约）。"""
     from pkapp import toolchain
-    from pkapp.commands.package import _find_rcedit
+    from pkapp.packager.winshell import _find_rcedit
 
     monkeypatch.setenv("PKAPP_CACHE", str(tmp_path / "cache"))
     monkeypatch.delenv("PKAPP_RCEDIT", raising=False)

@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from pkapp.commands.package import (
+from pkapp.packager.winshell import (
     _SHELL_DEFAULT_PUB,
     _find_shell,
     _patch_shell_pubkey,
@@ -78,7 +78,7 @@ def test_find_shell_explicit_not_patchable(tmp_path):
 def test_find_shell_vendored_fallback(monkeypatch, tmp_path):
     """仓库默认壳缺席时回落包内置壳（可补丁）。"""
     from pkapp import vendor
-    from pkapp.commands import package as pkg
+    from pkapp.packager import winshell as pkg
 
     exe = tmp_path / "MyApp.exe"
     exe.write_bytes(b"x")

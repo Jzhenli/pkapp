@@ -531,7 +531,7 @@ def test_manifest_ext_key_code_salt():
 def test_stage_keylib_derives_and_gates(tmp_path, monkeypatch):
     """★档位1★ 正向：master 派生 K_app → 现场产出专属件 → key_id ≡ manifest
     配对值；产出件按运行期形态打开 K_app 加密的 blob。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     master = _set_master(monkeypatch)
@@ -552,7 +552,7 @@ def test_stage_keylib_derives_and_gates(tmp_path, monkeypatch):
 def test_stage_keylib_salt_roundtrip(tmp_path, monkeypatch):
     """per_build_salt 档：manifest code_salt hex → 同 master 同 salt 派生同 K；
     丢 salt（按默认档派生）→ 异 K 被闸门拦下。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     master = _set_master(monkeypatch)
@@ -570,7 +570,7 @@ def test_stage_keylib_salt_roundtrip(tmp_path, monkeypatch):
 def test_stage_keylib_rejects_corrupt_salt(tmp_path, monkeypatch):
     """★review 修复回归★：manifest code_salt 损坏（非法 hex）→ 闸门 rc=2（打印
     原因），不 traceback 崩溃——与其余失败路径同收敛（保留 staging 现场）。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     _set_master(monkeypatch)
     stage = str(tmp_path / "stage")
@@ -581,7 +581,7 @@ def test_stage_keylib_rejects_corrupt_salt(tmp_path, monkeypatch):
 def test_stage_keylib_rejects_mismatched_key(tmp_path, monkeypatch):
     """跨 key 闸门：manifest code_key_id 与 master 派生值不配对（master 更换/
     丢失重生成/新旧混装）→ package 拒绝（返回 2），失败保留 staging 现场。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     _set_master(monkeypatch)
@@ -595,7 +595,7 @@ def test_stage_keylib_rejects_mismatched_key(tmp_path, monkeypatch):
 def test_stage_keylib_missing_master(tmp_path, monkeypatch):
     """spk 已加密而 K_master 缺失 = 不可交付：报错且不 keygen（新 master 必不
     配对，静默生成只会掩盖密钥丢失）。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     monkeypatch.delenv("PKAPP_MASTER_KEY", raising=False)   # 覆盖 autouse 隔离位
@@ -607,7 +607,7 @@ def test_stage_keylib_missing_master(tmp_path, monkeypatch):
 
 def test_stage_keylib_mode_b_no_patch(tmp_path, monkeypatch):
     """模式 B（PKAPP_KEYLIB 自管件，K 编译期内嵌）：不补丁仅落位，闸门仍生效。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     master = _set_master(monkeypatch)
     k_app = keylib.derive_k_app(master, _APP)
@@ -633,7 +633,7 @@ def test_stage_keylib_android_compiles_and_gates(tmp_path, monkeypatch,
     """android .so（构建机无法 dlopen ELF）：现场定制编译路径（conftest fixture
     强制编译成功写出假产物——android 无预制件退化路径，H4），key_id 闸门用
     Python 镜像 key_id_hex(K_app) 比对（ctypes 实测仅 windows 平台件可用）。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     master = _set_master(monkeypatch)
@@ -655,7 +655,7 @@ def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
                                                      android_keylib_so):
     """android 闸门负向：manifest code_key_id 与 master 派生值不配对 → rc=2
     （件保留 staging 现场供排查，同 windows 语义）。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
     _set_master(monkeypatch)
@@ -670,7 +670,7 @@ def test_stage_keylib_android_rejects_mismatched_key(tmp_path, monkeypatch,
 def test_stage_keylib_android_compile_fail_fails_hard(tmp_path, monkeypatch):
     """android 编译不可得（NDK 缺失）→ rc=2 fail-fast，绝无预制件退化（H4：
     单槽 so 错 ABI 打包风险已移除—— locate_dll("android") 仅认 PKAPP_KEYLIB）。"""
-    from pkapp.commands.package import _stage_keylib
+    from pkapp.packager.keybuild import _stage_keylib
     from pkapp.packager import keybuild, keylib as kl
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)

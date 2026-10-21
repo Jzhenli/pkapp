@@ -123,3 +123,22 @@ def verify_signature(text: bytes, sig_b64: str, public_hex: str) -> bool:
 def spk_sidecar_entries(text: bytes, sig_b64: str) -> list[tuple[str, bytes]]:
     """随 spk 携带的两个条目（package 期提取落 exe 旁；壳亦可自愈回写）。"""
     return [(SPK_MANIFEST_ENTRY, text), (SPK_SIG_ENTRY, sig_b64.encode("ascii"))]
+
+
+def _extract_integrity_sidecar(spk_path: str, stage: str) -> None:
+    """★P0★ 完整性侧车提取：spk 内 _integrity/* 条目 → staging 落 exe 旁（壳每启
+    校验的信任锚，读取合同 = exe 同级，Q7）。旧 format 1 spk 无侧车 → RuntimeError
+    引导重 build（新壳拒 format 1，此处提前到组装期给可行动错误）。"""
+    from . import spk as spk_mod
+    try:
+        entries = dict(spk_mod.read_spk(spk_path))
+    except Exception as e:                    # BadZipFile 等损坏包：给出可读原因
+        raise RuntimeError(f"spk 不可读: {e}") from e
+    if SPK_MANIFEST_ENTRY not in entries or SPK_SIG_ENTRY not in entries:
+        raise RuntimeError(
+            "spk 缺完整性侧车（_integrity/integrity.manifest[.sig]）——旧 format 1 包"
+            "（新壳拒收），请重新 pkapp build windows 后再 package")
+    with open(os.path.join(stage, SIDECAR_NAME), "wb") as f:
+        f.write(entries[SPK_MANIFEST_ENTRY])
+    with open(os.path.join(stage, SIDECAR_SIG_NAME), "wb") as f:
+        f.write(entries[SPK_SIG_ENTRY])
