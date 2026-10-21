@@ -1,4 +1,8 @@
-"""AppSpec：项目规格（pkapp.toml）加载与校验（方案 §一 SPEC；协议 B B.w）。
+"""AppSpec 核心：跨平台内核字段 + 校验分发 + pkapp.toml 加载编排（方案 §一 SPEC；协议 B B.w）。
+
+★分层吸收★：平台配置归 _platforms 三子 Spec（validate 随域），[network] 归
+_network；本模块只持真正的根语义（name/version/entry/…）+ 根级聚合方法
+（deps_for/wheels_index/all_platform_deps，消费面零改动）。
 
 B.w 校验：name/version/entry/min_app_version 必填非空；entry 为 module:attr 格式；
 构建期断言 app_version >= min_app_version（发行自洽性检查——注意它不是防回滚本体，
@@ -10,23 +14,15 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-from . import __version__ as PKAPP_VERSION
+from .. import __version__ as PKAPP_VERSION
+from ._network import NetworkSpec
+from ._platforms import (PLATFORM_SPECS, _PLAT_KEYS, _WATCHER_KEYS,
+                         AndroidSpec, LinuxSpec, WindowsSpec)
 
 import tomllib
 
 _ENTRY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):([A-Za-z_][A-Za-z0-9_]*)$")
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-_PYVER_RE = re.compile(r"^3\.\d+\.\d+$")
-
-# 平台段白名单：未知键报错（同 [network] 精神——拼写错误静默丢弃 = 配置悄悄失效，B.w 兜住）
-_PLAT_KEYS = {"dependencies", "icon", "setproctitle", "package", "abis",
-              "keystore", "python_version", "runtime_dir",
-              "index_url", "extra_index_url", "watcher"}
-
-# [platforms.android.watcher]（ANDROID_7x24_WATCHDOG_PLAN §8）：键名即壳 manifest 扩展键
-# 后缀（watcher_<key>），int 秒/次数；缺省键不投影 → 壳侧 §8 默认值兜底
-_WATCHER_KEYS = {"alarm_interval", "heartbeat_ttl", "healthz_interval",
-                 "revive_burst_window", "revive_burst_limit", "healthy_reset_window"}
 
 
 class SpecError(ValueError):
@@ -34,48 +30,13 @@ class SpecError(ValueError):
 
 
 @dataclass(frozen=True)
-class NetworkSpec:
-    """[network] 段（NETWORK_AUTH_DESIGN.md ★v1.1★ §5）。
-
-    lan=false 视同未配置（总开关语义，§5）；lan=true 时经 manifest network_* 扩展键
-    透传（Ed25519 签名覆盖正文；壳 C 解析器按未知键忽略，三平台壳零改动）。
-    """
-    present: bool = False
-    lan: bool = False
-    bind: str = ""                    # 空 = applocal 缺省（lan 开启 → 0.0.0.0，§12）
-    port: int = 0                     # 0 = OS 自选；1024–65535 = 固定端口（被占 fail-fast）
-    auth: tuple = ("login",)          # login/provision/none 可多选；none 独占
-    local_auth: bool = True           # 本机壳是否强制登录（§5：lan 开启缺省 true）
-    session_days: int = 7
-    local_roles: tuple = ("*",)       # 缺省全权限（§7）；显式 [] 视为校验错误（歧义禁配）
-    provision_roles: tuple = ("*",)   # 预留配置位（§15#3：P0 全权限）
-
-    def manifest_keys(self) -> dict:
-        """lan 开启时产出 manifest 扩展键；未开启返回 {}（逐位现状，零回归红线）。"""
-        if not (self.present and self.lan):
-            return {}
-        out = {"network_lan": "1",
-               "network_auth": ",".join(self.auth),
-               "network_local_auth": "1" if self.local_auth else "0",
-               "network_session_days": str(self.session_days)}
-        if self.bind:
-            out["network_bind"] = self.bind
-        if self.port:
-            out["network_port"] = str(self.port)
-        if self.local_roles and self.local_roles != ("*",):
-            out["network_local_roles"] = ",".join(self.local_roles)
-        if self.provision_roles and self.provision_roles != ("*",):
-            out["network_provision_roles"] = ",".join(self.provision_roles)
-        return out
-
-
-@dataclass(frozen=True)
 class AppSpec:
+    """项目规格根：跨平台内核 + 平台子 Spec（windows/android/linux）+ [network]。"""
     name: str
     version: str
     entry: str
     min_app_version: str
-    dependencies: tuple[str, ...] = ()
+    dependencies: tuple[str, ...] = ()   # 公共 [dependencies].python
     coexist: bool = False
     code_encryption: bool = False        # [app] code_encryption（★②加密+壳持钥★ §8；缺省关闭 G6）
     code_obfuscation: bool = False       # [app] code_obfuscation（★§13 混淆叠加层★；缺省关闭 G6）
@@ -86,44 +47,30 @@ class AppSpec:
     heartbeat_interval: int = 5          # 壳轮询默认值（SHELL_PROTOCOL §5，AppSpec 可调）
     heartbeat_timeout: int = 30
     cold_start_timeout: int = 120
-    linux_setproctitle: bool = True      # B.y：Linux 目标默认装入 setproctitle 探测项
-    android_package: str = ""
-    android_abis: tuple[str, ...] = ("arm64-v8a",)
-    android_keystore: str = ""           # [platforms.android].keystore（路径,非机密;密码走 PKAPP_KEYSTORE_PASS env）
-    android_icon: str = ""               # [platforms.android].icon（PNG → 启动器图标，覆盖壳默认矢量图）
-    windows_python_version: str = ""     # [platforms.windows].python_version（运行时意图声明 → pkapp fetch）
-    android_python_version: str = ""     # [platforms.android].python_version
-    windows_runtime_dir: str = ""        # [platforms.windows].runtime_dir（逃生门：显式覆盖托管快照）
-    android_runtime_dir: str = ""        # [platforms.android].runtime_dir
-    platform_deps: dict = field(default_factory=dict)   # [platforms.*].dependencies（追加式，不含公共）
-    platform_icon: str = ""              # [platforms.windows].icon → ship 图标默认值
-    platform_index: dict = field(default_factory=dict)        # [platforms.*].index_url（主源；缺省 PyPI）
-    platform_extra_index: dict = field(default_factory=dict)  # [platforms.*].extra_index_url（补充源，如 flet）
-    network: NetworkSpec = field(default_factory=NetworkSpec)  # [network] 段（§5）
-    android_watcher: dict = field(default_factory=dict)  # [platforms.android.watcher]（§8）
+    windows: WindowsSpec = field(default_factory=WindowsSpec)
+    android: AndroidSpec = field(default_factory=AndroidSpec)
+    linux: LinuxSpec = field(default_factory=LinuxSpec)
+    network: NetworkSpec = field(default_factory=NetworkSpec)   # [network] 段（§5）
     raw: dict = field(default_factory=dict, repr=False, compare=False)
+
+    # ---- 根级聚合方法（平台子 Spec 的统一门面；消费面零改动）----
 
     def deps_for(self, platform: str) -> tuple[str, ...]:
         """构建依赖 = 公共 [dependencies].python + 平台段追加（同包约束由 pip 合并）。"""
-        return self.dependencies + self.platform_deps.get(platform, ())
+        return self.dependencies + getattr(self, platform).dependencies
 
     def wheels_index(self, platform: str) -> tuple[str, str]:
         """平台 wheel 源 (index_url, extra_index_url)；缺省 ("", "") = 不传 pip、
         尊重本机 pip 配置（镜像等）。显式配置时 packager 原样透传。"""
-        return (self.platform_index.get(platform, ""),
-                self.platform_extra_index.get(platform, ""))
+        ps = getattr(self, platform)
+        return (ps.index_url, ps.extra_index_url)
 
     def all_platform_deps(self) -> tuple[str, ...]:
         """全平台依赖并集（check 的 import 声明集：平台特有依赖同样算已声明）。"""
         out = list(self.dependencies)
-        for extra in self.platform_deps.values():
-            out.extend(extra)
+        for p in PLATFORM_SPECS:
+            out.extend(getattr(self, p).dependencies)
         return tuple(out)
-
-    def android_watcher_manifest_keys(self) -> dict:
-        """[platforms.android.watcher] → spk manifest 扩展键（ANDROID_7x24_WATCHDOG_PLAN §8；
-        键名 watcher_<key>，随签名覆盖；未配置 = 零键，壳侧 §8 默认值兜底）。"""
-        return {f"watcher_{k}": str(v) for k, v in self.android_watcher.items()}
 
 
 def _ver_tuple(v: str) -> tuple:
@@ -138,7 +85,7 @@ def _ver_tuple(v: str) -> tuple:
 
 
 def validate(spec: AppSpec) -> list[str]:
-    """返回问题列表（空列表 = 通过）。B.w + 平台字段检查。"""
+    """返回问题列表（空列表 = 通过）。B.w 核心校验 + 平台/[network] 子域分发。"""
     problems: list[str] = []
     if not spec.name or not _NAME_RE.match(spec.name):
         problems.append(f"app.name 非法（须匹配 {_NAME_RE.pattern}，用作 exe/互斥键名）: {spec.name!r}")
@@ -157,38 +104,9 @@ def validate(spec: AppSpec) -> list[str]:
     for dep in spec.all_platform_deps():
         if not re.match(r"^[A-Za-z0-9_.\-]+(\[[^\]]*\])?\s*([<>=!~].*)?$", dep):
             problems.append(f"依赖声明格式非法: {dep!r}")
-    if spec.android_package and not re.match(
-            r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$",
-            spec.android_package):
-        problems.append(f"[platforms.android].package 须为反向域名"
-                        f"（如 com.example.hiapp）: {spec.android_package!r}")
-    for pv in (spec.windows_python_version, spec.android_python_version):
-        if pv and not _PYVER_RE.match(pv):
-            problems.append(f"[platforms.*].python_version 须为 3.X.Y 格式（如 3.12.14）: {pv!r}")
-    for key, pmap in (("index_url", spec.platform_index),
-                      ("extra_index_url", spec.platform_extra_index)):
-        for p, u in pmap.items():
-            if not u.startswith(("http://", "https://")):
-                problems.append(f"[platforms.{p}].{key} 须为 http(s) URL: {u!r}")
-    for k, v in spec.android_watcher.items():
-        if v <= 0:
-            problems.append(f"[platforms.android.watcher].{k} 必须 >= 1（秒/次数）: {v}"
-                            "（0/负值会引发闹钟风暴或永久熔断）")
-    net = spec.network
-    if net.present:
-        bad = [m for m in net.auth if m not in ("login", "provision", "none")]
-        if bad:
-            problems.append(f"[network].auth 非法模式: {bad}（允许 login/provision/none）")
-        if "none" in net.auth and len(net.auth) > 1:
-            problems.append("[network].auth: none 不可与其他模式共存（显式裸奔即独占）")
-        if net.session_days < 1:
-            problems.append("[network].session_days 必须 >= 1")
-        if net.port != 0 and not (1024 <= net.port <= 65535):
-            problems.append("[network].port 须为 0（OS 自选）或 1024–65535"
-                            "（<1024 特权端口跨平台不可用）")
-        if net.local_roles == () or net.provision_roles == ():
-            problems.append("[network].local_roles/provision_roles 不可为空列表"
-                            "（缺省全权限 = 不配置；显式限定请列出角色）")
+    for p in PLATFORM_SPECS:
+        problems += getattr(spec, p).validate()
+    problems += spec.network.validate()
     return problems
 
 
@@ -205,17 +123,14 @@ def load(path: str) -> AppSpec:
     app = data.get("app") or {}
     deps = data.get("dependencies") or {}
     plat = data.get("platforms") or {}
-    linux = plat.get("linux") or {}
-    android = plat.get("android") or {}
-    windows = plat.get("windows") or {}
     heart = data.get("heartbeat") or {}
     dist = data.get("dist") or {}
     net_toml = data.get("network") or {}
 
     # 平台段白名单：未知段名报错（拼写错误静默丢弃 = 依赖悄悄漏装，B.w 校验兜住）
-    known = ("windows", "android", "linux")
+    known = tuple(PLATFORM_SPECS)
     unknown = sorted(set(plat) - set(known))
-    # 未知键（段内）：按 net_unknown 模式收集进 problems
+    # 未知键（段内）：收集进 problems（拼写正确但放错平台/键名打错的静默失效）
     plat_unknown = sorted((f"[platforms.{p}].{k}" for p in known
                            for k in set(plat.get(p) or {}) - _PLAT_KEYS))
 
@@ -260,7 +175,7 @@ def load(path: str) -> AppSpec:
         if (plat.get(p) or {}).get("watcher") is not None:
             raise SpecError(f"[platforms.{p}].watcher 仅 android 平台支持"
                             "（看门狗为 Android 专属，请移至 [platforms.android.watcher]）")
-    watcher_toml = android.get("watcher") or {}
+    watcher_toml = (plat.get("android") or {}).get("watcher") or {}
     watcher_unknown = sorted(set(watcher_toml) - _WATCHER_KEYS)
     android_watcher = {}
     for k in sorted(set(watcher_toml) & _WATCHER_KEYS):
@@ -270,19 +185,36 @@ def load(path: str) -> AppSpec:
             raise SpecError(f"[platforms.android.watcher].{k} 必须是整数: "
                             f"{watcher_toml[k]!r}") from e
 
+    def _seg(p: str) -> dict:
+        return plat.get(p) or {}
+
+    def _platform(p: str):
+        seg = _seg(p)
+        return PLATFORM_SPECS[p](
+            dependencies=tuple(str(d) for d in seg.get("dependencies", ())),
+            index_url=str(seg.get("index_url", "")),
+            extra_index_url=str(seg.get("extra_index_url", "")),
+            **_platform_extras(p, seg))
+
+    def _platform_extras(p: str, seg: dict) -> dict:
+        if p == "windows":
+            return {"python_version": str(seg.get("python_version", "")),
+                    "runtime_dir": str(seg.get("runtime_dir", "")),
+                    "icon": str(seg.get("icon", ""))}
+        if p == "android":
+            return {"package": str(seg.get("package", "")),
+                    "abis": tuple(seg.get("abis", ("arm64-v8a",))),
+                    "keystore": str(seg.get("keystore", "")),
+                    "icon": str(seg.get("icon", "")),
+                    "python_version": str(seg.get("python_version", "")),
+                    "runtime_dir": str(seg.get("runtime_dir", "")),
+                    "watcher": android_watcher}
+        return {"setproctitle": bool(seg.get("setproctitle", True))}
+
     # [build] 段已废除（★v0.7★ 打包布局固化为默认行为）——残留报错（防配置静默失效）
     if "build" in data:
         raise SpecError('[build] 段已废除（v0.7 起打包布局固化：stdlib zip 纯 pyc、'
                         'site-packages 恒只带 .py、app/ 恒保留源码），请从 pkapp.toml 删除该段')
-
-    platform_deps = {p: tuple(str(d) for d in (plat.get(p) or {}).get("dependencies", ()))
-                     for p in known}
-    platform_index = {p: str((plat.get(p) or {}).get("index_url", ""))
-                      for p in known}
-    platform_index = {p: u for p, u in platform_index.items() if u}
-    platform_extra_index = {p: str((plat.get(p) or {}).get("extra_index_url", ""))
-                            for p in known}
-    platform_extra_index = {p: u for p, u in platform_extra_index.items() if u}
 
     spec = AppSpec(
         name=str(app.get("name", "")),
@@ -300,21 +232,10 @@ def load(path: str) -> AppSpec:
         heartbeat_interval=int(heart.get("interval_s", 5)),
         heartbeat_timeout=int(heart.get("timeout_s", 30)),
         cold_start_timeout=int(heart.get("cold_start_timeout_s", 120)),
-        linux_setproctitle=bool(linux.get("setproctitle", True)),
-        android_package=str(android.get("package", "")),
-        android_abis=tuple(android.get("abis", ("arm64-v8a",))),
-        android_keystore=str(android.get("keystore", "")),
-        android_icon=str(android.get("icon", "")),
-        windows_python_version=str(windows.get("python_version", "")),
-        android_python_version=str(android.get("python_version", "")),
-        windows_runtime_dir=str(windows.get("runtime_dir", "")),
-        android_runtime_dir=str(android.get("runtime_dir", "")),
-        platform_deps=platform_deps,
-        platform_icon=str(windows.get("icon", "")),
-        platform_index=platform_index,
-        platform_extra_index=platform_extra_index,
+        windows=_platform("windows"),
+        android=_platform("android"),
+        linux=_platform("linux"),
         network=network,
-        android_watcher=android_watcher,
         raw=data,
     )
     problems = validate(spec)

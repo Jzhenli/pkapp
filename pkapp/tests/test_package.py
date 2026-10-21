@@ -492,7 +492,7 @@ def test_build_arch_override_records_meta(tmp_path, monkeypatch, pkapp_cache):
 
     def fake_build_spk(project, spec, platform, out_path, *,
                        private_key=None, wheels_dir=None):
-        captured["abis"] = spec.android_abis
+        captured["abis"] = spec.android.abis
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with zipfile.ZipFile(out_path, "w") as zf:
             zf.writestr("manifest.json", "{}")

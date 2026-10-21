@@ -459,7 +459,7 @@ def test_resolve_managed_snapshot_contract(pkapp_cache, tmp_path):
     """托管路径：snapshot.toml python_version 与 spec 声明一致性（fetch 产物锁）。"""
     from dataclasses import replace
 
-    from pkapp.appspec import AppSpec
+    from pkapp.appspec import AppSpec, WindowsSpec
     from pkapp.packager.runtime import RuntimeResolveError, resolve
     from pkapp.tools.mockkit import make_mock_runtime
 
@@ -472,7 +472,7 @@ def test_resolve_managed_snapshot_contract(pkapp_cache, tmp_path):
     with pytest.raises(RuntimeResolveError, match="python_version"):
         resolve(spec_of(), "windows")
     # 托管快照缺失 → 指向 fetch
-    s = spec_of(windows_python_version="3.12.14")
+    s = spec_of(windows=WindowsSpec(python_version="3.12.14"))
     with pytest.raises(RuntimeResolveError, match="pkapp fetch windows"):
         resolve(s, "windows")
     # 快照在位 + snapshot.toml 一致 → 过（B.t① 断言同链路）
@@ -494,5 +494,5 @@ def test_resolve_managed_snapshot_contract(pkapp_cache, tmp_path):
     # 逃生门：runtime_dir 显式覆盖（version 仍取声明）
     with open(os.path.join(root, "snapshot.toml"), "w", encoding="utf-8") as f:
         f.write('python_version = "3.11.0"\n')           # 逃生门不读 snapshot
-    s2 = replace(s, windows_runtime_dir=root)
+    s2 = replace(s, windows=replace(s.windows, runtime_dir=root))
     assert resolve(s2, "windows").dir == os.path.abspath(root)

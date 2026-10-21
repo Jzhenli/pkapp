@@ -38,11 +38,10 @@ class RuntimeSnapshot:
 
 def _declared(spec, platform: str) -> tuple[str, str]:
     """(python_version, runtime_dir 覆盖) —— 取自 pkapp.toml 对应平台段。"""
-    if platform == "windows":
-        return spec.windows_python_version, spec.windows_runtime_dir
-    if platform == "android":
-        return spec.android_python_version, spec.android_runtime_dir
-    raise RuntimeResolveError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
+    if platform not in ("windows", "android"):
+        raise RuntimeResolveError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
+    ps = getattr(spec, platform)
+    return ps.python_version, ps.runtime_dir
 
 
 def _snapshot_version(root: str) -> str:

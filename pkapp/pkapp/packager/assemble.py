@@ -187,12 +187,12 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
     必须进 spk（APK 里只放与解释器版本绑定的件）。
     runtime_hash = libpythonbundle.so 的 sha256（标识所针对的运行时 bundle）。
     """
-    if len(spec.android_abis) != 1:
+    if len(spec.android.abis) != 1:
         raise BuildError(
-            f"[platforms.android].abis 须为单 ABI（当前 {list(spec.android_abis)}）："
+            f"[platforms.android].abis 须为单 ABI（当前 {list(spec.android.abis)}）："
             "flet android 解释器的扩展后缀无 ABI 段，双 ABI 的 .so 同名冲突无法共存于"
             "同一 site-packages——一次只打包一种 ABI（多 ABI 分次构建出多个 APK）")
-    snapshot = runtime.resolve(spec, "android", abis=spec.android_abis)
+    snapshot = runtime.resolve(spec, "android", abis=spec.android.abis)
 
     stage = tempfile.mkdtemp(prefix="pkapp-build-android-")
     try:
@@ -203,7 +203,7 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         index_url, extra_index = spec.wheels_index("android")
         sp_dir = _install_site_packages(stage, spec.deps_for("android"),
                                         wheels_dir or _wheels_cache("android",
-                                                                   spec.android_abis[0]),
+                                                                   spec.android.abis[0]),
                                         allow_download=wheels_dir is None,
                                         pip_tags=_android_pip_tags(spec),
                                         index_url=index_url, extra_index_url=extra_index)

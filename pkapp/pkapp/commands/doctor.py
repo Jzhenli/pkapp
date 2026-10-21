@@ -132,7 +132,7 @@ def cmd_doctor(project: str, integrity_dir: str | None = None) -> int:
         al = _venv_applocal_version(project)
         ok = al and not al.startswith("missing")
         if ok:
-            from ..appspec import _ver_tuple
+            from ..appspec._core import _ver_tuple
             ok = _ver_tuple(al) >= _ver_tuple("0.1.0")
         print(f"[doctor] applocal in .venv: {al}（契约层，区间下限随 AppSpec 升级）")
         if not ok:
@@ -235,7 +235,7 @@ def _check_android(spec) -> None:
         print("[doctor] android 工具链缺失——运行 `pkapp fetch android`")
     # android 运行时快照（两 abi 布局断言）
     try:
-        snap = rtmod.resolve(spec, "android", abis=getattr(spec, "android_abis", ("arm64-v8a",)))
+        snap = rtmod.resolve(spec, "android", abis=spec.android.abis)
         print(f"[doctor] runtime.android: {snap.python_version} @ {snap.dir} "
               f"(abis={','.join(snap.abis)})")
     except rtmod.RuntimeResolveError as e:

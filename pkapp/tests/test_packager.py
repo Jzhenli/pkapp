@@ -178,7 +178,7 @@ def test_android_runtime_resolve_negative(project, tmp_path):
     os.remove(os.path.join(bad, "arm64-v8a", "libpythonbundle.so"))
     # 逃生门路径只断言布局（version 取 spec 声明），不依赖托管缓存
     from dataclasses import replace
-    spec_bad = replace(spec, android_runtime_dir=bad)
+    spec_bad = replace(spec, android=replace(spec.android, runtime_dir=bad))
     with pytest.raises(RuntimeResolveError, match="libpythonbundle"):
         resolve(spec_bad, "android")
     make_mock_android_runtime(bad, abis=("arm64-v8a",))

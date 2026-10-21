@@ -124,7 +124,7 @@ def _rcedit_apply(rcedit: str, exe: str, icon: str | None, desc: str, version: s
 def _package_windows(project: str, spec, *, shell: str | None, icon: str | None,
                      desc: str | None, rcedit: str | None, out: str | None) -> int:
     name, version = spec.name, spec.version
-    icon = icon or spec.platform_icon  # --icon 优先；回退 [platforms.windows].icon
+    icon = icon or spec.windows.icon  # --icon 优先；回退 [platforms.windows].icon
     if icon and not os.path.isfile(os.path.join(project, icon) if not os.path.isabs(icon) else icon):
         print(f"[package] 图标文件不存在: {icon}（[platforms.windows].icon / --icon）")
         return 2

@@ -76,7 +76,8 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
         print(f"[build] AppSpec 错误: {e}")
         return 2
     if abi:
-        spec = dataclasses.replace(spec, android_abis=(abi,))
+        spec = dataclasses.replace(
+            spec, android=dataclasses.replace(spec.android, abis=(abi,)))
 
     private_key = None
     if not unsigned:
@@ -94,7 +95,7 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
             print(f"[build] 公钥(hex) {pub}")
 
     _seed_vendored_wheel(platform,
-                         spec.android_abis if platform == "android" else ())
+                         spec.android.abis if platform == "android" else ())
 
     out_dir = os.path.join(project, "build", f"platform-{platform}")
     out_path = os.path.join(out_dir, "runtime.spk")
@@ -129,10 +130,10 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
         # spk_sha256 = 写盘后 runtime.spk 的文件级 sha256（≠ manifest 层 fields
         # ["spk_hash"]）——package 据此做字节级配对闸门，spk 被替换即拦下
         atomic_write(os.path.join(out_dir, "build-meta.json"), json.dumps(
-            {"abis": list(spec.android_abis),
+            {"abis": list(spec.android.abis),
              "spk_sha256": "sha256:" + sha256_file(out_path)},
             ensure_ascii=False).encode("utf-8"))
-        print(f"[build] build-meta.json: abis={list(spec.android_abis)}")
+        print(f"[build] build-meta.json: abis={list(spec.android.abis)}")
     return 0
 
 

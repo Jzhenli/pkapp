@@ -281,7 +281,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
     # ABI 决策链：build-meta.json（最后一次 build 记录）> TOML（旧构建兼容）。
     # spk 按单 ABI 装配（assemble 既定约束）——package 的 ABI 必须跟随"最后一次
     # build"而非 TOML 当前值，否则产生壳/包 ABI 错配的静默坏包（dlopen 才炸）
-    abis = spec.android_abis
+    abis = spec.android.abis
     meta_path = os.path.join(spk_dir, "build-meta.json")
     if os.path.isfile(meta_path):
         try:
@@ -308,19 +308,19 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
               f"重新 pkapp build android --arch {assert_arch}")
         return 2
     icon = ""
-    if spec.android_icon:
-        icon = spec.android_icon if os.path.isabs(spec.android_icon) else os.path.join(
-            os.path.abspath(project), spec.android_icon)
+    if spec.android.icon:
+        icon = spec.android.icon if os.path.isabs(spec.android.icon) else os.path.join(
+            os.path.abspath(project), spec.android.icon)
         if not os.path.isfile(icon):
-            print(f"[package] 图标文件不存在: {spec.android_icon}（[platforms.android].icon）")
+            print(f"[package] 图标文件不存在: {spec.android.icon}（[platforms.android].icon）")
             return 2
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
     # keystore 链（★v1.2★）：PKAPP_KEYSTORE env > TOML [platforms.android].keystore
     #（相对项目根）；密码/别名只走 env（PKAPP_KEYSTORE_PASS / _ALIAS），永不入 AppSpec
     keystore = os.environ.get("PKAPP_KEYSTORE") or ""
-    if not keystore and spec.android_keystore:
+    if not keystore and spec.android.keystore:
         keystore = os.path.normpath(os.path.join(
-            os.path.abspath(project), spec.android_keystore))
+            os.path.abspath(project), spec.android.keystore))
     keystore_pass = os.environ.get("PKAPP_KEYSTORE_PASS") or ""
     keystore_alias = os.environ.get("PKAPP_KEYSTORE_ALIAS") or "pkapp"
     # android 运行时快照 = 壳模板注入的数据源；解析失败降级 None（上方已透出原因），
@@ -354,7 +354,7 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
     try:
         apk_path = build_apk(project, spec.name, spk, shell_dir=shell_dir,
                              out_dir=out_dir, variant=variant,
-                             app_id=spec.android_package,
+                             app_id=spec.android.package,
                              version=spec.version, abis=abis,
                              keystore=keystore, keystore_pass=keystore_pass,
                              keystore_alias=keystore_alias, icon=icon,

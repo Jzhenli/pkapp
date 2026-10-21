@@ -54,15 +54,15 @@ def test_platform_deps_merge(tmp_path):
     assert spec.deps_for("windows") == ("applocal>=0.1.0", "uvicorn>=0.30", "pywin32>=306")
     assert spec.deps_for("linux") == ("applocal>=0.1.0", "uvicorn>=0.30")  # 平台隔离
     assert spec.all_platform_deps() == ("applocal>=0.1.0", "uvicorn>=0.30", "pywin32>=306")
-    assert spec.platform_icon == "assets/app.ico"
+    assert spec.windows.icon == "assets/app.ico"
 
 
 def test_platform_python_version_parse(tmp_path):
     """[platforms.*].python_version 解析（★fetch★ 运行时意图声明）。"""
     root = _make(tmp_path, "n4b")
     spec = load(os.path.join(root, "pkapp.toml"))
-    assert spec.windows_python_version == "3.12.14"
-    assert spec.android_python_version == "3.12.14"
+    assert spec.windows.python_version == "3.12.14"
+    assert spec.android.python_version == "3.12.14"
 
 
 def test_platform_python_version_bad_format(tmp_path):
@@ -138,7 +138,7 @@ def test_network_port_bad_int(tmp_path):
 def test_android_package_parse_and_format(tmp_path):
     """[platforms.android].package：create 预填 com.example.<name>；解析 + 反向域名格式校验。"""
     root = _make(tmp_path, "n11")     # 模板已预填，零配置即合法
-    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.n11"
+    assert load(os.path.join(root, "pkapp.toml")).android.package == "com.example.n11"
     root2 = _make(tmp_path, "n12", **{
         'package = "com.example.n12"': 'package = "bad..id"',
     })
@@ -149,7 +149,7 @@ def test_android_package_parse_and_format(tmp_path):
 def test_android_package_prefill_sanitized(tmp_path):
     """create 预填净化：项目名含 - → package 段转 _，仍满足反向域名（零手工修正）。"""
     root = _make(tmp_path, "my-app")
-    assert load(os.path.join(root, "pkapp.toml")).android_package == "com.example.my_app"
+    assert load(os.path.join(root, "pkapp.toml")).android.package == "com.example.my_app"
 
 
 def test_android_keystore_parse(tmp_path):
@@ -157,7 +157,7 @@ def test_android_keystore_parse(tmp_path):
     root = _make(tmp_path, "n13", **{
         '# keystore = "signing/release.keystore"': 'keystore = "signing/release.keystore"',
     })
-    assert load(os.path.join(root, "pkapp.toml")).android_keystore == \
+    assert load(os.path.join(root, "pkapp.toml")).android.keystore == \
         "signing/release.keystore"
 
 
@@ -166,7 +166,7 @@ def test_android_icon_parse(tmp_path):
     root = _make(tmp_path, "n14", **{
         '# icon = "icons/android/xplay.png"': 'icon = "icons/android/xplay.png"',
     })
-    assert load(os.path.join(root, "pkapp.toml")).android_icon == \
+    assert load(os.path.join(root, "pkapp.toml")).android.icon == \
         "icons/android/xplay.png"
 
 

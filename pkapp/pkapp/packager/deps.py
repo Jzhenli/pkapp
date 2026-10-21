@@ -174,11 +174,11 @@ def _android_pip_tags(spec: AppSpec) -> list[str]:
     平台标签 android_24_<abi> 为 flet 索引约定（pypi.flet.dev wheel 文件名
     cp312-cp312-android_24_*；py-android 运行时同出自 flet python-build，自洽）。
     """
-    ver = spec.android_python_version or "3.12.14"
+    ver = spec.android.python_version or "3.12.14"
     short = ver.rsplit(".", 1)[0]                     # 3.12.14 → 3.12
     tags = ["--only-binary=:all:", "--python-version", short,
             "--implementation", "cp", "--abi", "cp" + short.replace(".", "")]
-    for abi in spec.android_abis:
+    for abi in spec.android.abis:
         # ABI 名（NDK 约定，连字符 arm64-v8a）→ wheel 平台标签（下划线 arm64_v8a）
         tags += ["--platform", "android_24_" + abi.replace("-", "_")]
     return tags
