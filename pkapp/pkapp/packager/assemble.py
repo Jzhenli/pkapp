@@ -75,8 +75,14 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         #    编译走独立暂存副本（stage 外，免被 tree_hash/check_closure 扫入），不改快照本体。
         _snapshot_exe = os.path.join(snapshot.dir, "python.exe")
         shutil.copytree(os.path.join(snapshot.dir, "Lib"), lib_work,
-                        ignore=shutil.ignore_patterns("site-packages", "test",
-                                                      "tests", "__pycache__"),
+                        ignore=shutil.ignore_patterns(
+                            "site-packages", "test", "tests", "__pycache__",
+                            # 保守档精简（flet python-build 同款共识死重）：
+                            # 工具链自举/开发工具/彩蛋——正常业务代码物理上不 import
+                            "ensurepip", "idlelib", "pydoc_data", "lib2to3",
+                            "turtledemo", "rlcompleter.py", "tabnanny.py",
+                            "antigravity.py", "this.py", "__hello__.py",
+                            "__phello__"),
                         dirs_exist_ok=True)  # mkdtemp 已建空目录
         _compile_checked_hash(lib_work, _snapshot_exe, snapshot.python_dll,
                               unchecked=True)
@@ -84,9 +90,12 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
                  pyc_tag="cpython-" +
                          "".join(c for c in snapshot.python_dll if c.isdigit()))
         # 3) DLLs/（.pyd + 传递原生依赖整体拷入；闭包自检见 step 7 之后——app/ 落盘
-        #    后统一扫描，扫描域含 app/（Q5），行为不变仅时序后移）
+        #    后统一扫描，扫描域含 app/（Q5），行为不变仅时序后移）。
+        #    保守档精简：CPython 测试专用扩展（仅被已裁的 Lib/test 引用）
         shutil.copytree(os.path.join(snapshot.dir, "DLLs"),
-                        os.path.join(stage, "DLLs"))
+                        os.path.join(stage, "DLLs"),
+                        ignore=shutil.ignore_patterns(
+                            "_test*.pyd", "_ctypes_test*.pyd"))
         # 4) _pth 由 5b 收拢函数生成（★P0 §4.1★：path 收窄 + 无 import site，随
         #    散件目录清单动态派生——先于收拢写死会与收拢结果脱钩）
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）

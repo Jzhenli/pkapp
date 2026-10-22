@@ -75,6 +75,52 @@ def test_managed_wheels_cache(project, wheels_dir, tmp_path, mock_runtime):
     assert open(out, "rb").read() == open(out2, "rb").read()
 
 
+def test_conservative_trim_anchor(project, wheels_dir, tmp_path, mock_runtime):
+    """保守档精简回归锚（flet python-build 对齐）：工具链自举（ensurepip）/
+    开发玩具（idlelib/turtledemo/彩蛋）/测试扩展（_test*.pyd）不进 spk。
+    mock 快照注入可裁件后构建，断言零残留——防止未来重构静默丢失 ignore
+    清单；同时断言正常 stdlib（os/json）与扩展（_ssl.pyd）保留（防误裁）。"""
+    lib = os.path.join(mock_runtime, "Lib")
+    for sub in ("ensurepip", "idlelib", "pydoc_data", "lib2to3",
+                "turtledemo", "__phello__"):
+        os.makedirs(os.path.join(lib, sub), exist_ok=True)
+        with open(os.path.join(lib, sub, "__init__.py"), "w") as f:
+            f.write("x = 1\n")
+    for fn in ("this.py", "rlcompleter.py", "tabnanny.py",
+               "antigravity.py", "__hello__.py"):
+        with open(os.path.join(lib, fn), "w") as f:
+            f.write("x = 1\n")
+    for fn in ("_testcapi.pyd", "_ctypes_test.pyd"):
+        with open(os.path.join(mock_runtime, "DLLs", fn), "wb") as f:
+            f.write(b"fake-pe")            # 裁除发生在 copytree，闭包扫描不触及
+
+    out = str(tmp_path / "trim.spk")
+    _build(project, wheels_dir, out)
+
+    banned_dirs = {"ensurepip", "idlelib", "pydoc_data", "lib2to3",
+                   "turtledemo", "__phello__"}
+    banned_stems = {"this", "rlcompleter", "tabnanny",
+                    "antigravity", "__hello__"}
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        # DLLs：测试扩展裁除（限定 DLLs/ 域——"_test" 子串断言扫全 spk 会误伤
+        # 未来 fixture 里 app/ 或 site-packages 的同名件）、正常扩展保留
+        assert not [n for n in names
+                    if n.startswith("DLLs/") and "_test" in os.path.basename(n)]
+        assert any(n.endswith("DLLs/_ssl.pyd") for n in names)
+        # stdlib zip：可裁件零残留（pyc/.py 双形态都拦）
+        import io
+        with zipfile.ZipFile(io.BytesIO(zf.read("python312.zip"))) as zz:
+            znames = zz.namelist()
+        for n in znames:
+            assert n.split("/")[0] not in banned_dirs, f"精简件残留: {n}"
+            stem = os.path.basename(n).rsplit(".", 1)[0]
+            assert stem not in banned_stems, f"精简件残留: {n}"
+        # 保留件在场（防止 ignore 清单误伤正常 stdlib）
+        assert any(n in ("os.pyc", "os.py") for n in znames)
+        assert any(n.startswith("json/") for n in znames)
+
+
 def test_uncached_deps_version_aware(tmp_path):
     """★v1.4★ 全局缓存跨项目共享 → 名字+精确版本匹配：同名旧版本不得误判已缓存。"""
     wd = str(tmp_path / "w")
