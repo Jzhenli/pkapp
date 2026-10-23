@@ -131,18 +131,23 @@ def test_bind_socket_strict_raises_when_busy(env):
 
 def test_bind_socket_reuseaddr_posix_only(env):
     """★v1.2★ SO_REUSEADDR 仅 POSIX：TIME_WAIT 残留卡重绑（安卓实测必现）；
-    Windows 语义排他故不设。活监听者互斥不受影响（strict 用例覆盖）。"""
+    Windows 语义排他故不设。活监听者互斥不受影响（strict 用例覆盖）。
+
+    ★M3 修正★：原实现先 close 再 getsockname（POSIX → EBADF，Windows 下侥幸
+    可用故从未暴露）；且对无监听端口 connect 得 RST 不产生 TIME_WAIT——
+    改为服务端 accept 后主动关（TIME_WAIT 挂监听口），close 前取 port。"""
     if sys.platform == "win32":
         pytest.skip("POSIX-only semantics")
     s = _core._bind_socket(0, "127.0.0.1")
     assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 1
+    port = s.getsockname()[1]                                      # close 前取（close 后 → EBADF）
+    s.listen(1)
+    c = socket.socket(); c.connect(("127.0.0.1", port))
+    conn, _ = s.accept()
+    conn.close()                                                   # 服务端主动关 → TIME_WAIT 残留监听口
+    c.close()
     s.close()
-    # TIME_WAIT 模拟：绑定→监听→主动连接→关闭后立即重绑同端口
-    port = s.getsockname()[1]
-    c = socket.socket(); c.connect(("127.0.0.1", port)); c.close()  # 死连接 → TIME_WAIT
-    s.close()
-    time.sleep(0.3)
-    s2 = _core._bind_socket(port, "127.0.0.1", strict=True)         # 无 REUSEADDR 会 EADDRINUSE
+    s2 = _core._bind_socket(port, "127.0.0.1", strict=True)        # 无 REUSEADDR 会 EADDRINUSE
     s2.close()
 
 
@@ -509,13 +514,21 @@ def test_handshake_remove_failure_still_ok(env):
     hs.parent.mkdir(parents=True, exist_ok=True)
     hs.write_text("CODE", encoding="utf-8")
     app = applocal.build_asgi_app(_ok_app, _cfg(env, strict=True, handshake=hs))
-    os.chmod(hs, 0o444)                                              # 只读 → os.remove 必失败
+    # 制造 remove 失败：Windows 只读文件位；POSIX 文件只读仍可 unlink（目录权限
+    # 才管 unlink）→ 改只读父目录。两平台殊途同归：删失败不得 500。
+    if sys.platform == "win32":
+        os.chmod(hs, 0o444)
+    else:
+        os.chmod(hs.parent, 0o555)
     try:
         status, body, _ = _run(app, "POST", "/auth",
                                body=json.dumps({"handshake": "CODE"}).encode())
         assert status == 200 and json.loads(body)["token"] == "T" * 32  # 码已校验通过，删除失败不得 500
     finally:
-        os.chmod(hs, 0o644)
+        if sys.platform == "win32":
+            os.chmod(hs, 0o644)
+        else:
+            os.chmod(hs.parent, 0o755)
 
 
 def test_auth_body_limit(env):
@@ -676,3 +689,60 @@ def test_bootstrap_missing_uvicorn_writes_diag(env, monkeypatch):
         applocal.bootstrap("app.main:app")
     d = applocal.read_diag()
     assert "uvicorn" in d["error"] and d["recoverable"] is False       # 错误页有因可查（§6）
+
+
+def test_bootstrap_linux_proctitle_takes_appname_env(env, monkeypatch):
+    """★M3 §4.5★进程标识：标题 = 应用名，主通道 = MYAPP_APPNAME（launcher 注入
+    g_appname，与 staging 同名）。 ._pth 隔离态 sys.executable 为空（部署 rename
+    探针实证，"阶段 0 实证"在该形态不成立）→ env 主通道绝不落常量 "myapp"。"""
+    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
+    monkeypatch.setenv("MYAPP_APPNAME", "hiapp")
+    captured = {}
+
+    class _FakeSPT:
+        @staticmethod
+        def setproctitle(name):
+            captured.setdefault("title", name)
+
+    monkeypatch.setitem(sys.modules, "setproctitle", _FakeSPT)
+    monkeypatch.setattr(sys, "executable", "")          # ._pth 隔离态实证形态（空）
+    _prep_entry(env)
+    _fake_uvicorn(monkeypatch, captured)
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    applocal.bootstrap("app.main:app")
+    assert captured["title"] == "hiapp"                 # MYAPP_APPNAME 主通道，非常量
+
+
+def test_bootstrap_linux_proctitle_fallback_executable(env, monkeypatch):
+    """dev 契约（无 MYAPP_APPNAME，windows/旧 launcher）→ sys.executable basename
+    兜底（非 ._pth 态）；仍非 myapp 命名成立（§9#6，硬编码回归）。"""
+    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
+    monkeypatch.delenv("MYAPP_APPNAME", raising=False)
+    captured = {}
+
+    class _FakeSPT:
+        @staticmethod
+        def setproctitle(name):
+            captured.setdefault("title", name)
+
+    monkeypatch.setitem(sys.modules, "setproctitle", _FakeSPT)
+    monkeypatch.setattr(sys, "executable", "/opt/hiapp/hiapp")   # 非 myapp 命名
+    _prep_entry(env)
+    _fake_uvicorn(monkeypatch, captured)
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    applocal.bootstrap("app.main:app")
+    assert captured["title"] == "hiapp"                 # sys.executable 兜底，非常量
+
+
+def test_bootstrap_linux_proctitle_missing_wheel_silent(env, monkeypatch):
+    """setproctitle 未装入（[platforms.linux].setproctitle=false 不追加依赖，B.y）
+    → ImportError 静默跳过，引导零扰动。"""
+    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
+    monkeypatch.setitem(sys.modules, "setproctitle", None)            # import → ImportError
+    _prep_entry(env)
+    _fake_uvicorn(monkeypatch, {})
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    applocal.bootstrap("app.main:app")                                # 不抛 = 静默跳过

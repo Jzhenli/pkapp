@@ -95,7 +95,11 @@ size_t manifest_canonical(const char *text, size_t text_len, char *out) {
     return (size_t)(w - out);
 }
 
-static int hex_to_bytes(const char *hex, uint8_t *out, size_t outlen) {
+/* ★R-L9 防折叠★ 参数取 const volatile：kPubHex 是"可被 packager 补丁在位改写"
+   的常量（_patch_shell_pubkey 字节等长替换）——gcc -O2 会把 static const 串的
+   hex 解析首迭代折叠成立即数（实测 mov $0x37,%eax），补丁改串后验签仍用旧首
+   字节 → 验签恒败。volatile 强制逐字节真读内存，公钥恒出自唯一 64-hex 常量段。 */
+static int hex_to_bytes(const volatile char *hex, uint8_t *out, size_t outlen) {
     size_t i;
     for (i = 0; i < outlen; i++) {
         int hi, lo;

@@ -69,7 +69,7 @@
 static char g_exe[PATH_MAX];        /* realpath(/proc/self/exe)（R-L10） */
 static char g_install[PATH_MAX];    /* launcher 所在目录 = 部署目录 */
 static char g_runtime[PATH_MAX];    /* <install>/_runtime（解包展开区/受保护树） */
-static char g_spk[PATH_MAX];        /* <install>/runtime.spk */
+static char g_spk[PATH_MAX];        /* <install>/<appname>.spk（M3 部署合同，exe 同名派生） */
 static char g_side_m[PATH_MAX];     /* <install>/integrity.manifest（Q7 同级） */
 static char g_side_s[PATH_MAX];     /* <install>/integrity.manifest.sig */
 static char g_data[PATH_MAX];       /* 数据区（D-9: StateDirectory 或 XDG） */
@@ -85,9 +85,14 @@ static char g_appname[128];         /* launcher 文件名 = 进程标识（§4.5
 
 /* ================= 基础工具 ================= */
 
+/* <appname><ext> 派生名单源（部署合同：spk/._pth/.service 均与 launcher 同名） */
+static void app_derived(char *out, size_t cap, const char *ext) {
+    snprintf(out, cap, "%s%s", g_appname, ext);
+}
+
 static void slog(const char *fmt, ...) {
     va_list ap;
-    fputs("[myapp] ", stderr);
+    fprintf(stderr, "[%s] ", g_appname[0] ? g_appname : "pkapp");  /* g_appname 赋值前早期路径兜底 */
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -308,7 +313,10 @@ static int setup_paths(void) {
     snprintf(g_install, sizeof(g_install), "%s", dn);
 
     path_join(g_runtime, sizeof(g_runtime), g_install, "_runtime");
-    path_join(g_spk, sizeof(g_spk), g_install, "runtime.spk");
+    /* spk 名 = launcher 同名 .spk（M3 部署合同；windows 壳 exe 同名派生同源） */
+    char spk_name[160];
+    app_derived(spk_name, sizeof(spk_name), ".spk");
+    path_join(g_spk, sizeof(g_spk), g_install, spk_name);
     path_join(g_side_m, sizeof(g_side_m), g_install, INTEGRITY_SIDECAR_NAME);
     path_join(g_side_s, sizeof(g_side_s), g_install, INTEGRITY_SIDECAR_SIG);
     path_join(g_runtime_version, sizeof(g_runtime_version), g_runtime, "runtime.version");
@@ -1335,17 +1343,16 @@ static int check_install_dir_clean(char *err, size_t cap) {
         if (S_ISDIR(st.st_mode)) {
             allowed = strncmp(e->d_name, "_runtime", 8) == 0;   /* 展开/中转区 */
         } else {
+            char svc_name[160], pth_name[160], spk_name[160];
+            app_derived(spk_name, sizeof(spk_name), ".spk");      /* 与 setup_paths 同一派生源 */
+            app_derived(svc_name, sizeof(svc_name), ".service");
+            app_derived(pth_name, sizeof(pth_name), "._pth");
             allowed = strcmp(e->d_name, g_appname) == 0 ||
-                      strcmp(e->d_name, "runtime.spk") == 0 ||
+                      strcmp(e->d_name, spk_name) == 0 ||
                       strcmp(e->d_name, INTEGRITY_SIDECAR_NAME) == 0 ||
-                      strcmp(e->d_name, INTEGRITY_SIDECAR_SIG) == 0;
-            {
-                char svc_name[160], pth_name[160];
-                snprintf(svc_name, sizeof(svc_name), "%s.service", g_appname);
-                snprintf(pth_name, sizeof(pth_name), "%s._pth", g_appname);
-                if (strcmp(e->d_name, svc_name) == 0 ||
-                    strcmp(e->d_name, pth_name) == 0) allowed = 1;
-            }
+                      strcmp(e->d_name, INTEGRITY_SIDECAR_SIG) == 0 ||
+                      strcmp(e->d_name, svc_name) == 0 ||
+                      strcmp(e->d_name, pth_name) == 0;
             if (!allowed) {
                 /* M2：侧车自愈 atomic_write 中断残件 → 放行并顺手清理（防洁净门
                    自锁：一次 SIGKILL 即永久 fail-closed）；unlink 不跟链，无越界面 */
@@ -1519,6 +1526,7 @@ static int run_shell(void) {
     {
         char purge[16];
         setenv("MYAPP_PLATFORM", "linux", 1);
+        setenv("MYAPP_APPNAME", g_appname, 1);   /* 应用名（§4.5 进程标题主通道） */
         setenv("MYAPP_DATA_DIR", g_data, 1);
         setenv("MYAPP_CACHE_DIR", g_cache, 1);
         setenv("MYAPP_LOG_DIR", g_logdir, 1);

@@ -1,6 +1,8 @@
 name: ci
 # 工具 CI 骨架（方案 §十一.9）：applocal 契约测试 + pkapp golden test。
-# 占位（随 M1 推进补齐）：示例回归（示例项目一键构建冒烟）、strict-auth 冒烟（§4.3）。
+# ★M3 阶段 3★ 增 shell-linux job：Linux host 全链预验（launcher 双构建 → 契约
+# harness → applocal/pkapp 契约面）。占位（随 M1 推进补齐）：示例回归（示例项目
+# 一键构建冒烟）、strict-auth 冒烟（§4.3）。
 on:
   push:
     branches: [main, master]
@@ -11,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest]        # 自用主开发环境；后续可加 ubuntu
+        os: [windows-latest]        # 自用主开发环境；linux 契约面走 shell-linux job
         python: ["3.12"]            # 工具链测试绑定 3.12 语义（golden mock python312.dll、
                                     # 加密链 pyc tag 锁 3.12——设计 §3"项目锁定 CPython 3.12"）
     runs-on: ${{ matrix.os }}
@@ -34,3 +36,45 @@ jobs:
         run: python -m pytest applocal/tests -q
       - name: pkapp 工具测试（含 golden G1-G7，mock runtime）
         run: python -m pytest pkapp/tests -q
+
+  shell-linux:
+    # ★M3 阶段 3★ Linux host 全链预验：
+    #   1) launcher 双构建——默认公钥锚件（R-L9 实物断言载体）+ 项目钥配对件；
+    #   2) 契约/golden harness（spk→env→bootstrap→healthz→sigkill 全链，§11 ①-⑨）；
+    #   3) applocal 套件 Linux host 口径（POSIX 宿主假设用例随 M3 落地）；
+    #   4) pkapp 契约面（manifest 契约 + env 对账锚 + R-L9 公钥补丁断言）。
+    # PBS pin 与 release.yml launcher job 同源（cpython-3.12.14+20260929）。
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + editable applocal/pkapp
+        run: |
+          python -m pip install -q pytest cryptography
+          python -m pip install -q -e applocal -e pkapp
+      - name: Fetch PBS headers (release.yml 同源 pin)
+        run: |
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
+          echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
+      - name: Pair keygen（.pkapp/sign.key → 公钥配对构建用）
+        run: >
+          echo "HPUB=$(python -c "from pkapp.packager import sign;
+          print(sign.generate_keypair('.pkapp')[1])")" >> "$GITHUB_ENV"
+      - name: Dual-build launcher（默认公钥锚件 myapp-default + 配对件 myapp）
+        working-directory: shell-linux
+        shell: bash
+        run: |
+          ./build.sh myapp-default "" "$PYINC"
+          ./build.sh myapp "$HPUB" "$PYINC"
+          ./build/myapp --selftest
+      - name: shell-linux 契约/golden harness（16 例）
+        run: python -m pytest shell-linux/tests -q
+      - name: applocal 契约测试（Linux host 口径）
+        run: python -m pytest applocal/tests -q
+      - name: pkapp 契约面（manifest 契约 + env 对账锚 + R-L9 补丁断言）
+        run: python -m pytest pkapp/tests/test_manifest_contract.py pkapp/tests/test_release_vendor.py -q

@@ -554,7 +554,13 @@ def test_package_linux_requires_spk(tmp_path, capsys):
 
 
 def test_package_linux_no_launcher_hardfail(tmp_path, capsys, monkeypatch):
-    """R-L19 双保险：launcher ELF 不可得 → 硬失败拒出包（绝不静默产出无壳 tar.gz）。"""
+    """R-L19 双保险：launcher ELF 不可得 → 硬失败拒出包（绝不静默产出无壳 tar.gz）。
+
+    ★M3 修正★finder 返回 None 直接钉死——原用例依赖"仓库无 shell-linux/build/myapp"
+    的环境偶然（本地 WSL 构建 / CI vendor 落位后该前提即破）；finder 各分支解析
+    另有 test_find_launcher_linux_resolution 覆盖。"""
+    import pkapp.packager.linshell as linshell
+    monkeypatch.setattr(linshell, "_find_launcher_linux", lambda *a, **k: (None, False))
     proj = _make_project(tmp_path)
     _write_spk(proj, "linux")
     assert main(["package", "linux", "--project", proj]) == 2
@@ -562,6 +568,25 @@ def test_package_linux_no_launcher_hardfail(tmp_path, capsys, monkeypatch):
     assert "未找到 launcher ELF" in out
     assert "拒绝出包" in out
     assert not os.path.isdir(os.path.join(proj, "release"))
+
+
+def test_find_launcher_linux_resolution(tmp_path, monkeypatch):
+    """_find_launcher_linux 解析序：explicit > PKAPP_SHELL_ELF > 开发壳 >
+    包内置 vendor；explicit 缺文件不静默回退；全链未命中 → (None, False)
+    （R-L19 前提）。返回 (launcher, patchable)：explicit/env = 模式 B 用户管件
+    （不补丁），开发壳/vendor = 模式 A 分发件（补丁）——winshell._find_shell 同口径。"""
+    import pkapp.packager.linshell as linshell
+    elf = tmp_path / "launcher"
+    elf.write_bytes(b"\x7fELF")
+    assert linshell._find_launcher_linux(str(elf), "x86_64", "myapp") == (str(elf), False)
+    assert linshell._find_launcher_linux(str(tmp_path / "nope"), "x86_64", "myapp") == (None, False)
+    monkeypatch.setenv("PKAPP_SHELL_ELF", str(elf))
+    assert linshell._find_launcher_linux(None, "x86_64", "myapp") == (str(elf), False)
+    monkeypatch.setenv("PKAPP_SHELL_ELF", str(tmp_path / "nope"))
+    assert linshell._find_launcher_linux(None, "x86_64", "myapp") == (None, False)  # env 缺文件硬失败不落穿
+    monkeypatch.delenv("PKAPP_SHELL_ELF", raising=False)
+    monkeypatch.setattr("pkapp.vendor.launcher_elf", lambda a, n: None)
+    assert linshell._find_launcher_linux(None, "x86_64", "zz-no-such-shell") == (None, False)
 
 
 def _fake_launcher(tmp_path, pub_hex: str) -> str:
@@ -593,7 +618,9 @@ def _make_signed_spk(proj, platform, key):
 
 def test_package_linux_golden(tmp_path, capsys, monkeypatch):
     """★M3★ linux tar.gz golden：成员/权限/._pth 四行（D-5）/.service（D-1+D-6）/
-    公钥补丁命中（出厂锚→项目 pub）/侧车随包（D-4）/staging 焚毁/arch 产物名。"""
+    公钥补丁命中（出厂锚→项目 pub）/侧车随包（D-4）/staging 焚毁/arch 产物名。
+    模式 A 路径（finder 返回出厂锚件）——补丁逻辑主锚；模式 B 显式件见
+    test_package_linux_modeb_skips_patch。"""
     import tarfile
     from pkapp.packager import sign as sign_mod
     from pkapp.packager import linshell, winshell
@@ -603,9 +630,11 @@ def test_package_linux_golden(tmp_path, capsys, monkeypatch):
     pub = sign_mod.public_key_hex(key)
     _make_signed_spk(proj, "linux", key)
     launcher = _fake_launcher(tmp_path, winshell._SHELL_DEFAULT_PUB)
+    monkeypatch.setattr(linshell, "_find_launcher_linux",
+                        lambda *a, **k: (launcher, True))   # 模式 A：开发壳/厂商件
     monkeypatch.setattr(linshell, "_shell_accepts", lambda *a, **k: (True, ""))
 
-    assert main(["package", "linux", "--project", proj, "--shell", launcher]) == 0
+    assert main(["package", "linux", "--project", proj]) == 0
     out = capsys.readouterr().out
     assert "公钥已配对项目密钥" in out
     tar_path = os.path.join(proj, "release", "myapp-0.1.0-linux-x86_64.tar.gz")
@@ -643,3 +672,30 @@ def test_package_linux_gate_rejects_unpaired(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "配对自检失败" in out
     assert os.path.isdir(os.path.join(proj, "build", "staging-linux"))
+
+
+def test_package_linux_modeb_skips_patch(tmp_path, capsys, monkeypatch):
+    """模式 B（显式 --shell 配对件，公钥编译期自定）：公钥补丁跳过不阻断，
+    配对自检兜底通过 → 正常出货（真实验证场景锚：build.sh <AppName> <pub> 件）。"""
+    import tarfile
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import linshell
+
+    proj = _make_project(tmp_path)
+    key = sign_mod.generate_keypair(os.path.join(proj, ".pkapp"))[0]
+    pub = sign_mod.public_key_hex(key)
+    _make_signed_spk(proj, "linux", key)
+    # 伪件内嵌项目 pub（64-hex 唯一段、无出厂锚——模式 B 形态）
+    paired = str(tmp_path / "paired-launcher")
+    with open(paired, "wb") as f:
+        f.write(b"\x7fELF-payload-" + pub.encode("ascii") + b"-tail")
+    monkeypatch.setattr(linshell, "_shell_accepts", lambda *a, **k: (True, ""))
+
+    assert main(["package", "linux", "--project", proj, "--shell", paired]) == 0
+    out = capsys.readouterr().out
+    assert "模式 B" in out and "补丁跳过" in out
+    assert "公钥已配对" not in out                          # 未走补丁
+    tar_path = os.path.join(proj, "release", "myapp-0.1.0-linux-x86_64.tar.gz")
+    with tarfile.open(tar_path) as tf:
+        elf = tf.extractfile("myapp/myapp").read()
+    assert pub.encode("ascii") in elf                       # 内嵌公钥原样保留

@@ -31,7 +31,9 @@ static int hex_nibble(char c) {
     return -1;
 }
 
-static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
+/* ★R-L9 防折叠★ 同 manifest.c hex_to_bytes：公钥是可补丁常量，volatile 禁止
+   编译器按编译期值折叠（gcc -O2 实测会把首字符烧成立即数）。 */
+static int hex_to_bytes32(const volatile char *hex, uint8_t out[32]) {
     for (int i = 0; i < 32; i++) {
         int hi = hex_nibble(hex[2 * i]);
         int lo = hex_nibble(hex[2 * i + 1]);

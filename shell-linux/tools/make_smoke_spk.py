@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""阶段 1 冒烟包构建：最小 linux runtime.spk（真实 Ed25519 签名）。
+"""阶段 1 冒烟包构建：最小 linux <appname>.spk（真实 Ed25519 签名）。
 
 用法（WSL 内 python3）：python3 make_smoke_spk.py [--encrypted]
   默认非加密（子项 ① 基线路径）；
@@ -9,7 +9,7 @@
 
 在 WSL 内运行（python3）。产出部署树（默认 ~/work/smoke/myapp/）：
   myapp                     ← launcher（run_smoke.sh 拷入）
-  runtime.spk               ← 本脚本产出
+  myapp.spk                 ← 本脚本产出（M3 部署合同：spk 名 = launcher 同名）
   integrity.manifest(.sig)  ← 侧车（package 期落 exe 旁的冒烟等价物）
   myapp._pth                ← run_smoke.sh 写入（D-5: launcher 目录同名 ._pth）
 
@@ -230,7 +230,7 @@ def main() -> int:
                          key=lambda e: e[0].encode("utf-8"))
 
     os.makedirs(OUT, exist_ok=True)
-    spk_path = os.path.join(OUT, "runtime.spk")
+    spk_path = os.path.join(OUT, "myapp.spk")   # M3 部署合同：spk 名 = launcher 同名
     spk.write_spk(spk_path, all_entries)
 
     # 侧车落 exe 旁（package 期等价物，Q7）

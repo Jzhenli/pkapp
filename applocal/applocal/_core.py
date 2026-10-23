@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import glob
 import hmac
 import importlib
 import inspect
@@ -541,8 +540,15 @@ def bootstrap(entry: str = "app.main:app") -> int:
     _audit.report_integrity_purge()                # ★P0★ Q8：native 侧 purge 事实补落库
     rt = cfg.runtime
     if rt.platform == "linux":                     # 步骤 0（§4.2：仅 Linux）
-        set_process_title("myapp")
-    sys.argv = [os.path.basename(sys.executable) or "myapp"]  # 步骤 0′（R25 嵌入态修正）
+        # ★M3 §4.5★标题 = 应用名：主通道 = MYAPP_APPNAME（launcher 注入 g_appname）。
+        #  ._pth 隔离态 sys.executable 为空（部署 rename 探针实证，"阶段 0 实证
+        # sys.executable 即 launcher 路径"在该形态不成立）→ 仅作 dev 契约兜底；
+        # ps/top 与 systemctl 三处一致（§9#6）；setproctitle 未装入
+        # （[platforms.linux].setproctitle=false 不追加依赖，assemble B.y）→ 静默跳过
+        set_process_title(rt.appname
+                          or os.path.basename(sys.executable) or "myapp")
+    sys.argv = [rt.appname
+                or os.path.basename(sys.executable) or "myapp"]  # 步骤 0′（R25 嵌入态修正；同标题主通道）
     key_id = str(rt.manifest.get("code_key_id") or "").strip()
     if key_id:                                     # 步骤 1′（加密态 §7.1）：三 stage 闸门
         _t = _install_codekey(cfg, key_id, _t, _tlog)   # + finder 注册；app_dir 不 append

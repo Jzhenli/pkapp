@@ -7,9 +7,8 @@ LINUX_M3_PLAN 阶段 1 子项 ③）。
   正例：验签链通过，app_version / spk_hash 与 packager 同法重算一致；
   负例：内容篡改 / 签名篡改 / 缺键 / format_version / 非 STORED / 路径穿越 / 垃圾文件 → 必须拒绝。
 
-运行（WSL 内）：cd /mnt/d/code/pack/pkapp && python3 -m pytest ../shell-linux/tests/test_shell_contract.py -q
-前置：WSL 内 ./build.sh 已产出 build/myapp；python3-cryptography + python3-pytest
-（缺则 sudo apt-get install -y python3-cryptography python3-pytest）。
+运行（WSL 内，uv 托管 venv）：~/wsl312/bin/python -m pytest shell-linux/tests -q
+前置：./build.sh 已产出 build/myapp（uv venv 装 pkapp editable；无需 sudo）。
 """
 import os
 import subprocess
@@ -19,11 +18,13 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]          # /mnt/d/code/pack
+ROOT = Path(__file__).resolve().parents[2]          # 仓库根
 sys.path.insert(0, str(ROOT / "pkapp"))
 
 from pkapp.packager import manifest as mf           # noqa: E402
 from pkapp.packager import sign, spk                # noqa: E402
+from pkapp.packager.winshell import (               # noqa: E402
+    _SHELL_DEFAULT_PUB, _patch_shell_pubkey)
 
 EXE = ROOT / "shell-linux" / "build" / "myapp"
 KEY = ROOT / ".pkapp" / "sign.key"
@@ -99,17 +100,18 @@ def write_raw_zip_exact(path: Path, entries, method: int = 0) -> None:
 
 
 def build_spk(tmp_path: Path, body=BODY, fields_over=None,
-              raw_entries=None) -> tuple[Path, dict, list]:
+              raw_entries=None, key: Path = KEY) -> tuple[Path, dict, list]:
     """按 packager build_spk 同构管线造 spk。
 
-    raw_entries 给定时直接用裸 zip 写入（跳过 packager 排序/校验）。
+    raw_entries 给定时直接用裸 zip 写入（跳过 packager 排序/校验）；
+    key 缺省用项目根 .pkapp/sign.key（与壳内置公钥配对）。
     返回 (spk_path, fields, 参与排序的 entries)。
     """
     entries = sorted(body, key=lambda e: e[0].encode("utf-8"))
     fields = make_fields(**(fields_over or {}))
     fields["spk_hash"] = "sha256:" + spk.spk_hash(entries)
     body_text = mf.render(fields)
-    sig = sign.sign_bytes(str(KEY), mf.canonical_bytes(body_text))
+    sig = sign.sign_bytes(str(key), mf.canonical_bytes(body_text))
     fields["signature"] = sig
     manifest_text = mf.render(fields, sig)
     all_entries = entries + [(spk.MANIFEST_ENTRY, manifest_text.encode("utf-8"))]
@@ -136,6 +138,46 @@ def test_embedded_pubkey_pairs_with_project_key(tmp_path):
     """正例通过本身即证明：壳内置公钥 == 项目 .pkapp/sign.key 公钥（配对性）。"""
     out, _, _ = build_spk(tmp_path)
     assert run_shell(out).startswith("SPK-VERIFY-OK ")
+
+
+def test_pubkey_patch_switches_verification(tmp_path):
+    """★R-L9 闭合（§9#10）★：真编译 ELF 补丁新公钥后验签随之切换——
+    补丁前拒收新钥签名 spk；补丁后恰好 64 字节被改写且验签通过。
+    载体 = 出厂默认公钥构建的 ELF（custom-pub 构建无默认锚 → 跳过；
+    CI ubuntu job 以 myapp-default 承载，契约 15 例用配对 custom-pub 构建）。"""
+    src = None
+    for cand in (EXE, ROOT / "shell-linux" / "build" / "myapp-default"):
+        if cand.is_file() and _SHELL_DEFAULT_PUB.encode("ascii") in cand.read_bytes():
+            src = cand
+            break
+    if src is None:
+        pytest.skip("无出厂默认公钥构建的 ELF（build.sh myapp \"\" 产物缺席）")
+    original = src.read_bytes()
+    key_path, pub = sign.generate_keypair(str(tmp_path / "kd"))
+    out, _, _ = build_spk(tmp_path, key=key_path)                   # 新钥签名
+    assert not run_shell(out).startswith("SPK-VERIFY-OK ")          # 补丁前：内置公钥 ≠ 新钥 → 拒
+    patched_path = tmp_path / "myapp-patched"
+    patched_path.write_bytes(original)
+    os.chmod(patched_path, 0o755)
+    _patch_shell_pubkey(str(patched_path), pub)                     # 原位补丁（字节等长）
+    patched = patched_path.read_bytes()
+    assert len(patched) == len(original)
+    anchor = _SHELL_DEFAULT_PUB.encode("ascii")                     # -g 构建锚含
+    offs, i = [], original.find(anchor)                             # .debug_info 副本 → N 处全改写
+    while i >= 0:
+        offs.append(i)
+        i = original.find(anchor, i + 1)
+    for o in offs:
+        assert patched[o:o + 64] == pub.lower().encode("ascii")
+    prev, eo, ep = 0, [], []                                        # 其余字节零扰动
+    for o in offs + [len(original)]:
+        eo.append(original[prev:o]); ep.append(patched[prev:o]); prev = o + 64
+    assert eo == ep
+    r = subprocess.run([str(patched_path), "--selftest-spk", str(out)],
+                       capture_output=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr                   # 补丁后：验签随之切换
+    # ★R-L9 防折叠回归★：gcc -O2 曾把 hex 解析首迭代折叠成立即数（补丁改串无效），
+    # manifest.c/integrity.c 的 hex 解析已 volatile 化——本用例端到端守住该修复。
 
 
 def test_sha256_prefix_in_spk_hash_accepted(tmp_path):

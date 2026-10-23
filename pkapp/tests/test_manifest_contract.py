@@ -117,3 +117,42 @@ def test_shell_default_pub_vs_manifest_c():
         "退化为 hex 扫描 fallback；两侧必须同步更新")
     assert re.fullmatch(r"[0-9a-f]{64}", _SHELL_DEFAULT_PUB), \
         "_SHELL_DEFAULT_PUB 须为 64 位小写 hex（补丁改写同长度 ASCII 改写依赖）"
+
+
+# ---------------------------------------- ⑥ linux env 契约：launcher setenv ↔ applocal 消费面
+
+def test_linux_env_contract_anchor():
+    """★M3 §9#9 对账锚★：shell-linux launcher 的 `setenv("MYAPP_*")` 与
+    applocal/_env.py 消费面逐项对齐（PLAN §3.1 步骤 4 表的代码级形态）。
+
+    - setenv 全集 ⊆ applocal 字符串字面量集：launcher 铺了 applocal 不消费的键
+      = 拼写漂移被静默忽略（applocal 对未知 MYAPP_* 零感知）；
+    - _env 必填集（_req(...)）⊆ setenv 全集：必填项不在引导期铺设 → 拖到运行中
+      才 ContractError（§9#9 后半：fail-fast 而非运行中爆炸）；
+    - MYAPP_PORT 不由 launcher 注入（v1.2 口径：运维 env 覆盖层保留继承）；
+    - MYAPP_PLATFORM 恒 "linux" 且在 _PLATFORMS 白名单内。
+    """
+    main_c = _text("shell-linux/src/main.c")
+    set_keys = set(re.findall(r'setenv\("(MYAPP_[A-Z_]+)"', main_c))
+    assert set_keys, "main.c 中找不到 setenv MYAPP_*（launcher env 步骤回归）"
+    # 读侧 = applocal 包全量源码（_env.py 契约主表 + _audit.py 的
+    # MYAPP_INTEGRITY_PURGE（Q8 壳→Python 审计补记，PLAN §3.1 表"条件"行的落定）
+    # + _core/_gate 等可能的自取面）
+    env_literals: set[str] = set()
+    for f in sorted((_REPO / "applocal" / "applocal").glob("*.py")):
+        env_literals |= _str_literals(str(f.relative_to(_REPO)))
+    env_src = _text("applocal/applocal/_env.py")
+    req_keys = set(re.findall(r'_req\("(MYAPP_[A-Z_]+)"\)', env_src))
+    assert set_keys <= env_literals, (
+        f"launcher 铺了 applocal 不消费的键: {sorted(set_keys - env_literals)}"
+        "（拼错/改名未对账——applocal 会静默忽略）")
+    assert req_keys <= set_keys, (
+        f"applocal 必填但 launcher 未铺: {sorted(req_keys - set_keys)}"
+        "（缺铺 → 运行中 ContractError 而非引导期 fail-fast）")
+    assert "MYAPP_PORT" not in set_keys, (
+        "MYAPP_PORT 不得由 launcher 注入（v1.2：端口偏好走运维 env 覆盖层继承）")
+    assert 'setenv("MYAPP_PLATFORM", "linux", 1)' in main_c
+    m = re.search(r"_PLATFORMS\s*=\s*\(([^)]*)\)", env_src)
+    assert m and '"linux"' in m.group(1), \
+        "_env._PLATFORMS 白名单须含 linux（launcher 铺 MYAPP_PLATFORM=linux 的读侧前提）"
+

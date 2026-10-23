@@ -114,21 +114,25 @@ def test_password_roundtrip_and_malformed_stored():
 
 
 def test_verify_missing_user_runs_pbkdf2(tmp_path):
-    """F3：缺失用户与错误密码等耗时——用户名存在性不经时序外泄。"""
+    """F3：缺失用户与错误密码等耗时——用户名存在性不经时序外泄。
+
+    ★M3 修正★：原 0.02s 绝对阈值在快机上 flake（WSL py3.12 实测单次 PBKDF2
+    ~15.5ms）——改为机器无关断言：wrong-pass 路径跑真 hash（>5ms 底线证 PBKDF2
+    确实执行），missing 路径与它等耗时（>0.5×，F3 时序 Oracle 本义）。"""
     st = sess.UserStore(str(tmp_path))
     st.create("alice", "pw123456", [])
     t0 = time.perf_counter()
     assert st.verify("nobody", "whatever") is None
     t_missing = time.perf_counter() - t0
     t0 = time.perf_counter()
-    assert st.verify("alice", "wrongpass") is None
+    assert st.verify("alice", "wrongpass") is None     # 真实 hash 校验 = PBKDF2 基准耗时
     t_wrong = time.perf_counter() - t0
-    assert t_missing > 0.02                        # 确实跑了 PBKDF2（首查含生成）
+    assert t_wrong > 0.005                             # 确实跑了 PBKDF2（快机实测 ~15ms）
     t0 = time.perf_counter()
     assert st.verify("nobody2", "whatever") is None
     t_missing2 = time.perf_counter() - t0
-    assert t_missing2 > 0.02                       # 假 hash 已复用，仍等价耗时
-    assert t_wrong > 0.02 and st.verify("alice", "pw123456")
+    assert t_missing2 > 0.5 * t_wrong                  # 假 hash 已复用，仍等价耗时
+    assert t_missing > 0.5 * t_wrong and st.verify("alice", "pw123456")
 
 
 def test_userstore_lifecycle(tmp_path):

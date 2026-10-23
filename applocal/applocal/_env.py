@@ -58,6 +58,7 @@ class Paths:
 class Runtime:
     platform: str            # windows | android | linux
     version: str
+    appname: str = ""        # MYAPP_APPNAME：应用名（linux launcher 注入；§4.5 进程标题主通道）
     manifest: Mapping = field(default_factory=lambda: MappingProxyType({}))  # 解析失败/缺失 = {}（dev 契约）；
     # MappingProxyType：runtime() 是全局缓存快照，可变 dict 会让调用方改坏缓存、破坏 frozen 语义
     native_lib_dir: str | None = None              # Android: lib/<abi>/；桌面 None
@@ -194,6 +195,7 @@ def load_env(refresh: bool = False) -> Cfg:
     runtime = Runtime(
         platform=platform,
         version=_req("MYAPP_VERSION"),
+        appname=_opt("MYAPP_APPNAME").strip(),
         manifest=MappingProxyType(manifest),
         native_lib_dir=_abs_opt("MYAPP_NATIVE_LIB_DIR", _opt("MYAPP_NATIVE_LIB_DIR")) or None,
         strict_auth=_opt("MYAPP_STRICT_AUTH").lower() in ("1", "true"),

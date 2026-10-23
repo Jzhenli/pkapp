@@ -18,6 +18,8 @@ from pkapp.packager.winshell import (
 )
 from pkapp.packager import sign
 
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def _fake_exe(default_pub: bool, extra_runs: int = 0) -> bytes:
     """构造带公钥常量的假 exe 字节：默认公钥命中 or 自定义 64-hex 段 + 干扰段。"""
@@ -29,6 +31,32 @@ def _fake_exe(default_pub: bool, extra_runs: int = 0) -> bytes:
     for i in range(extra_runs):
         body += b"\x01" + b"ef" * 32 + b"\x02"
     return body + b"\xff\xee-tail"
+
+
+def _fake_elf(default_pub: bool) -> bytes:
+    """ELF 形状假体（R-L9）：\x7fELF 头 + 64-hex 公钥常量段。补丁定位是纯字节
+    扫描（无格式感知），ELF/PE 同断言对拍。"""
+    body = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8
+    if default_pub:
+        body += b".rodata:" + _SHELL_DEFAULT_PUB.encode("ascii")
+    else:
+        body += b".rodata:" + b"ab" * 31 + b"cd"
+    return body + b"\x00.shstrtab\x00"
+
+
+def _find_default_pub_elf() -> str | None:
+    """出厂默认公钥构建的真编译 ELF（R-L9 实物载体）：build/myapp（本地默认构建）
+    或 build/myapp-default（CI 双构建，契约配对用 custom-pub 时默认锚件让位）。"""
+    for name in ("myapp", "myapp-default"):
+        cand = os.path.join(_REPO, "shell-linux", "build", name)
+        try:
+            if os.path.isfile(cand):
+                with open(cand, "rb") as f:
+                    if _SHELL_DEFAULT_PUB.encode("ascii") in f.read():
+                        return cand
+        except OSError:
+            pass
+    return None
 
 
 def test_patch_pubkey_default_hit(tmp_path):
@@ -66,6 +94,61 @@ def test_patch_pubkey_rejects_bad_pub(tmp_path):
     exe.write_bytes(_fake_exe(default_pub=True))
     with pytest.raises(RuntimeError, match="64 位 hex"):
         _patch_shell_pubkey(str(exe), "zz")
+
+
+def test_patch_pubkey_elf_default_hit(tmp_path):
+    """ELF 形状同断言（R-L9 / §9#10）：改公钥后恰好一处被改写——锚消失、
+    新钥恰现一处、其余字节零扰动。"""
+    elf = tmp_path / "myapp"
+    original = _fake_elf(default_pub=True)
+    elf.write_bytes(original)
+    new_pub = sign.generate_keypair(str(tmp_path / "kd"))[1]
+    _patch_shell_pubkey(str(elf), new_pub)
+    patched = elf.read_bytes()
+    assert len(patched) == len(original)
+    anchor = original.index(_SHELL_DEFAULT_PUB.encode("ascii"))
+    assert patched[anchor:anchor + 64] == new_pub.lower().encode("ascii")
+    assert patched[:anchor] == original[:anchor] and patched[anchor + 64:] == original[anchor + 64:]
+    assert patched.count(new_pub.lower().encode("ascii")) == 1          # 恰好一处
+    assert _SHELL_DEFAULT_PUB.encode("ascii") not in patched
+
+
+def test_patch_pubkey_real_elf_anchor_rewrite(tmp_path):
+    """★R-L9 实物断言★：真编译 ELF（gcc -O2/-g 产物）补丁新公钥后——出厂锚全部
+    被改写（-g 构建含 .rodata 正本 + .debug_info DWARF 副本，锚出现 N 次 ≥1）、
+    其余字节零扰动、验签随之切换（切换 e2e 见 shell-linux harness）。
+    "常量段唯一"的阶段 2 前提已被证伪并被 volatile 防折叠修复取代（gcc -O2 会把
+    hex 解析首迭代折叠成立即数——补丁需配 volatile 才生效，见 manifest.c）。
+    载体缺席（未跑 shell-linux/build.sh 默认公钥构建）→ 跳过；CI ubuntu job
+    以 myapp-default 承载。"""
+    cand = _find_default_pub_elf()
+    if cand is None:
+        pytest.skip("无出厂默认公钥构建的真 ELF（shell-linux/build/myapp[-default]）")
+    with open(cand, "rb") as f:
+        original = f.read()
+    anchor = _SHELL_DEFAULT_PUB.encode("ascii")
+    offs, i = [], original.find(anchor)
+    while i >= 0:
+        offs.append(i)
+        i = original.find(anchor, i + 1)
+    assert offs                                                    # 锚在场（R-L9 前提）
+    new_pub = sign.generate_keypair(str(tmp_path / "kd"))[1]
+    copy = os.path.join(str(tmp_path), "myapp.copy")
+    with open(copy, "wb") as f:
+        f.write(original)
+    _patch_shell_pubkey(copy, new_pub)
+    with open(copy, "rb") as f:
+        patched = f.read()
+    assert len(patched) == len(original)
+    for o in offs:                                                 # 全部锚窗口 → 新钥
+        assert patched[o:o + 64] == new_pub.lower().encode("ascii")
+    prev, expect_o, expect_p = 0, [], []                           # 其余字节零扰动
+    for o in offs + [len(original)]:
+        expect_o.append(original[prev:o])
+        expect_p.append(patched[prev:o])
+        prev = o + 64
+    assert expect_o == expect_p
+    assert patched.count(new_pub.lower().encode("ascii")) == len(offs)
 
 
 def test_find_shell_explicit_not_patchable(tmp_path):
