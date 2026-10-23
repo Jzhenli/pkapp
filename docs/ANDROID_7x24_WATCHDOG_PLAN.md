@@ -437,6 +437,24 @@ API 31）验证的结论分两类——AOSP 平台语义（STICKY 重建、闹�
 | 3 | `adb shell am broadcast -a com.pkapp.spike.ZOMBIE -n com.pkapp.spike/.ZombieReceiver` | ~30s 内 `watchdog: main thread STUCK → killProcess` → 新 pid 复活且闹钟链继续 | §6.6 |
 | 4 | `adb reboot` → 开机后 `adb logcat -d \| grep "Autostart blocked"` | 无 blocked 且有 `BOOT_COMPLETED received` → 无门禁；被拦 → 落 §4.2-4 对策后再部署 | §4.2-4 / R-10 |
 
+**★目标设备实测记录（2026-10-14，BAC_4041_100）★**：Allwinner A133 工控平板（Android 10 / API 29、
+armeabi-v7a、SP 2021-01-05），spike 以 debug 构建安装（compileSdk 35 / targetSdk 34）。**四项复验全过**：
+① `alarm scheduled` → `ALARM FIRED` deviation **6~14ms**（参考 ≤28ms），无 SecurityException；
+② `am crash` → 新 pid `why=RESTART(null-intent,STICKY 重建)`，秒级复活且闹钟链重排；
+③ ZOMBIE → 看门狗 27s 判死 `killProcess` → **4.3s** 全量复活、新 pid 闹钟继续触发；
+④ 重启后**无 `Autostart blocked`**（无 OEM 门禁，R-10 不成立），BOOT_COMPLETED → FGS →
+`startActivity OK (BOOT)` 全链路通。附加：熄屏 130s 两周期闹钟照常（deviation 12/14ms）。
+
+定性（呼应 R-10/R-11，与 XT2125_4 对照）：此设备属**宽松 ROM**——FGS 内 `startActivity`、
+receiver→`startForegroundService`、闹钟链均不拦（BAL 两连证伪结论**不适用**于本设备），
+复活拉起 UI 通道恒通，SWO 保底为可选增强；无自启门禁，HOME 化 / device-owner 对策非必需。
+另：API 29 无 `SCHEDULE_EXACT_ALARM` 概念，`setAlarmClock` 无权限门槛（§10 档位表 API<31 行语义）；
+`specialUse` FGS type 在 API 29 被忽略（PackageParser 警告无害，§5 ★M3★）。
+
+观察项（部署验收记录口径）：BOOT_COMPLETED 为**有序广播**，实测被 com.android.phone 的
+receiver 超时占用队列 **~60s** 后才投递到本应用——断电恢复空窗 ≈ boot(~25s) + 投递延迟（最坏 ~1min）
++ 服务启动，仍远优于 L2 的 8min 口径；现场验收应记录实际投递时延而非只 grep blocked。
+
 ### 7.4 负例三：boot-loop 熔断（★C3 配套新增；依赖 P0 已实装 ★P4★）
 
 > 依赖声明（★P4★）：本负例靠"注入清单外文件触发 P0 fail-closed"构造启动即崩——
