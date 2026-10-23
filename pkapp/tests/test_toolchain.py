@@ -431,6 +431,9 @@ def test_managed_runtime_dir_and_android_paths(tmp_path, monkeypatch):
         str(tmp_path / "cache" / "tools" / "rcedit-x64.exe")
     assert toolchain.managed_runtime_dir("android") == \
         str(tmp_path / "cache" / "runtimes" / "py-android-3.12.14")
+    # ★M3 阶段 2★ linux：各 arch 共享父目录（dest_parent/<arch> 分层）
+    assert toolchain.managed_runtime_dir("linux") == \
+        str(tmp_path / "cache" / "runtimes" / "pbs-linux-cpython-3.12.14+20260929")
     ap = toolchain.android_paths()
     assert ap["java_home"] == str(tmp_path / "cache" / "android" / "jdk" / "jdk-17.0.20.1+1")
     assert ap["android_home"] == str(tmp_path / "cache" / "android" / "sdk")
@@ -452,6 +455,45 @@ def test_fetch_android_finishes_licenses(tmp_path, monkeypatch):
     lic = tmp_path / "cache" / "android" / "sdk" / "licenses" / "android-sdk-license"
     assert lic.read_text(encoding="utf-8").strip() == "24333f8a63b6825ea9c5514f83c2829b004d1fee"
     assert (tmp_path / "cache" / "android" / "gradle-home").is_dir()
+
+
+def test_linux_pin_present_and_verified():
+    """★M3 阶段 2★ linux 运行时 pin 在场且 sha256 已核定（x86_64 先行；armv7 随阶段 5）。"""
+    linux = [p for p in toolchain.PINS if p.platform == "linux"]
+    assert [p.id for p in linux] == ["pbs-linux-cpython-3.12.14-x86_64"]
+    assert all(p.sha256 and p.kind == "tar.gz" for p in linux)
+
+
+def test_fetch_linux_arch_layout_snapshot_at_parent(tmp_path, monkeypatch):
+    """★M3 阶段 2★ linux pin：内层 python/ 重命名 <arch> 落位（<arch>/ 即安装根，
+    libpython 在 lib/ 子目录）；snapshot.toml 落各 arch 共享父目录
+    （managed_runtime_dir 同源，resolve 按此读取）。"""
+    monkeypatch.setenv("PKAPP_CACHE", str(tmp_path / "cache"))
+    t = tmp_path / "t.tar.gz"
+    sha = _mk_tar(str(t), {
+        "python/bin/python3.12": b"\x7fELF-interp",
+        "python/lib/libpython3.12.so.1.0": b"\x7fELF-libpython",
+        "python/lib/python3.12/os.py": b"pass",
+    })
+    pins = (Pin(id="pbs-linux-cpython-3.12.14-x86_64", platform="linux",
+                filename="cpython-linux.tar.gz",
+                urls=("https://example.test/cpython-linux.tar.gz",), sha256=sha,
+                kind="tar.gz", dest_parent="runtimes/pbs-linux-cpython-3.12.14+20260929",
+                inner_rename="x86_64"),)
+    monkeypatch.setattr(toolchain, "PINS", pins)
+    assert toolchain.fetch("linux", fetcher=_fetcher_by_name(
+        {"cpython-linux.tar.gz": str(t)})) == 0
+    cache = tmp_path / "cache"
+    arch = cache / "runtimes" / "pbs-linux-cpython-3.12.14+20260929" / "x86_64"
+    assert (arch / "lib" / "libpython3.12.so.1.0").read_bytes() == b"\x7fELF-libpython"
+    assert (arch / "lib" / "python3.12" / "os.py").read_text() == "pass"
+    # snapshot 在共享父目录（与 managed_runtime_dir 同源），不在 arch 目录内
+    snap_path = toolchain.managed_runtime_dir("linux")
+    assert snap_path == str(cache / "runtimes" / "pbs-linux-cpython-3.12.14+20260929")
+    snap = tomllib.load(open(os.path.join(snap_path, "snapshot.toml"), "rb"))
+    assert snap["python_version"] == toolchain.PYTHON_VERSION
+    assert snap["pins"]["pbs-linux-cpython-3.12.14-x86_64"]["sha256"] == sha
+    assert not (arch / "snapshot.toml").exists()
 
 
 # ---------------------------------------------------------------- resolve 集成（托管路径契约）

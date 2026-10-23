@@ -43,6 +43,7 @@ _ANDROID_SKIP_TOP = {"build.bat"}
 # 命中时升级为失败。
 ENTRIES: dict[str, str] = {
     "shell-windows": "包内置壳（MyApp.exe + WebView2Loader.dll）",
+    "shell-linux": "launcher ELF（_vendor/shell-linux/<arch>/myapp，M3 阶段 2）",
     "keylib-windows": "key-holder 通用件（pkapp_key.dll，锚点补丁退化位）",
     "keylib-src": "keylib C 源码（key.c/key.h，wheel 形态现场编译供给）",
     "shell-android": "android 壳模板（源码形态）",
@@ -66,6 +67,26 @@ def _vendor_shell_windows(vroot: str, root: str) -> tuple[str, str]:
     for fn in ("MyApp.exe", "WebView2Loader.dll"):
         shutil.copyfile(os.path.join(build, fn), os.path.join(dest, fn))
     return "OK", "_vendor/shell（MyApp.exe + WebView2Loader.dll）"
+
+
+def _vendor_shell_linux(vroot: str, root: str) -> tuple[str, str]:
+    """launcher ELF 收录（★M3 阶段 2 条 5★：wheel 装机后 package linux 的壳源）。
+
+    源 = shell-linux/build/myapp（build.sh 默认名产物，CI ubuntu job 容器编译
+    后 download-artifact 落位）；录名恒 myapp——launcher 内容与文件名无关
+    （部署期 staging 改名 + ._pth 同名锚），vendored 查找 _find_launcher_linux
+    按 <app 名> 未命中即回退 myapp。arch = x86_64（manylinux2014 容器编译，
+    glibc 2.17 地板）；aarch64/armv7l 随阶段 5 扩展。"""
+    src = os.path.join(root, "shell-linux", "build", "myapp")
+    dest = os.path.join(vroot, "shell-linux", "x86_64")
+    if not os.path.isfile(src):
+        shutil.rmtree(os.path.join(vroot, "shell-linux"),
+                      ignore_errors=True)              # SKIP 即清旧产物（同上）
+        return "SKIP", (f"缺 {src}——launcher ELF（manylinux2014 容器编译，"
+                        "shell-linux/build.sh；CI 由 launcher job artifact 供给）")
+    os.makedirs(dest, exist_ok=True)
+    shutil.copyfile(src, os.path.join(dest, "myapp"))
+    return "OK", "_vendor/shell-linux/x86_64（launcher ELF，录名 myapp）"
 
 
 def _vendor_keylib_windows(vroot: str, root: str) -> tuple[str, str]:
@@ -167,6 +188,7 @@ def run(argv: list[str] | None = None, root: str = ROOT) -> int:
     results: dict[str, tuple[str, str]] = {}
     hard_rc: dict[str, int] = {}
     for name, fn in (("shell-windows", _vendor_shell_windows),
+                     ("shell-linux", _vendor_shell_linux),
                      ("keylib-windows", _vendor_keylib_windows),
                      ("keylib-src", _vendor_keylib_src),
                      ("shell-android", _vendor_android_shell),

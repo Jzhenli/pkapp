@@ -26,7 +26,9 @@ def _wheels_cache(platform: str, abi: str | None = None) -> str:
     隔离标签集（windows 与 android 交叉 wheel 混判会让离线优先误命中）。android
     再按 <abi> 分层（★实测教训★：双 ABI 共缓存时，v7a 先建会把 arm32 的
     pydantic_core 写进缓存，arm64 构建"顶层需求已缓存"短路后死路——abi 目录
-    隔离与"单 ABI 构建"约束对齐）。平台内多版本 wheel 共存无害（pip 按需求挑）；
+    隔离与"单 ABI 构建"约束对齐）。★R-L17★ linux 同构：第二参传 arch
+    （x86_64/aarch64/armv7l，LinuxSpec.abis 元素——交叉 wheel 标签集随 arch
+    隔离，同 android 教训）。平台内多版本 wheel 共存无害（pip 按需求挑）；
     显式 --wheels-dir 仍为纯离线供应商目录语义。"""
     if abi:
         return os.path.join(cache_root(), "wheels", platform, abi)
@@ -99,6 +101,28 @@ def _uncached_deps(dep_list: list[str], wheels_dir: str) -> list[str]:
             continue
         out.append(d)
     return out
+
+
+def _linux_pip_tags(spec: AppSpec, arch: str) -> list[str]:
+    """Linux 交叉安装 pip 标志（★M3 阶段 2★ D-12 v5 拍板主路线 = PyPI 交叉下载）。
+
+    平台标签按 arch：x86_64 → manylinux2014_x86_64（glibc 2.17 地板，PBS 工具链
+    兼容域）；aarch64 → manylinux2014_aarch64（同 2.17 地板）；armv7l → 阶段 5
+    接线（manylinux_2_31_armv7l，板子 2.31 对齐，D-12 v5 fallback 语义）。
+    """
+    short = (spec.linux.python_version or "3.12.14").rsplit(".", 1)[0]  # 3.12.14 → 3.12
+    tags = ["--only-binary=:all:", "--python-version", short,
+            "--implementation", "cp", "--abi", "cp" + short.replace(".", "")]
+    plat = {"x86_64": ["manylinux2014_x86_64", "manylinux_2_17_x86_64",
+                       "linux_x86_64"],
+            "aarch64": ["manylinux2014_aarch64", "manylinux_2_17_aarch64",
+                        "linux_aarch64"]}.get(arch)
+    if plat is None:
+        raise BuildError(f"linux 架构 {arch!r} 的 wheel 平台标签随阶段 5 接线"
+                         "（armv7l 走 manylinux_2_31_armv7l，D-12 v5）")
+    for p in plat:
+        tags += ["--platform", p]
+    return tags
 
 
 def _install_site_packages(stage: str, deps: tuple[str, ...],

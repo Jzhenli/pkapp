@@ -10,6 +10,9 @@
 WebView2Loader 三件套一次性组装到 staging（build/staging-windows/，成功即焚毁、
 失败保留现场），公钥补丁/配对自检/完整性侧车/keylib 闸门/rcedit 可选增强通过后
 打 zip（内含 <name>/ 一层目录）到 release/。
+
+★M3 方案 A★ linux 壳域在 linshell.py（对仗 apk.py/android、winshell/windows）——
+本文件属地仅为共享机制件（出厂锚/补丁/自检），linshell 值绑定引直接复用。
 """
 from __future__ import annotations
 

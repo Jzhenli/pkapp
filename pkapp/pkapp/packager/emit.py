@@ -13,7 +13,9 @@ from ..util import tree_hash
 from . import manifest as mf
 from . import sign, spk
 
-FORMAT_VERSIONS = {"windows": "2", "android": "1"}
+# linux = "2"：★M3 定案（shell-linux Q2）★壳只认 format 2（integrity 侧车契约），
+# 布局与 windows 同构（§4.6 条 4）；android "1" 为 APK 伴生清单语义，不随动。
+FORMAT_VERSIONS = {"windows": "2", "android": "1", "linux": "2"}
 
 
 def _manifest_fields(spec: AppSpec, platform: str, python_dll: str,

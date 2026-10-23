@@ -1,5 +1,6 @@
 """packager 全管线 + golden 断言（G1–G5、G7；G8/G11 属 M2/真快照项）。"""
 import hashlib
+import io
 import os
 import types
 import zipfile
@@ -17,6 +18,7 @@ from pkapp.packager import pyc as pyc_mod
 from pkapp.packager import sign, spk
 from pkapp.packager.errors import BuildError
 from pkapp.packager.runtime import dll_stem
+from pkapp.tools.mockkit import make_wheel
 
 
 def _build(project, wheels_dir, out, **kw):
@@ -230,6 +232,32 @@ def test_android_runtime_resolve_negative(project, tmp_path):
     make_mock_android_runtime(bad, abis=("arm64-v8a",))
     with pytest.raises(RuntimeResolveError, match="子目录"):
         resolve(spec_bad, "android", abis=("x86_64",))
+
+
+def test_linux_runtime_resolve_arch_layout(project, tmp_path):
+    """★R-L17★ linux 快照 <root>/<arch>/ 布局：<arch>/ 即 PBS 安装根（bin/lib/...），
+    libpython 真件在 <arch>/lib/ 子目录；缺 arch 目录 fail fast；正向解析 dir 锚定
+    arch 子目录（逃生门路径口径）。"""
+    from pkapp.packager.runtime import RuntimeResolveError, resolve
+
+    spec = load(os.path.join(project, "pkapp.toml"))
+    rt = str(tmp_path / "linux-rt")
+    arch_dir = os.path.join(rt, "aarch64")
+    os.makedirs(os.path.join(arch_dir, "lib", "python3.12"))
+    with open(os.path.join(arch_dir, "lib", "libpython3.12.so.1.0"), "wb") as f:
+        f.write(b"x" * 64)
+    with open(os.path.join(arch_dir, "lib", "libpython3.12.so"), "wb") as f:
+        f.write(b"soname-link")          # 裸 .so 名不得被选中（真件优先）
+    from dataclasses import replace
+    spec_l = replace(spec, linux=replace(spec.linux, runtime_dir=rt,
+                                         python_version="3.12.14"))
+    # 缺省 arch（x86_64）目录未布置 → fail fast
+    with pytest.raises(RuntimeResolveError):
+        resolve(spec_l, "linux", abis=spec.linux.abis)
+    snap = resolve(spec_l, "linux", abis=("aarch64",))
+    assert snap.python_dll == "libpython3.12.so.1.0"
+    assert snap.dir == os.path.abspath(arch_dir)
+    assert snap.python_version == "3.12.14" and snap.abis == ()
 
 
 def test_min_app_version_selfcheck(tmp_path):             # G5
@@ -912,3 +940,79 @@ def test_consolidate_top_level_same_stem_clash_fails_fast(tmp_path):
     with pytest.raises(BuildError, match="顶层同名冲突"):
         consolidate_mod._consolidate_site_packages(
             str(tmp_path / "stage"), str(sp), "", "", "py")
+
+
+# ---- ★M3 阶段 2★ linux 构建（_build_spk_linux）----
+
+def _build_linux(project, wheels_dir, out, **kw):
+    spec = load(os.path.join(project, "pkapp.toml"))
+    return assemble.build_spk(project, spec, "linux", out,
+                              private_key=os.path.join(project, ".pkapp", "sign.key"),
+                              wheels_dir=wheels_dir, **kw)
+
+
+def test_linux_build_golden(linux_project, wheels_dir, tmp_path):
+    """★M3★ linux spk golden：布局 = 定案条 4（libpython 真件 + python312.zip +
+    lib-dynload/ + site-packages/ + app/ + ui/）；无 ._pth（D-5）；tcl/tk 与
+    保守档死重不进包；验签链全通（G4 linux 面）。"""
+    make_wheel(wheels_dir, "setproctitle", "1.0",
+               {"setproctitle/__init__.py": ""})     # B.y 注入面
+    out = str(tmp_path / "demo-linux.spk")
+    fields = _build_linux(linux_project, wheels_dir, out)
+    assert fields["python_dll"] == "libpython3.12.so.1.0"
+    assert fields["entry"] == "app.main:app"
+    assert fields["applocal_version"] == "0.1.0"
+    pub = sign.public_key_hex(os.path.join(linux_project, ".pkapp", "sign.key"))
+    got, _ = mf.verify_spk(out, pub)
+    assert got["app_version"] == "0.1.0"
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        with zf.open("python312.zip") as f, zipfile.ZipFile(io.BytesIO(f.read())) as sz:
+            zn = set(sz.namelist())
+    # 布局定稿（smoke spk 同构）
+    assert "libpython3.12.so.1.0" in names
+    assert "python312.zip" in names
+    assert "lib-dynload/_dbm.cpython-312-x86_64-linux-gnu.so" in names
+    assert "site-packages/deps.zip" in names
+    assert "app/main.py" in names and "ui/index.html" in names
+    assert "_integrity/integrity.manifest" in names
+    # D-5：linux spk 无 ._pth（package 期部署态生成）
+    assert not any(n.endswith("._pth") for n in names)
+    # 去 tk 联动 + lib-dynload 布局清理
+    assert not any("_tkinter" in n for n in names)
+    assert "lib-dynload/.empty" not in names
+    # stdlib zip 面：保守档 + linux 特有排除
+    assert "os.pyc" in zn and "json/__init__.pyc" in zn
+    assert not any(n.startswith("ensurepip") for n in zn)
+    assert not any(n.startswith("config-") for n in zn)
+    assert not any("turtle" in n for n in zn)
+    assert not any(n.startswith("lib-dynload/") for n in zn)   # 动态扩展不在 zip 内
+
+
+def test_linux_build_encrypted_keylib_failfast(linux_project, wheels_dir,
+                                               tmp_path, monkeypatch):
+    """加密态 linux：nt host 无 linux 工具链 → keybuild 失败收敛 rc=2 →
+    BuildError 指路 WSL2/CI（阶段 2 条 4 fail-fast，不再退化锚点补丁——H4 同款）。"""
+    from pkapp.packager.keybuild import KeyLibError
+    from dataclasses import replace
+    monkeypatch.setattr(
+        "pkapp.packager.keybuild._compile_linux",
+        lambda *a, **k: (_ for _ in ()).throw(KeyLibError("linux 编译器缺失")))
+    make_wheel(wheels_dir, "setproctitle", "1.0", {"setproctitle/__init__.py": ""})
+    spec = load(os.path.join(linux_project, "pkapp.toml"))
+    spec = replace(spec, code_encryption=True)
+    with pytest.raises(BuildError, match="keylib"):
+        assemble.build_spk(linux_project, spec, "linux", str(tmp_path / "e.spk"),
+                           private_key=os.path.join(linux_project, ".pkapp", "sign.key"),
+                           wheels_dir=wheels_dir)
+
+
+def test_linux_reproducible(linux_project, wheels_dir, tmp_path):   # G1 linux 面
+    """salt 关（默认）→ linux 构建字节级可复现（windows G1 同款口径）。"""
+    make_wheel(wheels_dir, "setproctitle", "1.0", {"setproctitle/__init__.py": ""})
+    outs = []
+    for i in (1, 2):
+        p = str(tmp_path / f"l{i}.spk")
+        _build_linux(linux_project, wheels_dir, p)
+        outs.append(open(p, "rb").read())
+    assert outs[0] == outs[1]

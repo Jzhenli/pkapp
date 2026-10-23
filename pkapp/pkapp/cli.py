@@ -51,9 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unsigned", action="store_true", help="dev/test 旁路：不签名（signature=unsigned）")
     p.add_argument("--keygen", action="store_true", help="生成 Ed25519 密钥对到 .pkapp/ 后退出")
     p.add_argument("--wheels-dir", default=None, help="离线 wheel 目录（--no-index --find-links）")
-    p.add_argument("--arch", default=None, metavar="ABI",
+    p.add_argument("--arch", default=None, metavar="ABI|ARCH",
                    help="android：覆盖 [platforms.android].abis（单 ABI，NDK 命名，"
-                        "如 arm64-v8a/armeabi-v7a；仅本次生效，不写回 TOML）")
+                        "如 arm64-v8a）；linux：覆盖 [platforms.linux].abis（单架构，"
+                        "x86_64/aarch64/armv7l）。仅本次生效，不写回 TOML")
 
     p = sub.add_parser("check", help="静态检查（依赖声明合规 + 路径/端口反模式扫描）")
     _add_project(p)
@@ -65,17 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "验签 + 对称差，免启动应用；退出码 0=通过 1=失配")
 
     p = sub.add_parser("fetch", help="工具链托管（唯一网络入口）：下载/离线导入运行时与构建工具链")
-    p.add_argument("platform", choices=["windows", "android", "all"],
+    p.add_argument("platform", choices=["windows", "android", "linux", "all"],
                    help="目标平台（位置参数，如 pkapp fetch android）")
     p.add_argument("--from", dest="from_dir", default=None,
                    help="离线导入：从本地目录按文件名+sha256 导入压缩包（不联网）")
     p.add_argument("--list", action="store_true", help="仅列出 pin 清单（不下载）")
 
-    p = sub.add_parser("package", help="平台终产物：windows→zip / android→apk / linux→tar.gz（M3）；spk 缺失时报错先 build")
+    p = sub.add_parser("package", help="平台终产物：windows→zip / android→apk / linux→tar.gz；spk 缺失时报错先 build")
     _add_project(p)
     p.add_argument("platform", choices=["windows", "android", "linux"],
                    help="目标平台（位置参数，如 pkapp package android）")
-    p.add_argument("--shell", default=None, help="windows：预编译壳 exe（缺省 PKAPP_SHELL_EXE/仓库 build/MyApp.exe）")
+    p.add_argument("--shell", default=None, help="windows：预编译壳 exe（缺省 PKAPP_SHELL_EXE/仓库 build/MyApp.exe）；linux：launcher ELF（缺省 PKAPP_SHELL_ELF/仓库 shell-linux/build/<name>）")
     p.add_argument("--shell-dir", default=None, help="android：壳工程根（缺省 PKAPP_SHELL_DIR/toolchain 默认布局）")
     p.add_argument("--variant", default="debug", choices=["debug", "release"],
                    help="android gradle 变体（release 需壳工程 keystore 配置，登记后续项）")
@@ -83,9 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--desc", default=None, help="windows：FileDescription/ProductName（默认 app.name）")
     p.add_argument("--rcedit", default=None, help="windows：rcedit 路径（缺省 PKAPP_RCEDIT/PATH）")
     p.add_argument("--out", default=None, help="终产物输出目录（默认 <project>/release）")
-    p.add_argument("--arch", default=None, metavar="ABI",
+    p.add_argument("--arch", default=None, metavar="ABI|ARCH",
                    help="android：断言与 build 记录的 ABI 一致（不符则报错；缺省自动沿用 "
-                        "最后一次 build 的 ABI）")
+                        "最后一次 build 的 ABI）；linux：目标架构（缺省 [platforms.linux].abis[0]，"
+                        "决定 launcher 定位目录与产物命名）")
     return ap
 
 
@@ -113,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "doctor":
             return cmd_doctor_mod.cmd_doctor(args.project, integrity_dir=args.integrity)
         if args.cmd == "fetch":
-            platforms = (["windows", "android"] if args.platform == "all"
+            # ★M3★ linux 消费面（_build_spk_linux）已落地，all 三平台全量
+            platforms = (["windows", "android", "linux"] if args.platform == "all"
                          else [args.platform])
             rc = 0
             for plat in platforms:

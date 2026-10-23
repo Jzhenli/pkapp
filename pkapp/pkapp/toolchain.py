@@ -47,7 +47,7 @@ class ToolchainError(RuntimeError):
 class Pin:
     """单一托管组件。filename = dl/ 压缩包名（--from 匹配键，本地名与上游资产名可不同）。"""
     id: str
-    platform: str            # windows | android
+    platform: str            # windows | android | linux（★R-L17★ linux pin 随 M3 阶段 2 入场，按 arch 各一条）
     filename: str
     urls: tuple              # 主源在前；镜像经 PKAPP_MIRROR_* 前缀替换
     sha256: str              # "" = 未核定（仅 TLS + 打印实测哈希）
@@ -132,6 +132,20 @@ PINS: tuple[Pin, ...] = (
               "python-android-dart-3.12.14-x86_64.tar.gz",),
         sha256="d9ecce41593d7a7b6ef016fe22d143d7732f1ae447bac1f611cf5a7358afde5b",
         kind="tar.gz", dest_parent="runtimes/py-android-3.12.14/x86_64", rootless=True),
+    # ---- linux 运行时（PBS install_only_stripped；M3 阶段 2 起）----
+    # 内层 python/ 重命名为 <arch>——快照 <arch>/ 即安装根（bin/include/lib/share，
+    # libpython3.12.so.1.0 在 lib/ 子目录）；各 arch pin 共享父目录
+    # runtimes/pbs-linux-cpython-3.12.14+20260929（snapshot.toml 落此，_install 特判）。
+    # sha256 为 2026-10-23 官方资产实测回填（32.69 MB）。armv7 pin 随阶段 5/D-8=c
+    # 接线（本地实测件为 3.12.15+20261021，与族锁 3.12.14 不同版，届时按当期
+    # release 回填值与族锁对齐策略一并定）。
+    Pin(id="pbs-linux-cpython-3.12.14-x86_64", platform="linux",
+        filename="cpython-3.12.14+20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        urls=("https://github.com/astral-sh/python-build-standalone/releases/"
+              "download/20260929/cpython-3.12.14+20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",),
+        sha256="ef605200f8174e87ecfc308e52a88127543f85dd5c940dc5e92cab244b98a003",
+        kind="tar.gz", dest_parent="runtimes/pbs-linux-cpython-3.12.14+20260929",
+        inner_rename="x86_64"),
 )
 
 
@@ -185,12 +199,16 @@ def managed_runtime_dir(platform: str, root: str | None = None) -> str:
 
     windows = <cache>/runtimes/pbs-cpython-3.12.14+20260929
     android = <cache>/runtimes/py-android-3.12.14（各 abi 共享父目录）
+    ★R-L17★ linux = <cache>/runtimes/pbs-linux-cpython-3.12.14+20260929
+    （各 arch 共享父目录；快照 <arch>/ 即安装根，snapshot.toml 落共享父目录）
     """
     for p in PINS:
         if p.platform == platform and _split(p.dest_parent)[0] == "runtimes":
-            if p.rootless:   # 各 abi pin 共享父目录
+            if p.rootless:   # android：各 abi pin rootless 直落 dest_parent（已含 abi 段）
                 return os.path.join(root or cache_root(),
                                     *_split(os.path.dirname(p.dest_parent)))
+            if platform == "linux":   # linux：dest_parent/<arch> 分层（inner_rename=arch）
+                return os.path.dirname(installed_dir(p, root))
             return installed_dir(p, root)
     raise ToolchainError(f"平台无托管运行时 pin: {platform}")
 
@@ -403,7 +421,7 @@ def fetch(platform: str, from_dir: str | None = None, list_only: bool = False,
     """唯一网络入口：取压缩包 → 解压安装 → 写 snapshot.toml（lock 从输入变产物）。"""
     pins = tuple(p for p in PINS if p.platform == platform)
     if not pins:
-        raise ToolchainError(f"未知平台: {platform}（目标仅 windows/android）")
+        raise ToolchainError(f"未知平台: {platform}（目标仅 windows/android/linux）")
     if list_only:
         for p in pins:
             mark = "已核定" if p.sha256 else "未核定"
@@ -510,7 +528,10 @@ def _install(pin: Pin, dl_dir: str, base: str) -> None:
                 f"{os.path.basename(archive)} 根级多条目（无内层目录），必须指定 inner_rename")
         name = pin.inner_rename or os.path.basename(inner)
         dest = os.path.join(base, *_split(pin.dest_parent), name)
-        snap = os.path.join(dest, "snapshot.toml")
+        # ★R-L17★ linux 多 arch 共享父目录快照（对齐 android rootless 口径——
+        # snapshot.toml 恒落 managed_runtime_dir，resolve 按此读取）
+        snap = os.path.join(os.path.dirname(dest) if pin.platform == "linux" else dest,
+                            "snapshot.toml")
         if os.path.isdir(dest) and _snap_has(snap, pin, sha):
             print(f"[fetch] {pin.id} 已就位（跳过）")
             return

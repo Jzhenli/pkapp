@@ -11,12 +11,45 @@ permissions:
   contents: write        # softprops/action-gh-release 创建 Release 需要写权限
 
 jobs:
+  launcher-linux:
+    # ★M3 阶段 2 条 6★ launcher ELF（manylinux2014 同容器编译，glibc 2.17 地板
+    # 对齐 D-2/D-12 v5）——artifact 供 pkapp-wheel job 收录 _vendor/shell-linux。
+    # PYINC：解压同 pin PBS linux 快照取 include/（PyConfig 头，不链 libpython）。
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch PBS headers (toolchain pin 同源)
+        run: |
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
+          # 跨 step 环境变量必须写 $GITHUB_ENV（echo 裸输出不共享）
+          echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
+      - name: Build launcher (build.sh 默认名 myapp)
+        working-directory: shell-linux
+        shell: bash
+        run: ./build.sh myapp "" "$PYINC"
+      - name: Selftest (算法向量)
+        working-directory: shell-linux
+        shell: bash
+        run: ./build/myapp --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-elf-x86_64
+          path: shell-linux/build/myapp
+
   pkapp-wheel:
+    needs: launcher-linux
     runs-on: windows-latest      # 壳是 MSVC /MT 产物，构建机须带 VS2022 C++ 工具链
     env:
       PYTHONUTF8: "1"            # runner 默认 cp1252，中文输出/构建日志统一 UTF-8
     steps:
       - uses: actions/checkout@v4
+      - name: Download launcher artifact → vendor 源位
+        uses: actions/download-artifact@v4
+        with:
+          name: launcher-elf-x86_64
+          path: shell-linux/build        # _vendor_shell_linux 源位（…/build/myapp）
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

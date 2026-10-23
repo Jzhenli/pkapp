@@ -1,6 +1,7 @@
 """pkapp fetch <platform>：工具链托管——唯一网络入口（build/package 绝不隐式联网）。
 
-windows = PBS CPython 运行时；android = JDK17/Gradle/SDK 五组件 + py-android 运行时。
+windows = PBS CPython 运行时；android = JDK17/Gradle/SDK 五组件 + py-android 运行时；
+linux = PBS CPython 运行时（M3 阶段 2 起，x86_64 先行，armv7 随阶段 5）。
 sha256 全程校验（google 四包未核定 → 打印实测哈希提示回填）；--from <目录> 离线导入
 兜底；PKAPP_MIRROR_* 支持镜像前缀替换。
 """

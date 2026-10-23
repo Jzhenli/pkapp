@@ -19,14 +19,23 @@ from . import runtime
 from .closure import check_closure
 from .consolidate import APPLOCAL_UNIT, _consolidate_site_packages
 from .deps import (_android_pip_tags, _detect_applocal, _install_site_packages,
-                   _wheels_cache)
+                   _linux_pip_tags, _wheels_cache)
 from .emit import _emit_spk, _manifest_fields
 from .encrypt import _encrypt_app_tree, _ensure_same_runtime_version
 from .errors import BuildError
+from .keybuild import _stage_keylib
 from .keylib import ensure_obf_key
 from .pyc import (_app_hash_plaintext, _compile_checked_hash, _compile_flat_tree,
                   _zip_lib)
 from .runtime import RuntimeResolveError
+
+# 保守档精简（flet python-build 同款共识死重，258d7f5 实测 Windows -3.2MB /
+# Linux -2.7MB）：工具链自举/开发工具/彩蛋——正常业务代码物理上不 import。
+# ★两平台同源★（windows Lib 拷贝 + linux stdlib 拷贝共用，防清单漂移）；
+# 回归锚 test_packager.test_conservative_trim_anchor 双向防丢。
+_TRIM_IGNORE_LIB = ("ensurepip", "idlelib", "pydoc_data", "lib2to3",
+                    "turtledemo", "rlcompleter.py", "tabnanny.py",
+                    "antigravity.py", "this.py", "__hello__.py", "__phello__")
 
 
 def _entry_protected_pairs(entry: str) -> frozenset:
@@ -51,8 +60,11 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
     if platform == "android":
         return _build_spk_android(project_dir, spec, out_path,
                                   private_key=private_key, wheels_dir=wheels_dir)
+    if platform == "linux":
+        return _build_spk_linux(project_dir, spec, out_path,
+                                private_key=private_key, wheels_dir=wheels_dir)
     if platform != "windows":
-        raise BuildError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
+        raise BuildError(f"{platform} 目标不支持（当前支持 windows/android/linux）")
 
     snapshot = runtime.resolve(spec, platform)
     stem = runtime.dll_stem(snapshot.python_dll)
@@ -77,12 +89,7 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         shutil.copytree(os.path.join(snapshot.dir, "Lib"), lib_work,
                         ignore=shutil.ignore_patterns(
                             "site-packages", "test", "tests", "__pycache__",
-                            # 保守档精简（flet python-build 同款共识死重）：
-                            # 工具链自举/开发工具/彩蛋——正常业务代码物理上不 import
-                            "ensurepip", "idlelib", "pydoc_data", "lib2to3",
-                            "turtledemo", "rlcompleter.py", "tabnanny.py",
-                            "antigravity.py", "this.py", "__hello__.py",
-                            "__phello__"),
+                            *_TRIM_IGNORE_LIB),
                         dirs_exist_ok=True)  # mkdtemp 已建空目录
         _compile_checked_hash(lib_work, _snapshot_exe, snapshot.python_dll,
                               unchecked=True)
@@ -300,3 +307,163 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         return _emit_spk(stage, fields, out_path, private_key)   # android 无侧车（Q3 不进 P0）
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+
+
+def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
+                     private_key: str | None = None,
+                     wheels_dir: str | None = None) -> dict:
+    """Linux spk（M3 阶段 2；LINUX_M3_PLAN §4.6 条 4/7 定案 + §5 差异点清单）。
+
+    windows 同构管线全复用（deps.zip + loose 收拢 + applocal + 加密链 + 侧车），
+    差异点：
+    - 快照 <arch>/ 布局：libpython 真件在 <arch>/lib/、stdlib 在 <arch>/lib/python3.12/
+      （runtime.resolve R-L17 已按 arch 解析）；
+    - manifest python_dll = libpython3.12.so.1.0（launcher dlopen _runtime/<键>）；
+    - stdlib zip 名恒 python312.zip（定案）；
+    - 无根伴生 DLL / DLLs/（PBS linux 扩展静态编入 libpython，动态扩展走
+      lib-dynload/ 整体拷入）；
+    - spk 内无 ._pth（★D-5★ 部署态 <launcher 名>._pth 由 package 期生成，引用
+      _runtime/ 内条目）——consolidate 产出的 windows 形态 _pth 落 stage 即删；
+    - 编译面解释器 = windows 快照 python.exe 借编（pyc 字节与目标平台无关，
+      android 同款先例；哨兵按"编译器实际版本"校验——pyc.py 已修 .so 版本链归一）；
+    - setproctitle 依赖追加（B.y，spec.linux.setproctitle 缺省开）；
+    - wheels 平台标签 manylinux2014_<arch>（D-12 v5 PyPI 交叉下载主路线）；
+    - 加密态：运行期 keylib 件 pkapp_key.so 烧 K 进 spk 根（§4.6 条 7——launcher
+      dlopen 与 applocal ctypes 同件同源）；nt host 无 linux 工具链 → keybuild
+      fail-fast（指路 WSL2/CI，阶段 2 条 4）。
+    - tcl/tk 运行期库不进 spk（冒烟定案口径，smoke spk 无 tcl/tk）——_tkinter.so +
+      tkinter/ + turtle.py 同步裁除（防"打包成功、运行期 dlopen libtcl 失败"炸弹）；
+      tk 支持随 spec 开关另议（须连带 6.99MB tcl/tk 全家 + TCL_LIBRARY 路径）。
+    - linux 闭包自检（ELF DT_NEEDED 扫描）随后续接线——本阶段动态扩展集 =
+      _crypt/_dbm（libc 族依赖），冒烟定案已实证加载链。
+    """
+    if len(spec.linux.abis) != 1:      # 数据层已拦（LinuxSpec.validate），防御同 android
+        raise BuildError(f"[platforms.linux].abis 须为单架构（当前 {list(spec.linux.abis)}）")
+    snapshot = runtime.resolve(spec, "linux", abis=spec.linux.abis)
+    arch = spec.linux.abis[0]
+    # 编译面解释器 = windows 快照 python.exe 借编（缺 windows 快照回退打包机解释器，
+    # 版本比对由哨兵锁定）。pyc_dll 恒描述"实际编译器"（哨兵语义），manifest 用
+    # linux 真名。
+    pyc_exe = None
+    pyc_dll = "python312.dll"
+    try:
+        win = runtime.resolve(spec, "windows")
+        pyc_exe = os.path.join(win.dir, "python.exe")
+        pyc_dll = win.python_dll
+        if spec.code_encryption:
+            _ensure_same_runtime_version(win.python_version, snapshot.python_version)
+    except RuntimeResolveError:
+        pass
+    pyc_tag = "cpython-" + "".join(snapshot.python_version.split(".")[:2])
+    # stdlib 目录/zip 名派生（防族锁升级漂移：review #5——"3.12.14" → lib "python3.12"
+    # / stem "python312"，快照实际版本为源，与 pin 对账一致由 resolve 保证）
+    maj_min = ".".join(snapshot.python_version.split(".")[:2])     # "3.12"
+    stdlib_stem = "python" + maj_min.replace(".", "")              # "python312"
+
+    stage = tempfile.mkdtemp(prefix="pkapp-build-linux-")
+    lib_work = tempfile.mkdtemp(prefix="pkapp-libwork-linux-")
+    try:
+        # 1) libpython 真件 → spk 根（定案条 4；launcher dlopen _runtime/<python_dll>）
+        shutil.copyfile(os.path.join(snapshot.dir, "lib", snapshot.python_dll),
+                        os.path.join(stage, snapshot.python_dll))
+        # 2) 标准库 zip（<arch>/lib/python<maj_min>/ → <stdlib_stem>.zip；保守档清单与
+        #    windows 同源（_TRIM_IGNORE_LIB）；linux 特有排除：lib-dynload/config-*/
+        #    tkinter/turtle——见本函数 docstring）
+        shutil.copytree(os.path.join(snapshot.dir, "lib", f"python{maj_min}"),
+                        lib_work,
+                        ignore=shutil.ignore_patterns(
+                            "site-packages", "test", "tests", "__pycache__",
+                            *_TRIM_IGNORE_LIB,
+                            # linux 布局特有：
+                            "lib-dynload",            # 动态扩展单独拷（步骤 3）
+                            "config-*",               # 构建配置/静态库，运行期无用
+                            "tkinter", "turtle.py",   # tcl/tk 运行期库不进 spk（见 docstring）
+                        ),
+                        dirs_exist_ok=True)  # mkdtemp 已建空目录
+        _compile_checked_hash(lib_work, pyc_exe, pyc_dll, unchecked=True)
+        _zip_lib(lib_work, os.path.join(stage, f"{stdlib_stem}.zip"), pyc_tag=pyc_tag)
+        # 3) lib-dynload/（动态扩展整体拷入；.empty 占位/测试扩展/_tkinter 裁除）
+        dyn_src = os.path.join(snapshot.dir, "lib", f"python{maj_min}", "lib-dynload")
+        if os.path.isdir(dyn_src):
+            shutil.copytree(dyn_src, os.path.join(stage, "lib-dynload"),
+                            ignore=shutil.ignore_patterns(
+                                ".empty", "_test*", "_ctypes_test*", "_tkinter*"))
+        # 4) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.linux] +
+        #    setproctitle（B.y）；wheels_dir 缺省 → 托管缓存 <root>/wheels/linux/<arch>）
+        index_url, extra_index = spec.wheels_index("linux")
+        deps = spec.deps_for("linux")
+        if spec.linux.setproctitle:
+            deps = deps + ("setproctitle",)   # B.y：set_process_title 探测项
+        sp_dir = _install_site_packages(stage, deps,
+                                        wheels_dir or _wheels_cache("linux", arch),
+                                        allow_download=wheels_dir is None,
+                                        pip_tags=_linux_pip_tags(spec, arch),
+                                        index_url=index_url,
+                                        extra_index_url=extra_index)
+        if not os.path.isdir(os.path.join(sp_dir, "certifi")):
+            raise BuildError("site-packages 缺 certifi（B.v 出网信任链硬约束，B.z⑥）")
+        # 5) 收拢（windows 同构：deps.zip + site-packages/loose/ + applocal flat
+        #    pyc）；linux spk 不携带 ._pth（D-5）——consolidate 的 windows 形态
+        #    _pth 落 stage 即删（不进 tree_hash/integrity 面）
+        applocal_version = _detect_applocal(sp_dir)
+        _consolidate_site_packages(stage, sp_dir, pyc_exe, pyc_dll, stdlib_stem)
+        gen_pth = os.path.join(stage, f"{stdlib_stem}._pth")
+        if os.path.isfile(gen_pth):
+            os.remove(gen_pth)
+        # 6) app/ 与 ui/（同 windows：packager 永不改写 app 内容；ui 恒存在）
+        app_src = os.path.join(project_dir, spec.app_dir)
+        if not os.path.isdir(app_src):
+            raise BuildError(f"项目缺 {spec.app_dir}/ 目录")
+        copy_tree(app_src, os.path.join(stage, "app"))
+        ui_src = os.path.join(project_dir, spec.dist_dir)
+        if os.path.isdir(ui_src) and os.listdir(ui_src):
+            copy_tree(ui_src, os.path.join(stage, "ui"))
+        else:
+            _placeholder_ui(os.path.join(stage, "ui"))
+        # 7) app/ checked-hash pyc（B.u）+ 混淆（同 windows；编译器 = 借编 exe）
+        app_stage = os.path.join(stage, "app")
+        obf_key = ensure_obf_key(project_dir) if spec.code_obfuscation else None
+        obf_stats = _compile_checked_hash(app_stage, pyc_exe, pyc_dll,
+                                          obfuscate=spec.code_obfuscation,
+                                          obf_key=obf_key,
+                                          protected_pairs=_entry_protected_pairs(spec.entry))
+        if obf_stats["renamed"] + obf_stats["stripped"] + obf_stats["strings"] > 0:
+            print(f"[build] app/ 混淆：改名 {obf_stats['renamed']} 符号/"
+                  f"剥离 {obf_stats['stripped']} docstring/"
+                  f"加密 {obf_stats['strings']} 字符串")
+        if obf_stats.get("exempt"):
+            parts = " ".join(f"{k}={v}" for k, v in sorted(obf_stats["exempt"].items()))
+            print(f"[build] app/ 改名豁免：{parts}")
+        # 7b) app_hash（加密前明文 marshal 载荷哈希——与 K 解耦，档位1 §3.2）
+        app_hash = _app_hash_plaintext(app_stage, pyc_tag)
+        # 7c) 代码加密 + 运行期 keylib 件烧 K 进 spk 根（§4.6 条 7）
+        code_key_id = ""
+        code_salt = ""
+        if spec.code_encryption:
+            salt = secrets.token_bytes(32) if spec.per_build_salt else None
+            if salt is not None:
+                code_salt = salt.hex()     # manifest code_salt（R-2 per-build 档）
+            code_key_id = _encrypt_app_tree(stage, pyc_exe, pyc_dll,
+                                            spec.name, salt)
+            rc = _stage_keylib(stage, code_key_id, "linux",
+                               app_id=spec.name, salt_hex=code_salt)
+            if rc != 0:
+                raise BuildError(
+                    "linux 运行期 keylib 件不可得：现场编译需 linux 工具链"
+                    "（WSL2/CI 构建加密态），或以 PKAPP_KEYLIB 指定自管件")
+        # 8) 树哈希 + manifest + 侧车 + spk（linux 闭包 ELF 扫描随后续接线，
+        #    见 docstring；spk_hash 排除口径由 emit 统一承担——§4.6 条 3）
+        runtime_hash = tree_hash(stage, excludes=("app", "ui"))
+        fields = _manifest_fields(spec, "linux", snapshot.python_dll,
+                                  f"sha256:{runtime_hash}",
+                                  applocal_version,
+                                  app_hash,
+                                  os.path.join(stage, "ui"),
+                                  code_key_id=code_key_id, code_salt=code_salt)
+        itext = integrity.render(integrity.build_entries(stage))
+        isig = integrity.sign_manifest(itext, private_key)
+        return _emit_spk(stage, fields, out_path, private_key,
+                         integrity_sidecar=integrity.spk_sidecar_entries(itext, isig))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(lib_work, ignore_errors=True)

@@ -183,11 +183,11 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
       明示降级——§3.3"预制件分发模式退化为 fallback"）。
     两条路径产物 key_id 同为 SHA256(K_app)[:16] hex——闸门语义零差异。
 
-    ★android 例外（H4 fail-fast 2026-10）★：android 无 fallback——单槽预制
-    so 无 ABI 语义，锚点补丁会把错 ABI 件打进 APK（key_id 配对正确、目标机
-    dlopen 即崩），且能执行 android 打包的机器必已装 NDK（fetch android 必含）。
-    编译不可得 → KeyLibError；自管件（模式 B）经 PKAPP_KEYLIB 显式指定，
-    由调用方（_stage_keylib）处理。
+    ★android/linux 例外（H4 fail-fast 2026-10；linux 同款 M3 条 4）★：无
+    fallback——单槽预制件无 ABI/arch 语义，锚点补丁会把错 ABI/arch 件打进包
+    （key_id 配对正确、目标机加载即崩）。linux 现场编译需目标工具链（交叉编译
+    或同架构 linux host——WSL2/CI），不可得 → KeyLibError 指路；自管件（模式 B）
+    经 PKAPP_KEYLIB 显式指定，由调用方（_stage_keylib）处理。
     """
     try:
         compile_keylib(platform, k_app, out_path, abi=abi)
@@ -200,6 +200,11 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
             "必需工具链（pkapp fetch android 或设 ANDROID_NDK_HOME）。android 无"
             "预制件退化路径（单槽 so 会把错 ABI 件打进 APK）；自管件请设 "
             "PKAPP_KEYLIB 显式指定")
+    if platform == "linux":
+        raise KeyLibError(
+            f"linux keylib 现场编译不可得（{reason}）——加密态构建需 linux 工具链"
+            "（WSL2：wsl 内重跑，或 CI ubuntu job）。linux 无预制件退化路径"
+            "（单槽 so 会把错 arch 件打进包）；自管件请设 PKAPP_KEYLIB 显式指定")
     prefab = locate_dll(platform)
     if not prefab:
         raise KeyLibError(
@@ -227,9 +232,15 @@ def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
     compile/patch 两条路径的契约保证）。
     返回 0 = 成功；非 0 = 失败（调用方保留 staging 现场）。
     """
-    out_name = "pkapp_key.dll" if platform == "windows" else "lib_pkapp_key.so"
-    expect_vendored = "_vendor/keylib/windows/pkapp_key.dll" if platform == "windows" \
-        else "PKAPP_KEYLIB 指定的 android 自管件（android 无包内置预制件）"
+    # ★M3 定案（LINUX_M3_PLAN §4.6 条 7）★：linux 运行期件名 pkapp_key.so @ spk
+    # 根（解包后 _runtime/pkapp_key.so——launcher dlopen 与 applocal ctypes 同件
+    # 同源）；android 沿用 lib_pkapp_key.so（APK jniLibs 命名约定）。
+    out_name = {"windows": "pkapp_key.dll", "linux": "pkapp_key.so"}.get(
+        platform, "lib_pkapp_key.so")
+    expect_vendored = {"windows": "_vendor/keylib/windows/pkapp_key.dll",
+                       "linux": "PKAPP_KEYLIB 指定的 linux 自管件"
+                       "（linux 无包内置预制件，现场编译优先）"}.get(
+        platform, "PKAPP_KEYLIB 指定的 android 自管件（android 无包内置预制件）")
     try:
         try:
             salt = bytes.fromhex(salt_hex) if salt_hex else None

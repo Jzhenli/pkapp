@@ -66,11 +66,15 @@ def artifact_name(name: str, version: str, platform: str,
     """终产物命名：{name}-{version}-{platform}-{arch}.{ext}——平台/架构一目了然。
 
     android arch = abi 列表拼接（abi 内 '-' 转 '_'，如 arm64_v8a-x86_64）；
-    windows 固定 x86_64（PBS pin 当前仅 x86_64-pc-windows-msvc）。
+    windows 固定 x86_64（PBS pin 当前仅 x86_64-pc-windows-msvc）；
+    ★M3★ linux = 单 arch（LinuxSpec.abis 口径，§5 产物名定案带 arch）。
     """
     if platform == "android":
         arch = "-".join(a.replace("-", "_") for a in abis) or "universal"
         ext = "apk"
+    elif platform == "linux":
+        arch = abis[0] if abis else "x86_64"
+        ext = "tar.gz"
     else:
         arch, ext = "x86_64", "zip"
     return f"{name}-{version}-{platform}-{arch}.{ext}"

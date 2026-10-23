@@ -216,6 +216,10 @@ def _parse_pyc_stats(stdout: str) -> dict:
 _COMPILE_CHILD = """\
 import os, sys
 expected = sys.argv[2]                     # 形如 python312.dll
+# ★M3★ .so 版本链归一：libpython3.12.so.1.0 → libpython3.12.so（裸版本后缀数字
+# 会污染抽取得 (312,10)；剥离 .so 后链再抽即 (3,12)，docstring 口径本就如此）
+if ".so" in expected:
+    expected = expected.split(".so")[0] + ".so"
 digits = "".join(c for c in expected if c.isdigit())
 if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     print("PYC-VERSION-MISMATCH", sys.version)
@@ -315,6 +319,9 @@ if obf:
 _COMPILE_ONE = """\
 import sys, os, py_compile
 expected = os.path.basename(sys.argv[1])
+# ★M3★ .so 版本链归一（同 _COMPILE_CHILD）：libpython3.12.so.1.0 → (3,12)
+if ".so" in expected:
+    expected = expected.split(".so")[0] + ".so"
 digits = "".join(c for c in expected if c.isdigit())
 if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     sys.exit(2)
@@ -328,9 +335,14 @@ def _dll_version_pair(python_dll: str) -> tuple[int, int]:
     """从解释器本体文件名抽 (major, minor)：python312.dll / libpython3.12.so → (3,12)。
 
     ★只对 basename 抽取★——完整路径里的目录数字（如 runtimes\\3.12\\）会污染
-    结果。文件名不足 3 位版本数字 → (0, 0)（形态未知的命名，调用方跳过校验）。
+    结果。★M3★ .so 版本链归一（同 _COMPILE_CHILD）：libpython3.12.so.1.0 的裸
+    版本后缀数字先剥离（→ libpython3.12.so）再抽取，否则得 (312,10) 误判。
+    文件名不足 3 位版本数字 → (0, 0)（形态未知的命名，调用方跳过校验）。
     """
-    digits = "".join(c for c in os.path.basename(python_dll) if c.isdigit())
+    base = os.path.basename(python_dll)
+    if ".so" in base:
+        base = base.split(".so")[0] + ".so"
+    digits = "".join(c for c in base if c.isdigit())
     if len(digits) < 3:
         return (0, 0)
     return (int(digits[:-2]), int(digits[-2:]))

@@ -94,6 +94,42 @@ def make_mock_android_runtime(root: str, abis: tuple = ("arm64-v8a",)) -> str:
     return root
 
 
+def make_mock_linux_runtime(root: str, arch: str = "x86_64") -> str:
+    """构造 PBS linux install_only 同构假快照（★M3 阶段 2★）：<root>/<arch>/ 即
+    安装根——lib/libpython3.12.so.1.0（真件）+ lib/python3.12/ stdlib 源码 +
+    lib-dynload/（.so 扩展，.empty 占位对齐 PBS armv7 实测形态）。
+    """
+    d = os.path.join(root, arch)
+    std = os.path.join(d, "lib", "python3.12")
+    os.makedirs(os.path.join(std, "json"), exist_ok=True)
+    os.makedirs(os.path.join(std, "lib-dynload"), exist_ok=True)
+    with open(os.path.join(d, "lib", "libpython3.12.so.1.0"), "wb") as f:
+        f.write(b"\x7fELF-mock-libpython")
+    with open(os.path.join(d, "lib", "libpython3.12.so"), "wb") as f:
+        f.write(b"soname-link")                  # 裸 .so 名（真件优先口径的负样本）
+    with open(os.path.join(std, "os.py"), "w") as f:
+        f.write("a = 1\n")
+    with open(os.path.join(std, "turtle.py"), "w") as f:
+        f.write("import tkinter\n")              # 去 tk 联动裁除的负样本
+    os.makedirs(os.path.join(std, "ensurepip"), exist_ok=True)
+    os.makedirs(os.path.join(std, "config-3.12-x86_64-linux-gnu"), exist_ok=True)
+    with open(os.path.join(std, "ensurepip", "_in_process.py"), "w") as f:
+        f.write("bootstrap\n")                   # 保守档裁除的负样本
+    with open(os.path.join(std, "json", "__init__.py"), "w") as f:
+        f.write("b = 2\n")
+    with open(os.path.join(std, "config-3.12-x86_64-linux-gnu", "Makefile"), "w") as f:
+        f.write("# build config\n")
+    with open(os.path.join(std, "lib-dynload", ".empty"), "w") as f:
+        f.write("")
+    with open(os.path.join(std, "lib-dynload",
+                           "_dbm.cpython-312-x86_64-linux-gnu.so"), "wb") as f:
+        f.write(b"\x7fELF-mock-dbm")
+    with open(os.path.join(std, "lib-dynload",
+                           "_tkinter.cpython-312-x86_64-linux-gnu.so"), "wb") as f:
+        f.write(b"\x7fELF-mock-tkinter")         # 去 tk 联动裁除的负样本
+    return root
+
+
 def make_wheel(wheels_dir: str, name: str, version: str,
                files: dict[str, str]) -> str:
     """构造最小合法 wheel（METADATA/WHEEL/RECORD 齐全），pip --no-index 可装入。"""

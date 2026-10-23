@@ -49,6 +49,19 @@ def mock_android_runtime(pkapp_cache):
     return root
 
 
+@pytest.fixture
+def mock_linux_runtime(pkapp_cache):
+    """linux 托管快照（★M3 阶段 2★）：PBS install_only 同构 <root>/<arch>/ 布局 +
+    snapshot.toml 落各 arch 共享父目录（managed_runtime_dir("linux") 同源）。"""
+    from pkapp import toolchain
+    from pkapp.tools.mockkit import make_mock_linux_runtime
+    root = toolchain.managed_runtime_dir("linux")
+    make_mock_linux_runtime(root, arch="x86_64")
+    with open(os.path.join(root, "snapshot.toml"), "w", encoding="utf-8") as f:
+        f.write('python_version = "3.12.14"\n')
+    return root
+
+
 @pytest.fixture(autouse=True)
 def _master_key_isolation(tmp_path, monkeypatch):
     """★档位1★ K_master 测试隔离：env 未显式设 PKAPP_MASTER_KEY 的用例绝不触碰
@@ -112,5 +125,20 @@ def project(tmp_path, mock_runtime, wheels_dir):
 
     root = str(tmp_path / "demo")
     assert cmd_create("demo", root, no_venv=True) == 0
+    sign.generate_keypair(os.path.join(root, ".pkapp"))
+    return root
+
+
+@pytest.fixture
+def linux_project(tmp_path, mock_runtime, mock_linux_runtime, wheels_dir):
+    """★M3 阶段 2★ linux 构建项目：windows mock（借编解释器）+ linux mock 快照
+    （托管路径）+ 激活的 [platforms.linux] 段（模板段为注释态，追加实体段）。"""
+    from pkapp.commands.create import cmd_create
+    from pkapp.packager import sign
+
+    root = str(tmp_path / "demo")
+    assert cmd_create("demo", root, no_venv=True) == 0
+    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write('\n[platforms.linux]\npython_version = "3.12.14"\n')
     sign.generate_keypair(os.path.join(root, ".pkapp"))
     return root

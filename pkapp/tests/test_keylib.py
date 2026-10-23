@@ -688,6 +688,38 @@ def test_stage_keylib_android_compile_fail_fails_hard(tmp_path, monkeypatch):
     assert not os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
 
 
+def test_stage_keylib_linux_compile_fail_fails_hard(tmp_path, monkeypatch):
+    """★M3 条 4★ linux 编译不可得 → rc=2 fail-fast，绝无预制件退化（H4 同款：
+    单槽 so 错 arch 打包风险——locate_dll("linux") 仅认 PKAPP_KEYLIB）。"""
+    from pkapp.packager.keybuild import _stage_keylib
+    from pkapp.packager import keybuild, keylib as kl
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    _set_master(monkeypatch)
+
+    def _no_compile(*_a, **_k):
+        raise kl.KeyLibError("测试强制：现场编译不可得（nt host 无 linux 工具链模拟）")
+
+    monkeypatch.setattr(keybuild, "compile_keylib", _no_compile)
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    k_app = kl.derive_k_app(kl.resolve_master_key(create=False)[0], "myapp")
+    assert _stage_keylib(stage, kl.key_id_hex(k_app), "linux",
+                         app_id="myapp") == 2
+    assert not os.path.isfile(os.path.join(stage, "pkapp_key.so"))
+
+
+def test_locate_dll_linux_env_only(monkeypatch):
+    """★M3 条 4★ linux 预制件定位仅认 PKAPP_KEYLIB（H4 同款纵深）：仓库/包内置
+    探测路径恒不命中——vendor 不收录 keylib/linux（架构对齐 android 不收录锚）。"""
+    from pkapp.packager import keylib as kl
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    assert kl.locate_dll("linux") is None
+    monkeypatch.setenv("PKAPP_KEYLIB", "N:/no/such/pkapp_key.so")
+    assert kl.locate_dll("linux") is None      # env 指向不存在文件 → None（不回退）
+
+
 # ---------------------------------------------------------------- 阶段2c：applocal 运行期 finder（跨包契约）
 _APPLOCAL = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "applocal")

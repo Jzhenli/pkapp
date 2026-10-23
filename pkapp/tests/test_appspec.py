@@ -177,3 +177,36 @@ def test_build_section_abolished(tmp_path):
         f.write("\n[build]\npyc_only = true\n")
     with pytest.raises(SpecError, match="已废除"):
         load(os.path.join(root, "pkapp.toml"))
+
+
+def test_linux_abis_default_and_parse(tmp_path):
+    """★R-L17★ [platforms.linux].abis：缺省 ("x86_64",)；显式配置解析（模板段为
+    注释态，追加实体段激活）。"""
+    root = _make(tmp_path, "l1")
+    spec = load(os.path.join(root, "pkapp.toml"))
+    assert spec.linux.abis == ("x86_64",)
+    assert spec.linux.python_version == "" and spec.linux.runtime_dir == ""
+    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write('\n[platforms.linux]\nabis = ["aarch64"]\n'
+                'python_version = "3.12.14"\n')
+    spec2 = load(os.path.join(root, "pkapp.toml"))
+    assert spec2.linux.abis == ("aarch64",)
+    assert spec2.linux.python_version == "3.12.14"
+
+
+def test_linux_abis_unknown_arch(tmp_path):
+    """★R-L17★ 架构值域校验：未知架构报错（x86_64 / aarch64 / armv7l）。"""
+    root = _make(tmp_path, "l2")
+    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write('\n[platforms.linux]\nabis = ["riscv64"]\n')
+    with pytest.raises(SpecError, match="未知架构"):
+        load(os.path.join(root, "pkapp.toml"))
+
+
+def test_linux_abis_multi_rejected(tmp_path):
+    """★R-L17★ 单架构约束（对齐 android 单 ABI 构建）：多架构报错、指引分次构建。"""
+    root = _make(tmp_path, "l3")
+    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write('\n[platforms.linux]\nabis = ["x86_64", "aarch64"]\n')
+    with pytest.raises(SpecError, match="单架构"):
+        load(os.path.join(root, "pkapp.toml"))

@@ -18,6 +18,10 @@ _SHELL = os.path.join(_REPO, "shell-windows", "build", "MyApp.exe")
 def _make_project(tmp_path):
     proj = str(tmp_path / "myapp")
     assert main(["create", "myapp", "--dir", proj, "--no-venv"]) == 0
+    # linux 段统一启用（python_version 声明 = package linux 声明闸门必需；
+    # 对 windows/android 用例无害——load 白名单收段）
+    with open(os.path.join(proj, "pkapp.toml"), "a", encoding="utf-8") as f:
+        f.write('\n[platforms.linux]\npython_version = "3.12.14"\n')
     return proj
 
 
@@ -471,13 +475,14 @@ def test_package_arch_non_android_rejected(tmp_path, capsys):
 def test_build_arch_non_android_rejected(tmp_path, capsys):
     assert main(["build", "windows", "--project", str(tmp_path),
                  "--arch", "arm64-v8a"]) == 2
-    assert "--arch 仅支持 android" in capsys.readouterr().out
+    # ★M3★ 文案泛化：windows 仍拒（--arch 仅支持 android/linux 平台）
+    assert "--arch 仅支持 android/linux" in capsys.readouterr().out
 
 
 def test_build_arch_multi_value_rejected(tmp_path, capsys):
     assert main(["build", "android", "--project", str(tmp_path),
                  "--arch", "arm64-v8a,armeabi-v7a"]) == 2
-    assert "单 ABI" in capsys.readouterr().out
+    assert "单键" in capsys.readouterr().out   # ★M3★ 文案泛化（android/linux 共用）
 
 
 def test_build_arch_override_records_meta(tmp_path, monkeypatch, pkapp_cache):
@@ -538,3 +543,103 @@ def test_package_android_meta_spk_hash_mismatch_rejected(tmp_path, monkeypatch, 
     assert main(["package", "android", "--project", proj,
                  "--shell-dir", _bare_template(tmp_path)]) == 2
     assert "不匹配" in capsys.readouterr().out
+
+
+# ---- ★M3 阶段 2★ linux 终产物（tar.gz：launcher + spk + 部署 ._pth + 侧车 + .service）----
+
+def test_package_linux_requires_spk(tmp_path, capsys):
+    proj = _make_project(tmp_path)
+    assert main(["package", "linux", "--project", proj]) == 2
+    assert "未找到 spk" in capsys.readouterr().out
+
+
+def test_package_linux_no_launcher_hardfail(tmp_path, capsys, monkeypatch):
+    """R-L19 双保险：launcher ELF 不可得 → 硬失败拒出包（绝不静默产出无壳 tar.gz）。"""
+    proj = _make_project(tmp_path)
+    _write_spk(proj, "linux")
+    assert main(["package", "linux", "--project", proj]) == 2
+    out = capsys.readouterr().out
+    assert "未找到 launcher ELF" in out
+    assert "拒绝出包" in out
+    assert not os.path.isdir(os.path.join(proj, "release"))
+
+
+def _fake_launcher(tmp_path, pub_hex: str) -> str:
+    """伪 launcher ELF：出厂 hex 常量在场（补丁精确锚命中形态）。"""
+    from pkapp.packager.winshell import _SHELL_DEFAULT_PUB
+    p = str(tmp_path / f"launcher-{pub_hex[:8]}")
+    with open(p, "wb") as f:
+        f.write(b"\x7fELF-payload-" + _SHELL_DEFAULT_PUB.encode("ascii")
+                + b"-tail" + (pub_hex != _SHELL_DEFAULT_PUB).to_bytes(1, "big"))
+    return p
+
+
+def _make_signed_spk(proj, platform, key):
+    """真 format 2 spk（manifest + _integrity 侧车随包，侧车提取闸门可过）。"""
+    from pkapp.packager import integrity as ig
+    from pkapp.packager import spk as spk_mod
+    spk_dir = os.path.join(proj, "build", f"platform-{platform}")
+    os.makedirs(spk_dir, exist_ok=True)
+    text = ig.render({"app/main.py": "a" * 64})
+    sig = ig.sign_manifest(text, key)
+    path = os.path.join(spk_dir, "runtime.spk")
+    entries = sorted(
+        [(spk_mod.MANIFEST_ENTRY,
+          b"format_version = 2\nname = \"myapp\"\nsignature = unsigned\n")]
+        + ig.spk_sidecar_entries(text, sig), key=lambda e: e[0].encode("utf-8"))
+    spk_mod.write_spk(path, entries)
+    return path
+
+
+def test_package_linux_golden(tmp_path, capsys, monkeypatch):
+    """★M3★ linux tar.gz golden：成员/权限/._pth 四行（D-5）/.service（D-1+D-6）/
+    公钥补丁命中（出厂锚→项目 pub）/侧车随包（D-4）/staging 焚毁/arch 产物名。"""
+    import tarfile
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import linshell, winshell
+
+    proj = _make_project(tmp_path)
+    key = sign_mod.generate_keypair(os.path.join(proj, ".pkapp"))[0]
+    pub = sign_mod.public_key_hex(key)
+    _make_signed_spk(proj, "linux", key)
+    launcher = _fake_launcher(tmp_path, winshell._SHELL_DEFAULT_PUB)
+    monkeypatch.setattr(linshell, "_shell_accepts", lambda *a, **k: (True, ""))
+
+    assert main(["package", "linux", "--project", proj, "--shell", launcher]) == 0
+    out = capsys.readouterr().out
+    assert "公钥已配对项目密钥" in out
+    tar_path = os.path.join(proj, "release", "myapp-0.1.0-linux-x86_64.tar.gz")
+    assert os.path.isfile(tar_path)
+    with tarfile.open(tar_path) as tf:
+        names = tf.getnames()
+        assert names == ["myapp/myapp", "myapp/myapp.spk", "myapp/myapp._pth",
+                         "myapp/myapp.service", "myapp/integrity.manifest",
+                         "myapp/integrity.manifest.sig"]
+        modes = {n: tf.getmember(n).mode for n in names}
+        assert modes["myapp/myapp"] == 0o755
+        assert modes["myapp/myapp.spk"] == 0o644
+        pth = tf.extractfile("myapp/myapp._pth").read().decode()
+        elf = tf.extractfile("myapp/myapp").read()
+    assert pth == "_runtime/python312.zip\n_runtime/lib-dynload\n" \
+                  "_runtime/site-packages/deps.zip\n_runtime/site-packages/loose\n"
+    assert pub.encode("ascii") in elf                       # 补丁命中项目公钥
+    assert winshell._SHELL_DEFAULT_PUB.encode("ascii") not in elf   # 出厂锚已替换
+    svc = tarfile.open(tar_path).extractfile("myapp/myapp.service").read().decode()
+    assert "ExecStart=/opt/myapp/myapp" in svc and "WatchdogSec=30" in svc
+    assert not os.path.isdir(os.path.join(proj, "build", "staging-linux"))  # 成功即焚
+
+
+def test_package_linux_gate_rejects_unpaired(tmp_path, capsys, monkeypatch):
+    """出货闸门：--selftest-spk 验不过 → 拒出包 + staging 保留现场（windows 同口径）。"""
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import linshell, winshell
+
+    proj = _make_project(tmp_path)
+    other = sign_mod.generate_keypair(str(tmp_path / "otherkey"))[0]   # 他钥签名
+    _make_signed_spk(proj, "linux", other)
+    launcher = _fake_launcher(tmp_path, winshell._SHELL_DEFAULT_PUB)
+    monkeypatch.setattr(linshell, "_shell_accepts", lambda *a, **k: (False, "bad sig"))
+    assert main(["package", "linux", "--project", proj, "--shell", launcher]) == 2
+    out = capsys.readouterr().out
+    assert "配对自检失败" in out
+    assert os.path.isdir(os.path.join(proj, "build", "staging-linux"))

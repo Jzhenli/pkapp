@@ -21,8 +21,8 @@ def cmd_package(project: str, platform: str, *, shell: str | None = None,
                 icon: str | None = None, desc: str | None = None,
                 rcedit: str | None = None, out: str | None = None,
                 arch: str | None = None) -> int:
-    if arch and platform != "android":
-        print(f"[package] --arch 仅支持 android 平台（当前 {platform}）")
+    if arch and platform not in ("android", "linux"):
+        print(f"[package] --arch 仅支持 android/linux 平台（当前 {platform}）")
         return 2
     try:
         spec = load(os.path.join(project, "pkapp.toml"))
@@ -35,5 +35,5 @@ def cmd_package(project: str, platform: str, *, shell: str | None = None,
     if platform == "android":
         return _package_android(project, spec, shell_dir=shell_dir,
                                 variant=variant, out=out, arch=arch)
-    print("[package] linux 终产物（tar.gz）M3 未实现")
-    return 2
+    from ..packager import linshell
+    return linshell._package_linux(project, spec, shell=shell, out=out, arch=arch)

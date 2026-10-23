@@ -19,6 +19,7 @@ from ..util import atomic_write, sha256_file
 # NDK 合法 ABI 集（--arch 白名单：笔误如 x86_x64 在此 fail-fast，免得建出垃圾
 # 缓存目录后，才在快照解析处伪装成"缺 <abi> 子目录"误导用户去跑 fetch）
 _ANDROID_ABIS = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+_LINUX_ARCHS = ("x86_64", "aarch64", "armv7l")   # LinuxSpec.validate 值域同源（R-L17）
 
 
 def _seed_vendored_wheel(platform: str, abis: tuple[str, ...] = ()) -> None:
@@ -26,18 +27,20 @@ def _seed_vendored_wheel(platform: str, abis: tuple[str, ...] = ()) -> None:
 
     applocal 不在 PyPI——托管缓存 allow_download 在线补齐永远装不到它，
     "先入缓存"是唯一入口（deps._uncached_deps 剔除语义）。缓存已有
-    applocal 则不覆盖（平台内多版本共存无害，pip 按需求挑）。android 缓存按
-    abi 分层（deps._wheels_cache），各 abi 目录都要播种到。
+    applocal 则不覆盖（平台内多版本共存无害，pip 按需求挑）。平台内分层键
+    （android=abi / ★M3★ linux=arch）各子目录都要播种到——读位在
+    _wheels_cache(platform, layer) 子层，种顶层 = 种进永不被读的位置
+    （android 双 ABI 缓存混判的同源教训）。
     """
     from ..vendor import wheels_dir as vendored_wheels
     src = vendored_wheels()
     if not src:
         return
+    layered = platform in ("android", "linux")
+    if layered and not abis:
+        return   # 无分层键可播（畸形 spec 随后必被单键检查拒），避免播种到永不被读的顶层
     caches = ([_wheels_cache(platform, abi) for abi in abis]
-              if platform == "android"
-              else [_wheels_cache(platform)])
-    if platform == "android" and not abis:
-        return   # 无 ABI 可播（abis=[] 畸形 spec 随后必被单 ABI 检查拒），避免播种到永不被读的顶层
+              if layered else [_wheels_cache(platform)])
     for cache in caches:
         os.makedirs(cache, exist_ok=True)
         have = {fn.split("-")[0].lower() for fn in os.listdir(cache) if fn.endswith(".whl")}
@@ -57,17 +60,21 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
         print(f"[build] 已生成密钥对:\n  私钥 {path}\n  公钥(hex, 壳内置) {pub}")
         return 0
 
-    # --arch：android 单 ABI 覆盖（spk 按单 ABI 装配是 assemble 既定约束，见
-    # assemble._build_spk_android；本参数即"分次构建多个 APK"工作流的显式开关）
+    # --arch：android/linux 单键覆盖（spk 按单键装配是 assemble 既定约束：
+    # android 单 ABI / ★M3★ linux 单 arch——本参数即"分次构建多目标"工作流的
+    # 显式开关；R-L17 数据层 LinuxSpec.abis 值域同源校验）
     abi = (arch or "").strip()
-    if abi and platform != "android":
-        print(f"[build] --arch 仅支持 android 平台（当前 {platform}）")
+    if abi and platform not in ("android", "linux"):
+        print(f"[build] --arch 仅支持 android/linux 平台（当前 {platform}）")
         return 2
     if abi and ("," in abi or " " in abi):
-        print(f"[build] --arch 须为单 ABI（当前 {arch!r}）——多 ABI 请分次构建出多个 APK")
+        print(f"[build] --arch 须为单键（当前 {arch!r}）——多目标请分次构建")
         return 2
-    if abi and abi not in _ANDROID_ABIS:
+    if abi and platform == "android" and abi not in _ANDROID_ABIS:
         print(f"[build] --arch {abi!r} 不是合法 NDK ABI（合法值：{'/'.join(_ANDROID_ABIS)}）")
+        return 2
+    if abi and platform == "linux" and abi not in _LINUX_ARCHS:
+        print(f"[build] --arch {abi!r} 不是合法 linux arch（合法值：{'/'.join(_LINUX_ARCHS)}）")
         return 2
 
     try:
@@ -76,8 +83,12 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
         print(f"[build] AppSpec 错误: {e}")
         return 2
     if abi:
-        spec = dataclasses.replace(
-            spec, android=dataclasses.replace(spec.android, abis=(abi,)))
+        if platform == "android":
+            spec = dataclasses.replace(
+                spec, android=dataclasses.replace(spec.android, abis=(abi,)))
+        else:
+            spec = dataclasses.replace(
+                spec, linux=dataclasses.replace(spec.linux, abis=(abi,)))
 
     private_key = None
     if not unsigned:
@@ -94,8 +105,8 @@ def cmd_build(project: str, *, platform: str = "windows", key: str | None = None
             print(f"[build] 未找到签名私钥——已自动生成: {private_key}")
             print(f"[build] 公钥(hex) {pub}")
 
-    _seed_vendored_wheel(platform,
-                         spec.android.abis if platform == "android" else ())
+    _seed_vendored_wheel(platform, {"android": spec.android.abis,
+                                    "linux": spec.linux.abis}.get(platform, ()))
 
     out_dir = os.path.join(project, "build", f"platform-{platform}")
     out_path = os.path.join(out_dir, "runtime.spk")

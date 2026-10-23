@@ -52,6 +52,9 @@ def fake_repo(tmp_path):
     sa.mkdir(parents=True)
     (sa / "AndroidManifest.xml").write_text("<manifest/>", encoding="utf-8")
     (root / "applocal").mkdir()
+    sl = root / "shell-linux" / "build"
+    sl.mkdir(parents=True)
+    (sl / "myapp").write_bytes(b"\x7fELF-fake-launcher")
     return str(root)
 
 
@@ -71,16 +74,17 @@ def fake_wheel(monkeypatch):
 
 
 def test_full_matrix_ok(vendor_mod, fake_repo, fake_wheel, capsys):
-    """五条目全齐 → rc=0，矩阵逐行 OK，产物落位正确。"""
+    """六条目全齐 → rc=0，矩阵逐行 OK，产物落位正确。"""
     fake_wheel(vendor_mod)
     rc = vendor_mod.run(["--require",
-                         "shell-windows,keylib-windows,keylib-src,shell-android,"
-                         "applocal-wheel"], root=fake_repo)
+                         "shell-windows,shell-linux,keylib-windows,keylib-src,"
+                         "shell-android,applocal-wheel"], root=fake_repo)
     assert rc == 0
     out = capsys.readouterr().out
-    assert out.count("[vendor] OK:") == 5
+    assert out.count("[vendor] OK:") == 6
     vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor")
     assert os.path.isfile(os.path.join(vroot, "shell", "MyApp.exe"))
+    assert os.path.isfile(os.path.join(vroot, "shell-linux", "x86_64", "myapp"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "src", "key.c"))
     assert os.path.isfile(os.path.join(vroot, "shell-android", "app",
@@ -98,6 +102,28 @@ def test_android_prebuilt_never_vendored(vendor_mod, fake_repo, fake_wheel):
     vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor", "keylib")
     assert not os.path.isdir(os.path.join(vroot, "android"))
     assert sorted(os.listdir(vroot)) == ["src", "windows"]
+
+
+def test_shell_linux_missing_is_skip_not_hard(vendor_mod, fake_wheel, tmp_path,
+                                              capsys):
+    """★M3 条 5★：launcher 缺件 → SKIP（可选条目，--require 命中才失败），
+    且 SKIP 即清旧 _vendor/shell-linux（滞留件照常进 wheel=静默陈旧变体，H4 同款）。"""
+    fake_wheel(vendor_mod)
+    root = str(tmp_path / "repo-no-launcher")
+    sw = os.path.join(root, "shell-windows", "build")     # 硬闸门原料齐（仅 launcher 缺）
+    os.makedirs(sw)
+    open(os.path.join(sw, "MyApp.exe"), "wb").close()
+    open(os.path.join(sw, "WebView2Loader.dll"), "wb").close()
+    kb = os.path.join(root, "keylib", "build")
+    os.makedirs(kb)
+    open(os.path.join(kb, "pkapp_key.dll"), "wb").close()
+    rc_no_require = vendor_mod.run([], root=root)
+    assert rc_no_require == 0
+    assert "SKIP: shell-linux" in capsys.readouterr().out
+    assert not os.path.isdir(os.path.join(
+        root, "pkapp", "pkapp", "_vendor", "shell-linux"))
+    rc_require = vendor_mod.run(["--require", "shell-linux"], root=root)
+    assert rc_require == 2                       # --require 缺件契约 rc=2（既有语义）
 
 
 def test_optional_skip_without_require(vendor_mod, fake_repo, fake_wheel, capsys):

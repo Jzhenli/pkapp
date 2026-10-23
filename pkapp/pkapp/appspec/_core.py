@@ -209,7 +209,11 @@ def load(path: str) -> AppSpec:
                     "python_version": str(seg.get("python_version", "")),
                     "runtime_dir": str(seg.get("runtime_dir", "")),
                     "watcher": android_watcher}
-        return {"setproctitle": bool(seg.get("setproctitle", True))}
+        # ★R-L17★ linux 架构维度（默认 ("x86_64",)；值域/单架构约束走 LinuxSpec.validate）
+        return {"setproctitle": bool(seg.get("setproctitle", True)),
+                "abis": tuple(seg.get("abis", ("x86_64",))),
+                "python_version": str(seg.get("python_version", "")),
+                "runtime_dir": str(seg.get("runtime_dir", ""))}
 
     # [build] 段已废除（★v0.7★ 打包布局固化为默认行为）——残留报错（防配置静默失效）
     if "build" in data:

@@ -38,8 +38,8 @@ class RuntimeSnapshot:
 
 def _declared(spec, platform: str) -> tuple[str, str]:
     """(python_version, runtime_dir 覆盖) —— 取自 pkapp.toml 对应平台段。"""
-    if platform not in ("windows", "android"):
-        raise RuntimeResolveError(f"{platform} 目标在 M3 接入（当前支持 windows/android）")
+    if platform not in ("windows", "android", "linux"):
+        raise RuntimeResolveError(f"{platform} 目标不支持（当前支持 windows/android/linux）")
     ps = getattr(spec, platform)
     return ps.python_version, ps.runtime_dir
 
@@ -56,10 +56,14 @@ def _snapshot_version(root: str) -> str:
 
 
 def resolve(spec, platform: str, abis: tuple = ("arm64-v8a",)) -> RuntimeSnapshot:
-    """解析 + 校验平台快照。任何缺失/非法 → RuntimeResolveError（fail fast）。"""
+    """解析 + 校验平台快照。任何缺失/非法 → RuntimeResolveError（fail fast）。
+
+    abis 语义按平台分野：android = ABI 列表（快照 <abi>/ 子目录布局）；
+    ★R-L17★ linux = 单目标架构（元组取首元素，快照 <arch>/ 子目录布局，
+    元素即 LinuxSpec.abis 口径 x86_64/aarch64/armv7l）；windows 忽略。"""
     declared, override = _declared(spec, platform)
     if not declared:
-        seg = "windows" if platform == "windows" else "android"
+        seg = platform if platform in ("windows", "linux") else "android"
         raise RuntimeResolveError(
             f"pkapp.toml 缺 [platforms.{seg}].python_version——声明运行时意图"
             f"（如 python_version = \"{toolchain.PYTHON_VERSION}\"），"
@@ -86,7 +90,7 @@ def resolve(spec, platform: str, abis: tuple = ("arm64-v8a",)) -> RuntimeSnapsho
                 f"{root} 缺 snapshot.toml 或未记录 python_version——重跑 "
                 f"`pkapp fetch {platform}`（须由 fetch 产出，勿手工布置）")
         if version != declared:
-            seg = "windows" if platform == "windows" else "android"
+            seg = platform if platform in ("windows", "linux") else "android"
             raise RuntimeResolveError(
                 f"快照 python_version ({version}) 与 [platforms.{seg}].python_version "
                 f"({declared}) 不一致——重跑 `pkapp fetch {platform}` 或核对声明")
@@ -104,8 +108,14 @@ def resolve(spec, platform: str, abis: tuple = ("arm64-v8a",)) -> RuntimeSnapsho
             hit = _detect_android_dir(root, abi)
             dll = dll or hit  # python_dll 名三 ABI 一致，取首个
     else:
-        dll = _detect_linux_so(root)
-    return RuntimeSnapshot(platform=platform, dir=os.path.abspath(root),
+        # ★R-L17★ linux：快照 <root>/<arch>/ 布局（对齐 android <abi>/ 子目录
+        # 口径；arch 取 abis 首元素 = LinuxSpec.abis 单架构约束的目标）
+        arch = (abis or ("x86_64",))[0]
+        dll = _detect_linux_so(os.path.join(root, arch))
+    return RuntimeSnapshot(platform=platform,
+                           dir=os.path.abspath(
+                               os.path.join(root, arch)
+                               if platform == "linux" else root),
                            python_version=version, python_dll=dll,
                            abis=tuple(abis) if platform == "android" else ())
 
@@ -125,10 +135,24 @@ def _detect_windows_dll(root: str) -> str:
 
 
 def _detect_linux_so(root: str) -> str:
-    hits = sorted(glob.glob(os.path.join(root, "libpython3*.so*")))
-    if not hits:
-        raise RuntimeResolveError(f"{root} 下未找到 libpython3*.so*（Linux 快照布局）")
-    return os.path.basename(hits[0])
+    """B.t① linux 形态：共享构建断言——<root>/lib/ 必须存在 libpython3*.so*。
+
+    PBS install_only 布局（R-L8/R-L22 实测）：bin/include/lib/share 四目录，
+    libpython3.12.so.1.0 真件在 lib/，顶层无实体（libpython3.so 为 soname 软链，
+    同 windows python3.dll 转发器教训——版本后缀真件优先，避免选中裸 .so 名）。
+    同时断言 lib/python3.X/ stdlib 源码目录在场（build 期 pyc 编译面），对齐
+    windows 的 Lib/DLLs 目录检查。
+    """
+    hits = sorted(glob.glob(os.path.join(root, "lib", "libpython3*.so*")))
+    real = [h for h in hits if re.search(r"\.so(\.\d+)+$", h)]
+    if not (real or hits):
+        raise RuntimeResolveError(
+            f"{root}/lib 下未找到 libpython3*.so*（PBS linux 安装目录形态）")
+    for std in glob.glob(os.path.join(root, "lib", "python3.*")):
+        if os.path.isdir(std):
+            return os.path.basename((real or hits)[0])
+    raise RuntimeResolveError(
+        f"{root}/lib 下缺 python3.X stdlib 源码目录（PBS 安装目录形态）")
 
 
 def _detect_android_dir(root: str, abi: str) -> str:

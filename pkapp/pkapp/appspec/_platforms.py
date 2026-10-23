@@ -93,13 +93,34 @@ class AndroidSpec:
 class LinuxSpec:
     """[platforms.linux] 段（M3 目标平台，字段随 M3 扩充）。"""
     setproctitle: bool = True         # B.y：Linux 目标默认装入 setproctitle 探测项
+    # ★R-L17 架构维度★（M3 前置，仿 android.abis 口径）：目标架构元组，元素为
+    # 目录/tag 段名（x86_64 / aarch64 / armv7l，与 PBS triple 末端及产物名口径
+    # {name}-{version}-linux-{arch}.tar.gz 对齐）。M2.5 仅数据层落位——单架构
+    # 约束与消费面（pin arch 子层 / _wheels_cache arch 分层 / 产物命名）随
+    # 阶段 2 _build_spk_linux 接线；armv7l 候选值随 D-8=c 板子线启用。
+    abis: tuple[str, ...] = ("x86_64",)
+    python_version: str = ""          # 运行时意图声明 → pkapp fetch linux（B.t 同源）
+    runtime_dir: str = ""             # 逃生门：显式覆盖托管快照（<dir>/<arch>/ 布局）
     dependencies: tuple[str, ...] = ()
     index_url: str = ""
     extra_index_url: str = ""
 
     def validate(self) -> list[str]:
-        return _index_problems("[platforms.linux]",
-                               self.index_url, self.extra_index_url)
+        problems = []
+        if self.python_version and not _PYVER_RE.match(self.python_version):
+            problems.append(f"[platforms.linux].python_version 须为 3.X.Y 格式"
+                            f"（如 3.12.14）: {self.python_version!r}")
+        # 与 android 单 ABI 构建约束同源：一次构建一个目标架构（多架构 = 多次构建）
+        if len(self.abis) != 1:
+            problems.append(f"[platforms.linux].abis 须为单架构（当前 {list(self.abis)}）："
+                            "多目标架构请分次构建（缓存/产物按 arch 隔离，同 android）")
+        for a in self.abis:
+            if a not in ("x86_64", "aarch64", "armv7l"):
+                problems.append(f"[platforms.linux].abis 含未知架构 {a!r}"
+                                "（可选 x86_64 / aarch64 / armv7l）")
+        problems += _index_problems("[platforms.linux]",
+                                    self.index_url, self.extra_index_url)
+        return problems
 
 
 # 平台名 → Spec 类型（★分层吸收③的前身★：M3 时 CLI 分发注册表在此基线上扩展）
