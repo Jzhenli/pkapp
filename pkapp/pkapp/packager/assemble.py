@@ -329,8 +329,10 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
     - setproctitle 依赖追加（B.y，spec.linux.setproctitle 缺省开）；
     - wheels 平台标签 manylinux2014_<arch>（D-12 v5 PyPI 交叉下载主路线）；
     - 加密态：运行期 keylib 件 pkapp_key.so 烧 K 进 spk 根（§4.6 条 7——launcher
-      dlopen 与 applocal ctypes 同件同源）；nt host 无 linux 工具链 → keybuild
-      fail-fast（指路 WSL2/CI，阶段 2 条 4）。
+      dlopen 与 applocal ctypes 同件同源）；供给序 = host 同 arch 现场编译 >
+      per-arch 预制件锚点补丁（_vendor/keylib/linux/<arch>，CI launcher job
+      同容器编译收录）> fail-fast 指路（2026-10 D-3 边界修订：nt host 加密态
+      亦可用包内置预制件出包）。
     - tcl/tk 运行期库不进 spk（冒烟定案口径，smoke spk 无 tcl/tk）——_tkinter.so +
       tkinter/ + turtle.py 同步裁除（防"打包成功、运行期 dlopen libtcl 失败"炸弹）；
       tk 支持随 spec 开关另议（须连带 6.99MB tcl/tk 全家 + TCL_LIBRARY 路径）。
@@ -446,11 +448,14 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
             code_key_id = _encrypt_app_tree(stage, pyc_exe, pyc_dll,
                                             spec.name, salt)
             rc = _stage_keylib(stage, code_key_id, "linux",
-                               app_id=spec.name, salt_hex=code_salt)
+                               app_id=spec.name, salt_hex=code_salt,
+                               arch=arch)
             if rc != 0:
                 raise BuildError(
                     "linux 运行期 keylib 件不可得：现场编译需 linux 工具链"
-                    "（WSL2/CI 构建加密态），或以 PKAPP_KEYLIB 指定自管件")
+                    "（WSL2/CI），per-arch 预制件缺失（重跑 pkapp/scripts/"
+                    "vendor.py 或 CI launcher job artifact），或以 PKAPP_KEYLIB "
+                    "指定自管件")
         # 8) 树哈希 + manifest + 侧车 + spk（linux 闭包 ELF 扫描随后续接线，
         #    见 docstring；spk_hash 排除口径由 emit 统一承担——§4.6 条 3）
         runtime_hash = tree_hash(stage, excludes=("app", "ui"))

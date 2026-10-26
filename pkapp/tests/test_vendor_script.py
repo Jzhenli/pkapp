@@ -8,6 +8,8 @@ applocal wheel 构建步骤 monkeypatch 掉（pip wheel 不在被测面）。
 - 硬闸门条目（shell-windows/keylib-windows/applocal-wheel）缺件直接非零退出；
 - --require 命中 SKIP 条目 → rc=2 并列缺口；未知条目 → rc=2；
 - android keylib 预编译件永不收录（单槽 so ABI 错配风险已移除）；
+- linux keylib 预制件按 arch 收录 + 锚点字节校验（★linux 预制件 2026-10★，
+  H4 的 arch 语义由 per-arch 分目录消解——与 android 单槽排除形成对照）；
 - locate_dll("android") 仅认 PKAPP_KEYLIB env（keybuild 侧无退化路径配套）。
 """
 from __future__ import annotations
@@ -18,8 +20,11 @@ import shutil
 
 import pytest
 
+from pkapp.packager.keylib import ANCHOR_HEX
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VENDOR_SCRIPT = os.path.join(os.path.dirname(_HERE), "scripts", "vendor.py")
+_ANCHOR_BYTES = bytes.fromhex(ANCHOR_HEX)
 
 
 @pytest.fixture
@@ -33,7 +38,7 @@ def vendor_mod():
 
 @pytest.fixture
 def fake_repo(tmp_path):
-    """假仓库树：八条目收录原料齐备。keylib/build 额外放 lib_pkapp_key.so
+    """假仓库树：十一条目收录原料齐备。keylib/build 额外放 lib_pkapp_key.so
     （android 预编译件——收录时必须被无视，回归锚）。"""
     root = tmp_path / "repo"
     sw = root / "shell-windows" / "build"
@@ -44,6 +49,11 @@ def fake_repo(tmp_path):
     kb.mkdir(parents=True)
     (kb / "pkapp_key.dll").write_bytes(b"fake-key-holder-dll")
     (kb / "lib_pkapp_key.so").write_bytes(b"android-single-slot-so")
+    for arch in ("x86_64", "aarch64", "armv7l"):      # linux keylib 通用件 ×3
+        kbl = kb / "linux" / arch
+        kbl.mkdir(parents=True)
+        (kbl / "pkapp_key.so").write_bytes(
+            b"\x7fELF-fake-so-" + arch.encode() + b"|" + _ANCHOR_BYTES + b"|")
     ks = root / "keylib" / "src"
     ks.mkdir(parents=True)
     (ks / "key.c").write_text("/* fake key.c */", encoding="utf-8")
@@ -76,21 +86,25 @@ def fake_wheel(monkeypatch):
     return _install
 
 
+_REQUIRE_FULL = ("shell-windows,shell-linux-x86_64,shell-linux-aarch64,"
+                 "shell-linux-armv7l,keylib-windows,keylib-linux-x86_64,"
+                 "keylib-linux-aarch64,keylib-linux-armv7l,keylib-src,"
+                 "shell-android,applocal-wheel")
+
+
 def test_full_matrix_ok(vendor_mod, fake_repo, fake_wheel, capsys):
-    """八条目全齐 → rc=0，矩阵逐行 OK，产物落位正确（launcher ×3 arch 分目录）。"""
+    """十一条目全齐 → rc=0，矩阵逐行 OK，产物落位正确（launcher/keylib ×3 arch 分目录）。"""
     fake_wheel(vendor_mod)
-    rc = vendor_mod.run(["--require",
-                         "shell-windows,shell-linux-x86_64,shell-linux-aarch64,"
-                         "shell-linux-armv7l,keylib-windows,keylib-src,"
-                         "shell-android,applocal-wheel"], root=fake_repo)
+    rc = vendor_mod.run(["--require", _REQUIRE_FULL], root=fake_repo)
     assert rc == 0
     out = capsys.readouterr().out
-    assert out.count("[vendor] OK:") == 8
+    assert out.count("[vendor] OK:") == 11
     vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor")
     assert os.path.isfile(os.path.join(vroot, "shell", "MyApp.exe"))
-    assert os.path.isfile(os.path.join(vroot, "shell-linux", "x86_64", "myapp"))
-    assert os.path.isfile(os.path.join(vroot, "shell-linux", "aarch64", "myapp"))
-    assert os.path.isfile(os.path.join(vroot, "shell-linux", "armv7l", "myapp"))
+    for arch in ("x86_64", "aarch64", "armv7l"):
+        assert os.path.isfile(os.path.join(vroot, "shell-linux", arch, "myapp"))
+        assert os.path.isfile(os.path.join(vroot, "keylib", "linux", arch,
+                                           "pkapp_key.so"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "src", "key.c"))
     assert os.path.isfile(os.path.join(vroot, "shell-android", "app",
@@ -102,12 +116,12 @@ def test_full_matrix_ok(vendor_mod, fake_repo, fake_wheel, capsys):
 def test_android_prebuilt_never_vendored(vendor_mod, fake_repo, fake_wheel):
     """★H4 回归锚★：keylib/build/lib_pkapp_key.so 存在也不收录——
     _vendor/keylib/android 必须不存在（单槽 so 无 ABI 语义，锚点补丁会把
-    错 ABI 件打进 APK）。"""
+    错 ABI 件打进 APK）。linux per-arch 预制件是对照面（arch 显式分目录）。"""
     fake_wheel(vendor_mod)
     assert vendor_mod.run([], root=fake_repo) == 0
     vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor", "keylib")
     assert not os.path.isdir(os.path.join(vroot, "android"))
-    assert sorted(os.listdir(vroot)) == ["src", "windows"]
+    assert sorted(os.listdir(vroot)) == ["linux", "src", "windows"]
 
 
 def test_shell_linux_missing_is_skip_not_hard(vendor_mod, fake_wheel, tmp_path,
@@ -194,6 +208,7 @@ def test_skip_clears_stale_artifacts(vendor_mod, fake_repo, fake_wheel, capsys):
         os.path.join(vroot, "shell", "MyApp.exe"),
         os.path.join(vroot, "shell-linux", "x86_64", "myapp"),
         os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"),
+        os.path.join(vroot, "keylib", "linux", "armv7l", "pkapp_key.so"),
         os.path.join(vroot, "keylib", "src", "key.c"),
         os.path.join(vroot, "shell-android", "app", "AndroidManifest.xml"),
     }
@@ -202,16 +217,37 @@ def test_skip_clears_stale_artifacts(vendor_mod, fake_repo, fake_wheel, capsys):
         with open(p, "wb") as f:
             f.write(b"stale")
     # 源全部缺失（shell-windows / shell-linux-x86_64 / keylib-windows /
-    # keylib-src / shell-android）
+    # keylib-linux-armv7l / keylib-src / shell-android）
     os.remove(os.path.join(fake_repo, "shell-windows", "build", "MyApp.exe"))
     os.remove(os.path.join(fake_repo, "shell-linux", "build", "myapp"))
     os.remove(os.path.join(fake_repo, "keylib", "build", "pkapp_key.dll"))
+    os.remove(os.path.join(fake_repo, "keylib", "build", "linux", "armv7l",
+                           "pkapp_key.so"))
     os.remove(os.path.join(fake_repo, "keylib", "src", "key.c"))
     shutil.rmtree(os.path.join(fake_repo, "shell-android", "shell"))
     rc = vendor_mod.run([], root=fake_repo)
     assert rc == 2                                    # shell-windows 硬闸门拦截
     for p in stale:
         assert not os.path.exists(p), f"旧产物滞留: {p}"
+
+
+def test_keylib_linux_anchor_missing_rejected(vendor_mod, fake_repo, fake_wheel,
+                                              capsys):
+    """linux keylib 无锚点字节 → 拒收 SKIP（patch_dll 定位前提失效，件源
+    不对版——防错版 .so 静默进 wheel 后在用户 package 期才炸）。"""
+    fake_wheel(vendor_mod)
+    src = os.path.join(fake_repo, "keylib", "build", "linux", "x86_64",
+                       "pkapp_key.so")
+    with open(src, "wb") as f:
+        f.write(b"\x7fELF-so-without-anchor-slot")
+    assert vendor_mod.run([], root=fake_repo) == 0    # 可选条目，SKIP 不失败
+    out = capsys.readouterr().out
+    assert "SKIP: keylib-linux-x86_64" in out
+    assert "无锚点字节" in out
+    assert not os.path.isdir(os.path.join(fake_repo, "pkapp", "pkapp", "_vendor",
+                                          "keylib", "linux", "x86_64"))
+    rc = vendor_mod.run(["--require", "keylib-linux-x86_64"], root=fake_repo)
+    assert rc == 2
 
 
 def test_applocal_wheel_clears_stale_wheels(vendor_mod, fake_repo, monkeypatch):

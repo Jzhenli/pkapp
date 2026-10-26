@@ -6,8 +6,10 @@
 
 编译矩阵（§3.3 运维面）：windows=MSVC（vswhere 定位 vcvars64）、
 android=NDK clang（ANDROID_NDK_HOME > 托管 SDK > 标准 SDK 位）、linux=cc/gcc。
-编译不可得 → 预制件锚点补丁退化路径（locate_dll + patch_dll，保护面明示降级——
-件内保留锚点标记；预制件分发模式据此"退化为 fallback"，§3.3）。
+编译不可得 → 预制件锚点补丁退化路径（patch_dll；windows/android 经 locate_dll，
+linux 经 locate_linux_keylib(arch) per-arch——★linux 预制件 2026-10★，glibc
+基线与同 arch launcher 严格一致；保护面明示降级——件内保留锚点标记；预制件
+分发模式据此"退化为 fallback"，§3.3）。
 
 keylib 源码（key.c/key.h）定位序：env PKAPP_KEYLIB_SRC > 仓库 keylib/src（源码
 形态开发）> _vendor/keylib/src（wheel 形态，scripts/vendor.py 收录）。
@@ -21,7 +23,8 @@ import subprocess
 import tempfile
 
 from .keylib import (KeyLib, KeyLibError, derive_k_app, generate_kdata_c,
-                     key_id_hex, locate_dll, patch_dll, resolve_master_key)
+                     key_id_hex, locate_dll, locate_linux_keylib, patch_dll,
+                     resolve_master_key)
 
 # linux 目标（PRETECTION_ROADMAP §3.3 三平台矩阵）；windows/android 走专属定位
 _COMPILE_FLAGS = ["-O2", "-shared", "-fPIC", "-std=c17"]
@@ -174,8 +177,31 @@ def compile_keylib(platform: str, k_app: bytes, out_path: str, *,
         raise KeyLibError(f"keylib 编译无产物: {out_path}")
 
 
+def _linux_prefab_fallback(arch: str, k_app: bytes, out_path: str,
+                           reason: str) -> str:
+    """linux 预制件锚点补丁退化（★linux 预制件收录 2026-10，D-3 边界修订★）。
+
+    per-arch 通用件（_vendor/keylib/linux/<arch>/ 或仓库 build/linux/<arch>/
+    ，CI launcher job 同容器编译——glibc 基线与同 arch launcher 严格一致）+
+    锚点补丁注入 K_app。H4 的"单槽 so 无 arch 语义"由 per-arch 分目录 +
+    显式 arch 参数消解（locate 必带 arch，错 arch 件无法被静默选中）；
+    件内保留锚点标记，保护面明示降级（§3.3 同纪律）。预制件缺失 →
+    KeyLibError 指路（fail-fast 语义保留在"两头都无供给"处）。"""
+    prefab = locate_linux_keylib(arch)
+    if not prefab:
+        raise KeyLibError(
+            f"linux keylib（arch={arch}）现场编译不可得（{reason}），预制件亦缺失"
+            "——加密态构建三选一：① linux 工具链现场编译（WSL2/CI）；② 重跑 "
+            "pkapp/scripts/vendor.py 补 _vendor/keylib/linux/<arch>（CI launcher "
+            "job artifact）；③ PKAPP_KEYLIB 指定自管件")
+    patch_dll(prefab, out_path, k_app)
+    print(f"[keylib] linux 现场编译退化预制件锚点补丁（{reason}；arch={arch}，"
+          f"{prefab}）——件内保留锚点标记，保护面降级；建议 linux 工具链现场编译")
+    return "fallback"
+
+
 def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
-                   abi: str = "arm64-v8a") -> str:
+                   abi: str = "arm64-v8a", arch: str | None = None) -> str:
     """本包专属 keylib 件产出（编译优先、锚点补丁退化），返回方式说明。
 
     - "compiled"：现场定制编译（首选，件内无锚点常量）；
@@ -183,12 +209,34 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
       明示降级——§3.3"预制件分发模式退化为 fallback"）。
     两条路径产物 key_id 同为 SHA256(K_app)[:16] hex——闸门语义零差异。
 
-    ★android/linux 例外（H4 fail-fast 2026-10；linux 同款 M3 条 4）★：无
-    fallback——单槽预制件无 ABI/arch 语义，锚点补丁会把错 ABI/arch 件打进包
-    （key_id 配对正确、目标机加载即崩）。linux 现场编译需目标工具链（交叉编译
-    或同架构 linux host——WSL2/CI），不可得 → KeyLibError 指路；自管件（模式 B）
-    经 PKAPP_KEYLIB 显式指定，由调用方（_stage_keylib）处理。
+    arch 语义双轨：
+    - arch=None（缺省）＝ host 本机件（encrypt._encrypt_app_tree 的加密器路径
+      ——构建机本平台编译 + ctypes 实测加载）；
+    - arch=<目标 arch>（linux 运行期件，_stage_keylib ← assemble 传入
+      spec.linux.abis[0]）＝ 启用 host-arch 守卫：native cc 只能产 host 架构件，
+      linux host 交叉目标若放行会静默产错 arch 件（比编译失败更危险）→ 跳过
+      编译直接走 per-arch 预制件回退。
+
+    ★android 例外（H4 fail-fast 2026-10）★：无 fallback——单槽预制件无 ABI
+    语义，锚点补丁会把错 ABI 件打进包（key_id 配对正确、目标机加载即崩）。
+    android 现场编译需 NDK，不可得 → KeyLibError 指路；自管件（模式 B）经
+    PKAPP_KEYLIB 显式指定，由调用方（_stage_keylib）处理。
+
+    ★linux（预制件收录 2026-10，D-3 边界修订）★：预制件缺失才 fail-fast——
+    Windows host + linux 目标加密态经包内置 per-arch 预制件出包（_vendor/
+    keylib/linux/<arch>，CI launcher job 同容器编译，glibc 基线与同 arch
+    launcher 严格一致）。
     """
+    if platform == "linux":
+        host = os.uname().machine if hasattr(os, "uname") else None
+        target = arch or host
+        if target is None:
+            raise KeyLibError(
+                "linux keylib 须显式 arch（host arch 不可知且未传 arch）")
+        if host is not None and target != host:
+            return _linux_prefab_fallback(
+                target, k_app, out_path,
+                f"host arch {host} ≠ 目标 arch {target}（native cc 产 host 架构件）")
     try:
         compile_keylib(platform, k_app, out_path, abi=abi)
         return "compiled"
@@ -201,10 +249,8 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
             "预制件退化路径（单槽 so 会把错 ABI 件打进 APK）；自管件请设 "
             "PKAPP_KEYLIB 显式指定")
     if platform == "linux":
-        raise KeyLibError(
-            f"linux keylib 现场编译不可得（{reason}）——加密态构建需 linux 工具链"
-            "（WSL2：wsl 内重跑，或 CI ubuntu job）。linux 无预制件退化路径"
-            "（单槽 so 会把错 arch 件打进包）；自管件请设 PKAPP_KEYLIB 显式指定")
+        host = os.uname().machine if hasattr(os, "uname") else None
+        return _linux_prefab_fallback(arch or host, k_app, out_path, reason)
     prefab = locate_dll(platform)
     if not prefab:
         raise KeyLibError(
@@ -217,19 +263,21 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
 
 
 def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
-                  app_id: str, salt_hex: str = "") -> int:
+                  app_id: str, salt_hex: str = "", arch: str | None = None) -> int:
     """key-holder 件落位 staging + K 派生 + key_id 配对闸门（§6.2 + ★档位1 §3★）。
 
     ★档位1★ K 派生化：code.key 退役——现场 resolve_master_key(create=False，
     package 期缺失即 fail-fast 提示 master 准入) → derive_k_app(master, app_id,
     salt)（salt 读 spk manifest code_salt，per_build_salt 档；缺省 = 默认档常量）
     → produce_keylib 现场定制编译专属件（kdata.c 烧件），编译不可得退化为预制件
-    锚点补丁。PKAPP_KEYLIB 指定的自管件（模式 B，K 编译期内嵌）原样落位不补丁。
+    锚点补丁（linux 走 per-arch 预制件，arch 显式传入——assemble 侧
+    spec.linux.abis[0]；android 无预制件 fail-fast 不变）。PKAPP_KEYLIB 指定的
+    自管件（模式 B，K 编译期内嵌）原样落位不补丁。
     产出件 key_id 必须与 manifest code_key_id 一致——不一致 = 本机 master 与该
     spk 不配对（master 更换/丢失重生成），闸门拦下。
-    windows 构建机可 dlopen 同平台件实测；异平台件（android .so）无法 dlopen，
-    改用 Python 镜像 key_id_hex(K_app) 比对（K_app 即烧件密钥，写入正确性由
-    compile/patch 两条路径的契约保证）。
+    windows 构建机可 dlopen 同平台件实测；异平台件（android .so / linux .so）
+    无法 dlopen，改用 Python 镜像 key_id_hex(K_app) 比对（K_app 即烧件密钥，
+    写入正确性由 compile/patch 两条路径的契约保证）。
     返回 0 = 成功；非 0 = 失败（调用方保留 staging 现场）。
     """
     # ★M3 定案（LINUX_M3_PLAN §4.6 条 7）★：linux 运行期件名 pkapp_key.so @ spk
@@ -238,8 +286,8 @@ def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
     out_name = {"windows": "pkapp_key.dll", "linux": "pkapp_key.so"}.get(
         platform, "lib_pkapp_key.so")
     expect_vendored = {"windows": "_vendor/keylib/windows/pkapp_key.dll",
-                       "linux": "PKAPP_KEYLIB 指定的 linux 自管件"
-                       "（linux 无包内置预制件，现场编译优先）"}.get(
+                       "linux": f"_vendor/keylib/linux/{arch or '目标arch'}/pkapp_key.so"
+                       "（或 PKAPP_KEYLIB 指定的 linux 自管件）"}.get(
         platform, "PKAPP_KEYLIB 指定的 android 自管件（android 无包内置预制件）")
     try:
         try:
@@ -268,7 +316,7 @@ def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
                       "key_id 闸门仅验证 master↔manifest 配对")
             got = KeyLib(out_dll).key_id() if platform == "windows" else expect
         else:
-            mode = produce_keylib(platform, k_app, out_dll)
+            mode = produce_keylib(platform, k_app, out_dll, arch=arch)
             if mode == "fallback":
                 print(f"[package] 警告：keylib 现场编译不可得，退化为预制件锚点补丁"
                       "（件内保留锚点标记，保护面降级——PROTECTION_ROADMAP §3.3）")

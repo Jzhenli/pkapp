@@ -689,8 +689,9 @@ def test_stage_keylib_android_compile_fail_fails_hard(tmp_path, monkeypatch):
 
 
 def test_stage_keylib_linux_compile_fail_fails_hard(tmp_path, monkeypatch):
-    """★M3 条 4★ linux 编译不可得 → rc=2 fail-fast，绝无预制件退化（H4 同款：
-    单槽 so 错 arch 打包风险——locate_dll("linux") 仅认 PKAPP_KEYLIB）。"""
+    """linux 编译不可得 + 预制件亦缺失 → rc=2 fail-fast（★linux 预制件 2026-10
+    边界修订后语义收窄★：fail-fast 保留在"两头都无供给"处；预制件在位时走
+    fallback，见 test_produce_keylib_linux_prefab_fallback）。"""
     from pkapp.packager.keybuild import _stage_keylib
     from pkapp.packager import keybuild, keylib as kl
 
@@ -701,17 +702,102 @@ def test_stage_keylib_linux_compile_fail_fails_hard(tmp_path, monkeypatch):
         raise kl.KeyLibError("测试强制：现场编译不可得（nt host 无 linux 工具链模拟）")
 
     monkeypatch.setattr(keybuild, "compile_keylib", _no_compile)
+    monkeypatch.setattr(keybuild, "locate_linux_keylib", lambda *_a: None)
     stage = str(tmp_path / "stage")
     os.makedirs(stage)
     k_app = kl.derive_k_app(kl.resolve_master_key(create=False)[0], "myapp")
     assert _stage_keylib(stage, kl.key_id_hex(k_app), "linux",
-                         app_id="myapp") == 2
+                         app_id="myapp", arch="x86_64") == 2
     assert not os.path.isfile(os.path.join(stage, "pkapp_key.so"))
 
 
+def test_produce_keylib_linux_prefab_fallback(tmp_path, monkeypatch):
+    """★linux 预制件 2026-10★ 编译不可得 + per-arch 预制件在位 → fallback：
+    锚点补丁注入 K（patch_dll 产物），返回 "fallback"。"""
+    from pkapp.packager import keybuild, keylib as kl
+
+    prefab = tmp_path / "prefab.so"
+    prefab.write_bytes(b"\x7fELF-fake-so|" + kl.ANCHOR + b"|tail")
+    monkeypatch.setattr(keybuild, "compile_keylib",
+                        lambda *_a, **_k: (_ for _ in ()).throw(
+                            kl.KeyLibError("测试强制：现场编译不可得")))
+    monkeypatch.setattr(keybuild, "locate_linux_keylib",
+                        lambda arch: str(prefab))
+    k_app = hashlib.sha256(b"k-app-fallback").digest()
+    out = str(tmp_path / "pkapp_key.so")
+    mode = keybuild.produce_keylib("linux", k_app, out, arch="armv7l")
+    assert mode == "fallback"
+    data = open(out, "rb").read()
+    assert kl.ANCHOR not in data                       # 锚点已改写
+    assert data.startswith(b"\x7fELF-fake-so|")        # 补丁在副本上（prefab 原件不动）
+
+
+def test_produce_keylib_linux_cross_arch_guard(tmp_path, monkeypatch):
+    """host-arch 守卫：linux host 交叉目标（host ≠ 目标 arch）不得现场编译——
+    native cc 会静默产错 arch 件，必须走 per-arch 预制件回退。（Windows host
+    无 os.uname → 守卫不触发，走编译失败→回退链，另有用例覆盖。）"""
+    from pkapp.packager import keybuild, keylib as kl
+
+    if not hasattr(os, "uname"):
+        pytest.skip("os.uname 仅 POSIX")
+    calls = []
+
+    def _must_not_compile(*_a, **_k):
+        calls.append(1)
+        raise kl.KeyLibError("守卫失守：交叉目标竟走了现场编译")
+
+    prefab = tmp_path / "prefab.so"
+    prefab.write_bytes(b"\x7fELF-fake-so|" + kl.ANCHOR + b"|tail")
+    monkeypatch.setattr(keybuild, "compile_keylib", _must_not_compile)
+    monkeypatch.setattr(keybuild, "locate_linux_keylib",
+                        lambda arch: str(prefab))
+    k_app = hashlib.sha256(b"k-app-guard").digest()
+    out = str(tmp_path / "pkapp_key.so")
+    host_arch = os.uname().machine
+    other = "aarch64" if host_arch != "aarch64" else "x86_64"
+    assert keybuild.produce_keylib("linux", k_app, out, arch=other) == "fallback"
+    assert not calls                                   # 编译器未被触碰
+
+
+def test_locate_linux_keylib_per_arch(monkeypatch, tmp_path):
+    """★linux 预制件 2026-10★ locate_linux_keylib(arch) per-arch 定位：
+    包内置 _vendor 优先，仓库 keylib/build/linux/<arch> 回退；arch 进路径，
+    错 arch 件无法被静默选中（H4 的 linux 消解）。
+    回退路径为确定性断言（真实仓库位临时落件 + finally 清理）——条件断言在
+    两路皆缺的机器上会空洞通过，曾漏放 6/7 级 dirname 错层 bug。"""
+    from pkapp.packager import keylib as kl
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    assert kl.locate_linux_keylib("nonexistent-arch") is None
+    # 仓库布局 repo/pkapp/pkapp/pkapp：kl.__file__ 向上 4 级 = 仓库根
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(kl.__file__))))
+    built_dir = os.path.join(repo_root, "keylib", "build", "linux", "x86_64")
+    built = os.path.join(built_dir, "pkapp_key.so")
+    os.makedirs(built_dir, exist_ok=True)
+    with open(built, "wb") as f:
+        f.write(b"\x7fELF-repo-built-fake")
+    try:
+        assert kl.locate_linux_keylib("x86_64") == built
+        # 包内置优先：同 arch 在 _vendor 有件时压过仓库位
+        vend_dir = os.path.join(os.path.dirname(os.path.dirname(kl.__file__)),
+                                "_vendor", "keylib", "linux", "x86_64")
+        os.makedirs(vend_dir, exist_ok=True)
+        vend = os.path.join(vend_dir, "pkapp_key.so")
+        try:
+            with open(vend, "wb") as f:
+                f.write(b"\x7fELF-vendored-fake")
+            assert kl.locate_linux_keylib("x86_64") == vend
+        finally:
+            shutil.rmtree(os.path.dirname(vend_dir), ignore_errors=True)
+    finally:
+        shutil.rmtree(os.path.dirname(built_dir), ignore_errors=True)
+
+
 def test_locate_dll_linux_env_only(monkeypatch):
-    """★M3 条 4★ linux 预制件定位仅认 PKAPP_KEYLIB（H4 同款纵深）：仓库/包内置
-    探测路径恒不命中——vendor 不收录 keylib/linux（架构对齐 android 不收录锚）。"""
+    """locate_dll("linux") 仅认 PKAPP_KEYLIB（模式 B 直取路径的纵深）：通用
+    locate 不做平台探测——per-arch 定位走专用的 locate_linux_keylib(arch)
+    （★linux 预制件 2026-10★，见 test_locate_linux_keylib_per_arch）。"""
     from pkapp.packager import keylib as kl
 
     monkeypatch.delenv("PKAPP_KEYLIB", raising=False)

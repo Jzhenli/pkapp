@@ -4,10 +4,13 @@
       仓库根 shell-linux/build/{myapp,aarch64/myapp,armv7l/myapp}（launcher ELF ×3：
       x86_64 = build.sh 本地产物；arm 双线 = CI launcher job artifact 落位子目录）
       仓库根 keylib/build/pkapp_key.dll（keylib/build.bat 产物，key-holder 通用件）
+      仓库根 keylib/build/linux/<arch>/pkapp_key.so ×3（CI launcher job 同容器
+      编译产物——glibc 基线与同 arch launcher 严格一致；linux host 现场编译亦落此位）
       仓库根 shell-android/shell（源码壳模板，★方案A★：排除二进制/jniLibs/assets）
-输出：pkapp/pkapp/_vendor/{shell,shell-linux/<arch>,keylib,wheels}——包内置壳 +
-      linux launcher ELF（按 arch 分目录，package linux --arch 的壳源）+ android
-      模板 + key-holder 件（locate_dll 首选回退位；package 期锚点补丁注入 K）+
+输出：pkapp/pkapp/_vendor/{shell,shell-linux/<arch>,keylib/{windows,linux/<arch>},
+      wheels}——包内置壳 + linux launcher ELF（按 arch 分目录，package linux
+      --arch 的壳源）+ android 模板 + key-holder 件（windows + linux per-arch，
+      locate/locate_linux_keylib 首选回退位；package 期锚点补丁注入 K）+
       applocal 离线 wheel（applocal 不在 PyPI，build/create 的零配置入口全靠它）。
 
 android keylib 预编译件不收录（★H4 fail-fast 2026-10★）：单槽 so 无 ABI 语义
@@ -51,6 +54,9 @@ ENTRIES: dict[str, str] = {
     "shell-linux-aarch64": "launcher ELF aarch64（_vendor/shell-linux/aarch64/myapp，arm runner 容器编译，阶段 5）",
     "shell-linux-armv7l": "launcher ELF armv7l（_vendor/shell-linux/armv7l/myapp，ubuntu:20.04 交叉编译，阶段 5）",
     "keylib-windows": "key-holder 通用件（pkapp_key.dll，锚点补丁退化位）",
+    "keylib-linux-x86_64": "key-holder 通用件 x86_64（_vendor/keylib/linux/x86_64/pkapp_key.so，锚点补丁退化位）",
+    "keylib-linux-aarch64": "key-holder 通用件 aarch64（_vendor/keylib/linux/aarch64/pkapp_key.so，锚点补丁退化位）",
+    "keylib-linux-armv7l": "key-holder 通用件 armv7l（_vendor/keylib/linux/armv7l/pkapp_key.so，锚点补丁退化位）",
     "keylib-src": "keylib C 源码（key.c/key.h，wheel 形态现场编译供给）",
     "shell-android": "android 壳模板（源码形态）",
     "applocal-wheel": "applocal 离线 wheel（非 PyPI 私有件）",
@@ -116,6 +122,37 @@ def _vendor_keylib_windows(vroot: str, root: str) -> tuple[str, str]:
     os.makedirs(dest, exist_ok=True)
     shutil.copyfile(src, os.path.join(dest, "pkapp_key.dll"))
     return "OK", "_vendor/keylib/windows（key-holder 通用件）"
+
+
+def _vendor_keylib_linux_arch(vroot: str, root: str, arch: str) -> tuple[str, str]:
+    """linux key-holder 通用件按 arch 收录（★linux 预制件 2026-10，D-3 边界修订★）。
+
+    源位 keylib/build/linux/<arch>/pkapp_key.so（CI launcher job 同容器编译
+    产物落位——glibc 基线与同 arch launcher 严格一致；linux host 现场编译亦落
+    此位）。消费端 keybuild._linux_prefab_fallback → locate_linux_keylib(arch)
+    （per-arch 分目录，错 arch 件无法被静默选中——H4 教训的 linux 消解）。
+    锚点字节存在性校验（patch_dll 定位前提，件源不对版即拒收）。
+    SKIP 即清本 arch 子树（滞留件照常进 wheel = 静默陈旧变体，H4 同款）。"""
+    src = os.path.join(root, "keylib", "build", "linux", arch, "pkapp_key.so")
+    dest = os.path.join(vroot, "keylib", "linux", arch)
+    if not os.path.isfile(src):
+        shutil.rmtree(dest, ignore_errors=True)           # SKIP 即清旧产物（本 arch 子树）
+        return "SKIP", (f"缺 {src}——linux keylib 通用件（CI launcher job "
+                        "artifact / linux host 现场编译）")
+    try:
+        sys.path.insert(0, os.path.join(root, "pkapp"))
+        from pkapp.packager.keylib import ANCHOR_HEX      # 锚点单源（keylib.py）
+    except ImportError as e:
+        shutil.rmtree(dest, ignore_errors=True)
+        return "SKIP", f"{src} 锚点校验不可执行（pkapp.packager.keylib 导入失败: {e}）"
+    with open(src, "rb") as f:
+        n = f.read().count(bytes.fromhex(ANCHOR_HEX))
+    if n < 1:
+        shutil.rmtree(dest, ignore_errors=True)
+        return "SKIP", f"{src} 无锚点字节（patch_dll 定位前提失效——件源不对版）"
+    os.makedirs(dest, exist_ok=True)
+    shutil.copyfile(src, os.path.join(dest, "pkapp_key.so"))
+    return "OK", f"_vendor/keylib/linux/{arch}（key-holder 通用件，锚点 ×{n}）"
 
 
 def _vendor_keylib_src(vroot: str, root: str) -> tuple[str, str]:
@@ -211,6 +248,12 @@ def run(argv: list[str] | None = None, root: str = ROOT) -> int:
                      ("shell-linux-armv7l",
                       partial(_vendor_shell_linux_arch, arch="armv7l")),
                      ("keylib-windows", _vendor_keylib_windows),
+                     ("keylib-linux-x86_64",
+                      partial(_vendor_keylib_linux_arch, arch="x86_64")),
+                     ("keylib-linux-aarch64",
+                      partial(_vendor_keylib_linux_arch, arch="aarch64")),
+                     ("keylib-linux-armv7l",
+                      partial(_vendor_keylib_linux_arch, arch="armv7l")),
                      ("keylib-src", _vendor_keylib_src),
                      ("shell-android", _vendor_android_shell),
                      ("applocal-wheel", _build_applocal_wheel)):

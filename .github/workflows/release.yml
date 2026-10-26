@@ -27,20 +27,29 @@ jobs:
           mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
           # 跨 step 环境变量必须写 $GITHUB_ENV（echo 裸输出不共享）
           echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
-      - name: Build launcher (build.sh 默认名 myapp，manylinux2014 容器内编译)
+      - name: Build launcher + keylib (manylinux2014 容器内编译)
         # 编译须在容器内（glibc 2.17 头/链接器地板）；PBS 头只读挂载，PYINC 经
         # -e 传入（宿主展开），容器内 bash -c 单引号防宿主二次展开。
+        # keylib 通用件同容器编译（key.c + kdata.c 锚点形态 = patch_dll 退化位
+        # 源；glibc 基线与 launcher 严格一致，★linux 预制件 2026-10★）。
         run: >
           docker run --rm -v /tmp/pbs:/tmp/pbs:ro -v "$PWD":/io -w /io/shell-linux
           -e PYINC="$PYINC"
           quay.io/pypa/manylinux2014_x86_64
-          bash -c './build.sh myapp "" "$PYINC"'
+          bash -c './build.sh myapp "" "$PYINC" &&
+                   mkdir -p /io/keylib/build/linux/x86_64 &&
+                   gcc -O2 -shared -fPIC -std=c17 /io/keylib/src/key.c /io/keylib/src/kdata.c -o /io/keylib/build/linux/x86_64/pkapp_key.so'
       - name: Selftest (算法向量，宿主执行——glibc 2.31 ≥ 2.17 地板)
         run: ./shell-linux/build/myapp --selftest
+      - name: Stage artifacts (arch 子目录统一布局，三 job 同构)
+        run: |
+          mkdir -p stage/x86_64
+          cp shell-linux/build/myapp stage/x86_64/myapp
+          cp keylib/build/linux/x86_64/pkapp_key.so stage/x86_64/pkapp_key.so
       - uses: actions/upload-artifact@v4
         with:
-          name: launcher-elf-x86_64
-          path: shell-linux/build/myapp
+          name: linux-x86_64
+          path: stage
 
   launcher-linux-aarch64:
     # ★M3 阶段 5 前置★ aarch64 launcher ELF：原生 arm runner（公共仓库免费）+
@@ -58,20 +67,28 @@ jobs:
           curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
           mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
           echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
-      - name: Build launcher (manylinux2014_aarch64 容器内编译)
+      - name: Build launcher + keylib (manylinux2014_aarch64 容器内编译)
+        # keylib 通用件同容器编译（同 launcher glibc 基线，★linux 预制件 2026-10★）
         run: >
           docker run --rm -v /tmp/pbs:/tmp/pbs:ro -v "$PWD":/io -w /io/shell-linux
           -e PYINC="$PYINC"
           quay.io/pypa/manylinux2014_aarch64
-          bash -c './build.sh myapp "" "$PYINC"'
+          bash -c './build.sh myapp "" "$PYINC" &&
+                   mkdir -p /io/keylib/build/linux/aarch64 &&
+                   gcc -O2 -shared -fPIC -std=c17 /io/keylib/src/key.c /io/keylib/src/kdata.c -o /io/keylib/build/linux/aarch64/pkapp_key.so'
       - name: Selftest (arm runner 容器内原生执行)
         run: >
           docker run --rm -v "$PWD":/io -w /io/shell-linux
           quay.io/pypa/manylinux2014_aarch64 ./build/myapp --selftest
+      - name: Stage artifacts (arch 子目录统一布局，三 job 同构)
+        run: |
+          mkdir -p stage/aarch64
+          cp shell-linux/build/myapp stage/aarch64/myapp
+          cp keylib/build/linux/aarch64/pkapp_key.so stage/aarch64/pkapp_key.so
       - uses: actions/upload-artifact@v4
         with:
-          name: launcher-elf-aarch64
-          path: shell-linux/build/myapp
+          name: linux-aarch64
+          path: stage
 
   launcher-linux-armv7l:
     # ★M3 阶段 5 前置★ armv7 launcher ELF：ubuntu:20.04 交叉链（D-2 v4 拍板——
@@ -80,7 +97,7 @@ jobs:
     #（编译产物 armhf 无法在 x86_64 宿主执行；真机验收随阶段 5 板子线）。
     # focal 已 EOL：apt 源 archive 失效时回退 old-releases。
     # PYINC = 同 pin release（20260929）armv7 快照头——pyconfig.h 是 configure
-    # 平台配置件（SIZEOF_LONG=8 等按 arch 烤死），x86_64 头在 armhf 目标触发
+    # 平台配置件（SIZEOF_LONG=4，ILP32 烤死），x86_64 头在 armhf 目标触发
     # pyport.h LONG_BIT 守卫（LONG_BIT=32 ≠ 8×8）#error，实测踩坑勿回退。
     runs-on: ubuntu-latest
     steps:
@@ -102,11 +119,18 @@ jobs:
             apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user >/dev/null
             CC=arm-linux-gnueabihf-gcc ./build.sh myapp "" "$PYINC"
             qemu-arm -L /usr/arm-linux-gnueabihf ./build/myapp --selftest
+            mkdir -p /io/keylib/build/linux/armv7l
+            arm-linux-gnueabihf-gcc -O2 -shared -fPIC -std=c17 /io/keylib/src/key.c /io/keylib/src/kdata.c -o /io/keylib/build/linux/armv7l/pkapp_key.so
           '
+      - name: Stage artifacts (arch 子目录统一布局，三 job 同构)
+        run: |
+          mkdir -p stage/armv7l
+          cp shell-linux/build/myapp stage/armv7l/myapp
+          cp keylib/build/linux/armv7l/pkapp_key.so stage/armv7l/pkapp_key.so
       - uses: actions/upload-artifact@v4
         with:
-          name: launcher-elf-armv7l
-          path: shell-linux/build/myapp
+          name: linux-armv7l
+          path: stage
 
   pkapp-wheel:
     needs: [launcher-linux, launcher-linux-aarch64, launcher-linux-armv7l]
@@ -115,21 +139,24 @@ jobs:
       PYTHONUTF8: "1"            # runner 默认 cp1252，中文输出/构建日志统一 UTF-8
     steps:
       - uses: actions/checkout@v4
-      - name: Download launcher artifacts → vendor 源位（arch 分目录）
-        # x86_64 落 build 根（vendor 基线源位 …/build/myapp）；arm 双线落
-        # build/<arch>/（_vendor_shell_linux_arch 源位，_LINUX_ARCH_SOURCES 口径）
+      - name: Download linux artifacts (三 launcher job：launcher ELF + keylib so)
+        # pattern + merge-multiple：三 artifact 合并落 vendor-src/<arch>/{myapp,pkapp_key.so}
         uses: actions/download-artifact@v4
         with:
-          name: launcher-elf-x86_64
-          path: shell-linux/build
-      - uses: actions/download-artifact@v4
-        with:
-          name: launcher-elf-aarch64
-          path: shell-linux/build/aarch64
-      - uses: actions/download-artifact@v4
-        with:
-          name: launcher-elf-armv7l
-          path: shell-linux/build/armv7l
+          pattern: linux-*
+          path: vendor-src
+          merge-multiple: true
+      - name: Place artifacts → vendor 源位（shell-linux/keylib 双 arch 分位）
+        shell: bash
+        run: |
+          mkdir -p shell-linux/build/aarch64 shell-linux/build/armv7l \
+                   keylib/build/linux/x86_64 keylib/build/linux/aarch64 keylib/build/linux/armv7l
+          cp vendor-src/x86_64/myapp shell-linux/build/myapp
+          cp vendor-src/aarch64/myapp shell-linux/build/aarch64/myapp
+          cp vendor-src/armv7l/myapp shell-linux/build/armv7l/myapp
+          for a in x86_64 aarch64 armv7l; do
+            cp vendor-src/$a/pkapp_key.so keylib/build/linux/$a/pkapp_key.so
+          done
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -150,10 +177,10 @@ jobs:
       - name: Build keylib key-holder (build.bat)
         working-directory: keylib
         run: .\build.bat
-      - name: Vendor _vendor (shell + launcher ELF ×3 + keylib + applocal wheel)
+      - name: Vendor _vendor (shell + launcher ELF ×3 + keylib dll/so ×4 + applocal wheel)
         # 全量 require：发布件完整性闸门（H4 fail-fast）——任何条目缺件拒绝出制品；
-        # launcher 三 arch 全 require（arm 双线 job 失败不得静默出缺 arch 的 wheel）
-        run: python pkapp/scripts/vendor.py --require shell-windows,shell-linux-x86_64,shell-linux-aarch64,shell-linux-armv7l,keylib-windows,keylib-src,shell-android,applocal-wheel
+        # launcher + linux keylib 三 arch 全 require（arm job 失败不得静默出缺 arch 的 wheel）
+        run: python pkapp/scripts/vendor.py --require shell-windows,shell-linux-x86_64,shell-linux-aarch64,shell-linux-armv7l,keylib-windows,keylib-linux-x86_64,keylib-linux-aarch64,keylib-linux-armv7l,keylib-src,shell-android,applocal-wheel
       - name: Build pkapp wheel
         run: |
           python -m pip install -q build

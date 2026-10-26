@@ -315,6 +315,32 @@ def locate_dll(platform: str = "windows") -> str | None:
     return built if os.path.isfile(built) else None
 
 
+def locate_linux_keylib(arch: str) -> str | None:
+    """linux key-holder 通用件按 arch 定位（★linux 预制件收录 2026-10，D-3 边界修订★）。
+
+    查找序：包内置 _vendor/keylib/linux/<arch>/pkapp_key.so > 仓库
+    keylib/build/linux/<arch>/pkapp_key.so。env PKAPP_KEYLIB 不在此层——模式 B
+    由 _stage_keylib 直取 locate_dll(env)，属用户明确意图，不走静默回退。
+
+    ★H4 教训的 linux 消解★：单槽 so 无 arch 语义的风险由 per-arch 分目录 +
+    调用方显式 arch 消解（launcher _vendor/shell-linux/<arch> 同款分层）——
+    locate 必带 arch 参数，错 arch 件无法被静默选中。锚点字节存在性在收录侧
+    （vendor.py）校验，patch_dll 定位前提两头把守。
+    """
+    fname = "pkapp_key.so"
+    vendored = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "_vendor", "keylib", "linux", arch, fname)
+    if os.path.isfile(vendored):
+        return vendored
+    # dev-from-source 回退：vendored 末 7 级 = <arch>/linux/keylib/_vendor/包/包/仓库根
+    # ——注意比 locate_dll 多两层（linux/<arch>），5 级算法在此会错落 <repo>/pkapp
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(vendored)))))))
+    built = os.path.join(repo, "keylib", "build", "linux", arch, fname)
+    return built if os.path.isfile(built) else None
+
+
 class KeyLib:
     """key-holder 件的 ctypes 封装（构建期用；运行期封装在 applocal._codekey）。"""
 
