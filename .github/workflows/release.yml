@@ -46,14 +46,16 @@ jobs:
     # ★M3 阶段 5 前置★ aarch64 launcher ELF：原生 arm runner（公共仓库免费）+
     # manylinux2014_aarch64 容器编译——glibc 2.17 地板与 x86_64 基线同口径（D-2/D-8）。
     # ★Node24 约束同 x86_64 job★：JS action 走宿主，编译/selftest docker run 进容器。
-    # PYINC 共用 x86_64 pin 快照头：PyConfig 等 C 头 arch 无关（arm 交叉编译器按
-    # 目标 arch 自解类型），仅编译期取头不链 libpython。
+    # PYINC = 同 pin release（20260929）aarch64 快照头——pyconfig.h 是 configure
+    # 平台配置件（SIZEOF_LONG 等按 arch 烤死），必须取本 arch 头勿跨用（armv7l
+    # 用 x86_64 头实测触发 pyport.h LONG_BIT 守卫 #error；aarch64 LP64 兼容但
+    # 同源口径更净）。
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch PBS headers (toolchain pin 同源)
+      - name: Fetch PBS headers (同 pin 20260929，aarch64 资产)
         run: |
-          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
           mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
           echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
       - name: Build launcher (manylinux2014_aarch64 容器内编译)
@@ -77,12 +79,15 @@ jobs:
     # 2.17 为两条并行基线勿混读）。QEMU user 模式跑 --selftest 16 向量关闸
     #（编译产物 armhf 无法在 x86_64 宿主执行；真机验收随阶段 5 板子线）。
     # focal 已 EOL：apt 源 archive 失效时回退 old-releases。
+    # PYINC = 同 pin release（20260929）armv7 快照头——pyconfig.h 是 configure
+    # 平台配置件（SIZEOF_LONG=8 等按 arch 烤死），x86_64 头在 armhf 目标触发
+    # pyport.h LONG_BIT 守卫（LONG_BIT=32 ≠ 8×8）#error，实测踩坑勿回退。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch PBS headers (toolchain pin 同源)
+      - name: Fetch PBS headers (同 pin 20260929，armv7 资产)
         run: |
-          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-armv7-unknown-linux-gnueabihf-install_only_stripped.tar.gz"
           mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
           echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
       - name: Cross-build + QEMU selftest (ubuntu:20.04 容器内)
