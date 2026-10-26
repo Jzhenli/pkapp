@@ -16,7 +16,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-gcc --version | head -1   # R-L13 一行确认：开发验证 gcc ≥ 8；官方产物走容器 devtoolset
+CC=${CC:-gcc}
+$CC --version | head -1   # R-L13 一行确认：开发验证 gcc ≥ 8；官方产物走容器 devtoolset；
+                          # 交叉编译：CC=arm-linux-gnueabihf-gcc ./build.sh ...（armhf sysroot
+                          # glibc 基线随发行版，如 ubuntu22.04 = 2.35——板子 glibc 须 ≥ 此值）
 
 APPNAME=${1:-myapp}
 PUBHEX=${2:-}
@@ -43,11 +46,11 @@ CFLAGS="$CFLAGS -D_snprintf=snprintf"
 
 # 五模块直引 shell-windows/src（零复制零改动；阶段 0 已核验零 Linux 依赖）
 for f in sha256 ed25519 spk manifest integrity; do
-  gcc $CFLAGS "${PUBDEF[@]+"${PUBDEF[@]}"}" -c "$WINSRC/$f.c" -o "build/$f.o"
+  $CC $CFLAGS "${PUBDEF[@]+"${PUBDEF[@]}"}" -c "$WINSRC/$f.c" -o "build/$f.o"
 done
-gcc $CFLAGS "${PUBDEF[@]+"${PUBDEF[@]}"}" -c src/main.c -o build/main.o
+$CC $CFLAGS "${PUBDEF[@]+"${PUBDEF[@]}"}" -c src/main.c -o build/main.o
 
-gcc build/sha256.o build/ed25519.o build/spk.o build/manifest.o \
+$CC build/sha256.o build/ed25519.o build/spk.o build/manifest.o \
     build/integrity.o build/main.o -o "build/$APPNAME" -lpthread -ldl
 
 echo "[build] OK: build/$APPNAME"

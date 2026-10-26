@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import Any
 
 from . import _audit
 from . import _env
@@ -603,13 +604,45 @@ def bootstrap(entry: str = "app.main:app") -> int:
     except BaseException:
         sock.close()                               # 起不来就别占着端口
         raise
-    server = Server(Config(
-        asgi_app, host=cfg.network.bind, port=port, access_log=False, log_config=None))
-    threading.Thread(target=_run_server, args=(server, sock),
-                     name="applocal-uvicorn", daemon=True).start()
+    # graceful 停服面（★阶段 4★）：launcher 信号链（SIGINT/SIGTERM → C 置位 → watchdog
+    # 线程 PyRun 调 shutdown()）与嵌入方显式停服共用——Server/线程存模块级，出栈即失效
+    global _server, _server_thread
+    # timeout_graceful_shutdown 自 uvicorn 0.29 引入：打包链路缓存钉 0.54 无虞，
+    # dev 契约走本机 venv 可能更旧 → TypeError 降级（无排空上限，should_exit 仍生效）
+    srv_kw = dict(host=cfg.network.bind, port=port, access_log=False, log_config=None,
+                  timeout_graceful_shutdown=3)   # 排空上限：stop 通道 3s 强关拒不释放的连接
+    try:
+        server = Server(Config(asgi_app, **srv_kw))
+    except TypeError:
+        srv_kw.pop("timeout_graceful_shutdown")
+        server = Server(Config(asgi_app, **srv_kw))
+    _server = server
+    _server_thread = threading.Thread(target=_run_server, args=(server, sock),
+                                      name="applocal-uvicorn", daemon=True)
+    _server_thread.start()
     _tmark("uvicorn thread started (bootstrap total)", _t0, _tlog)
     start_heartbeat(port, cfg)                     # 步骤 5′：ready 由首跳成功点亮
     return port
+
+
+_server: Any = None            # uvicorn Server（bootstrap 起存；shutdown 停服通道）
+_server_thread: threading.Thread | None = None
+
+
+def shutdown(timeout: float = 5.0) -> bool:
+    """graceful 停服（★阶段 4★ 停服通道）：uvicorn should_exit=True → join 服务线程。
+
+    调用方：launcher 信号链（watchdog 线程 PyRun，拿 GIL 后可安全调）与嵌入方显式停服。
+    幂等：未 bootstrap / 线程已退出均返回 True。False = 超时线程未退（排空挂住）。
+    """
+    if _server is None:
+        return True
+    _server.should_exit = True
+    t = _server_thread
+    if t is None or not t.is_alive():
+        return True
+    t.join(timeout)
+    return not t.is_alive()
 
 
 def _run_server(server, sock) -> None:

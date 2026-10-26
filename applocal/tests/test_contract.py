@@ -11,7 +11,6 @@ import socket
 import sys
 import threading
 import time
-import urllib.request
 
 import pytest
 
@@ -689,6 +688,88 @@ def test_bootstrap_missing_uvicorn_writes_diag(env, monkeypatch):
         applocal.bootstrap("app.main:app")
     d = applocal.read_diag()
     assert "uvicorn" in d["error"] and d["recoverable"] is False       # 错误页有因可查（§6）
+
+
+def test_bootstrap_wires_shutdown_channel(env, monkeypatch):
+    """★阶段 4★ shutdown 停服通道接线：bootstrap 后模块级 _server/_server_thread
+    挂上真实例（launcher 信号链 PyRun applocal.shutdown() 的对拍面）。"""
+    _prep_entry(env)
+    captured = {}
+    _fake_uvicorn(monkeypatch, captured)
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    applocal.bootstrap("app.main:app")
+    assert _core._server is not None                                   # Server 实例已存（global 接线）
+    assert _core._server_thread is not None and _core._server_thread.name == "applocal-uvicorn"
+    assert applocal.shutdown() is True                                 # fake run 直返 → 线程已退 → True
+
+
+def test_shutdown_noop_without_server(monkeypatch):
+    monkeypatch.setattr(_core, "_server", None)
+    monkeypatch.setattr(_core, "_server_thread", None)
+    assert applocal.shutdown() is True                                 # 未 bootstrap 幂等
+
+
+def test_shutdown_graceful_join_thread(monkeypatch):
+    captured = {}
+
+    class _FakeServer:
+        should_exit = False
+
+    class _FakeThread:
+        def __init__(self):
+            self._alive = True
+        def is_alive(self):
+            return self._alive
+        def join(self, timeout=None):
+            captured["joined"] = timeout
+            self._alive = False                                        # 模拟 uvicorn 主循环退出
+
+    srv, th = _FakeServer(), _FakeThread()
+    monkeypatch.setattr(_core, "_server", srv)
+    monkeypatch.setattr(_core, "_server_thread", th)
+    assert applocal.shutdown(timeout=2) is True
+    assert captured["joined"] == 2                                     # join 上限 = timeout
+    assert srv.should_exit is True                                     # 置位在前（uvicorn 约定）
+
+
+def test_shutdown_timeout_returns_false(monkeypatch):
+    class _FakeServer:
+        should_exit = False
+    class _HangThread:                                                 # 排空挂住不退
+        def is_alive(self):
+            return True
+        def join(self, timeout=None):
+            pass
+    monkeypatch.setattr(_core, "_server", _FakeServer())
+    monkeypatch.setattr(_core, "_server_thread", _HangThread())
+    assert applocal.shutdown(timeout=0.2) is False
+
+
+def test_bootstrap_old_uvicorn_drops_graceful_kwarg(env, monkeypatch):
+    """旧 uvicorn（<0.29 无 timeout_graceful_shutdown）→ TypeError 降级重建 Config，
+    bootstrap 照常成功（dev 契约：本机 venv 版本地板不受 applocal 假设约束）。"""
+    _prep_entry(env)
+    captured = {}
+    fake = _fake_uvicorn(monkeypatch, captured)
+
+    strict_errors = []
+
+    class _StrictConfig:
+        def __init__(self, app, **kw):
+            if "timeout_graceful_shutdown" in kw:
+                strict_errors.append(kw)
+                raise TypeError("unexpected keyword argument 'timeout_graceful_shutdown'")
+            captured["kw"] = kw
+
+    fake.Config = _StrictConfig
+    fake_config_mod = sys.modules["uvicorn.config"]
+    fake_config_mod.Config = _StrictConfig
+    monkeypatch.setitem(sys.modules, "uvicorn.config", fake_config_mod)
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    port = applocal.bootstrap("app.main:app")                          # 不抛 = 降级成功
+    assert port > 0 and strict_errors and "timeout_graceful_shutdown" not in captured["kw"]
 
 
 def test_bootstrap_linux_proctitle_takes_appname_env(env, monkeypatch):

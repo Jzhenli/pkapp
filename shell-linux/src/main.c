@@ -77,6 +77,27 @@ static char g_cache[PATH_MAX];      /* 缓存区 */
 static char g_logdir[PATH_MAX];     /* <cache>/log */
 static char g_logfile[PATH_MAX];    /* <logdir>/<app>.log */
 static char g_ready[PATH_MAX];      /* <cache>/ready */
+
+/* ★M3 阶段 4★ graceful shutdown：SIGINT/SIGTERM → g_stop 置位 → watchdog 循环检测 →
+   PyGILState 拿 GIL 调 applocal.shutdown()（uvicorn should_exit + 排空等待）→ 清 ready
+   → return 0 正常退出（flock 单实例锁随进程释放）。sig_atomic_t：信号 handler 与
+   普通线程间的可见性最小保证（volatile 语义，R-L9 同源教训）。 */
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_stop_signal(int sig) {
+    (void)sig;                      /* SIGINT/SIGTERM 同路，不区分来源 */
+    g_stop = 1;
+}
+
+static void install_stop_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;                /* 不设 SA_RESTART：usleep 被打断 → 下一拍即查 g_stop */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
 static char g_diag[PATH_MAX];       /* <cache>/diag.json */
 static char g_handshake[PATH_MAX];  /* <cache>/handshake */
 static char g_lock[PATH_MAX];       /* <data>/lock（flock 单实例） */
@@ -861,6 +882,14 @@ static int load_installed_manifest(manifest_doc *doc, char **text_out,
 
 typedef int (*fn_PyRun_SimpleString)(const char *);
 typedef void *(*fn_PyEval_SaveThread)(void);
+/* ★graceful 停服面★（watchdog 线程用）：boot_python 局部 fn 指针出栈即失效，成功后
+   全局化保存（dlopen 句柄同理）。PyGILState_Ensure 返回 PyGILState_STATE，按 int 传递。 */
+typedef int (*fn_PyGILState_Ensure)(void);
+typedef void (*fn_PyGILState_Release)(int);
+static void *g_py = NULL;
+static fn_PyRun_SimpleString g_pRun = NULL;
+static fn_PyGILState_Ensure g_pEnsure = NULL;
+static fn_PyGILState_Release g_pRelease = NULL;
 /* 注意：PyConfig_InitPythonConfig 返回 void。误声明为 PyStatus（40 字节结构体
    返回 → sret ABI 隐藏首参）会把 &st 当 config 传入，库端 memset 408 字节
    直接打穿调用方栈帧（阶段 1 ①实测踩坑，勿改回）。 */
@@ -1155,6 +1184,15 @@ static int boot_python(const char *python_dll, const char *entry,
     }
     slog("applocal bootstrap ok");
 
+    /* graceful 停服面：句柄/导出全局化（watchdog 线程用）+ 重装停止信号 handler——
+       Py_InitializeFromConfig 已装 CPython 的 SIGINT handler（吞 KeyboardInterrupt），
+       必须在其后覆盖；此后 SIGINT/SIGTERM 统一走 g_stop → watchdog graceful 路径 */
+    g_py = py;
+    g_pRun = pRun;
+    g_pEnsure = (fn_PyGILState_Ensure)(void *)dlsym(py, "PyGILState_Ensure");
+    g_pRelease = (fn_PyGILState_Release)(void *)dlsym(py, "PyGILState_Release");
+    install_stop_handlers();
+
     /* V1（致命）：立即归还 GIL，主线程此后永不触碰 Python C API */
     pSave();
     return 0;
@@ -1181,6 +1219,18 @@ static int ready_parse(const char *text, int *ready, long *port, long *seq) {
     k = strstr(text, "\"seq\"");
     if (k && strchr(k, ':')) *seq = strtol(strchr(k, ':') + 1, NULL, 10);
     return (*ready >= 0) ? 0 : -1;
+}
+
+/* graceful 停服（watchdog 线程内）：PyGILState 拿 GIL → applocal.shutdown()
+   （uvicorn should_exit=True + 排空等待 ≤5s）→ 清 ready 残留（防退出后被误读）。
+   失败不 fail-closed：退出路径上的清理动作，尽力而为（flock 随进程释放兜底）。 */
+static void graceful_shutdown(void) {
+    if (g_py && g_pRun && g_pEnsure && g_pRelease) {
+        int gil = g_pEnsure();
+        (void)g_pRun("import applocal\napplocal.shutdown()\n");
+        g_pRelease(gil);
+    }
+    unlink(g_ready);
 }
 
 /* 判死出口：diag + exit 非零 → systemd Restart=on-failure 接管（§3.3） */
@@ -1248,6 +1298,15 @@ static void *watchdog_loop(void *arg) {
     }
 
     for (;;) {
+        if (g_stop) {
+            /* ★graceful 退出通道★：SIGINT/SIGTERM → applocal.shutdown()（uvicorn
+               优雅排空）→ ready 清理 → return（pthread_join 返回 → run_shell 0）。
+               与判死 _exit() 不同路：正常退出码 0，systemd KillSignal=SIGTERM 走此。 */
+            slog("stop signal 收到 → graceful shutdown begin");
+            graceful_shutdown();
+            slog("graceful shutdown ok（exit 0）");
+            return NULL;
+        }
         if (sd_interval_s > 0 && time(NULL) - last_ping >= sd_interval_s) {
             sd_notify_watchdog();
             last_ping = time(NULL);
@@ -1857,5 +1916,6 @@ int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--selftest-spk") == 0)
         return run_selftest_spk(argv[2]) == 0 ? 0 : 1;
     signal(SIGPIPE, SIG_IGN);
+    install_stop_handlers();   /* bootstrap 期（python 未起）收到也置位，watchdog 起来后生效 */
     return run_shell();
 }

@@ -107,8 +107,9 @@ def _linux_pip_tags(spec: AppSpec, arch: str) -> list[str]:
     """Linux 交叉安装 pip 标志（★M3 阶段 2★ D-12 v5 拍板主路线 = PyPI 交叉下载）。
 
     平台标签按 arch：x86_64 → manylinux2014_x86_64（glibc 2.17 地板，PBS 工具链
-    兼容域）；aarch64 → manylinux2014_aarch64（同 2.17 地板）；armv7l → 阶段 5
-    接线（manylinux_2_31_armv7l，板子 2.31 对齐，D-12 v5 fallback 语义）。
+    兼容域）；aarch64 → manylinux2014_aarch64（同 2.17 地板）；armv7l →
+    manylinux_2_31/2_17_armv7l（板子 glibc 2.31 对齐，D-12 v5 主路线；PyPI 官方
+    armv7l 轮已核实：pydantic-core 2.1.2 起全量覆盖）。
     """
     short = (spec.linux.python_version or "3.12.14").rsplit(".", 1)[0]  # 3.12.14 → 3.12
     tags = ["--only-binary=:all:", "--python-version", short,
@@ -116,10 +117,11 @@ def _linux_pip_tags(spec: AppSpec, arch: str) -> list[str]:
     plat = {"x86_64": ["manylinux2014_x86_64", "manylinux_2_17_x86_64",
                        "linux_x86_64"],
             "aarch64": ["manylinux2014_aarch64", "manylinux_2_17_aarch64",
-                        "linux_aarch64"]}.get(arch)
+                        "linux_aarch64"],
+            "armv7l": ["manylinux_2_31_armv7l", "manylinux_2_17_armv7l",
+                       "manylinux2014_armv7l", "linux_armv7l"]}.get(arch)
     if plat is None:
-        raise BuildError(f"linux 架构 {arch!r} 的 wheel 平台标签随阶段 5 接线"
-                         "（armv7l 走 manylinux_2_31_armv7l，D-12 v5）")
+        raise BuildError(f"linux 架构 {arch!r} 不支持（可选 x86_64 / aarch64 / armv7l）")
     for p in plat:
         tags += ["--platform", p]
     return tags
