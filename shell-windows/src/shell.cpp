@@ -1594,16 +1594,26 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
    DefWindowProc→WM_QUIT→g_boot_quit 路径本就是裸退（语义不变）。
    致命错误页路径不走这里（ExitProcess 直杀 = Linux _exit() 对仗）。 */
 static __declspec(noreturn) void graceful_and_exit(int code) {
-    if (InterlockedCompareExchange(&g_exiting, 1, 0) != 0)
-        return;                            /* 退出流程已在跑（并发关机+点 X）：吞掉 */
+    if (InterlockedCompareExchange(&g_exiting, 1, 0) != 0) {
+        /* 退出流程已在跑。同步模型下 UI 单线程且 PyRun 不泵消息，实际不可达；
+           但 noreturn 属性要求本函数绝不返回（否则调用方落出非 void = UB）——
+           原地挂等第一个调用者 ExitProcess 收场，防患未来嵌套泵/第二线程调用 */
+        for (;;) Sleep(INFINITE);
+    }
     slog("graceful exit begin");
     if (g_hwnd) ShowWindow(g_hwnd, SW_HIDE);
     if (g_splash) ShowWindow(g_splash, SW_HIDE);
     if (g_pRun_g && g_pEnsure && g_pRelease) {
         int st = g_pEnsure();
-        g_pRun_g("import applocal\napplocal.shutdown()\n");
+        int rc = g_pRun_g("import applocal\napplocal.shutdown()\n");
         g_pRelease(st);
-        slog("applocal.shutdown ok");
+        /* 返回非零 = Python 异常（如 spk 内 applocal 旧版缺 shutdown 的
+           AttributeError"假优雅"事故形态）——如实记失败，绝不误导排查；
+           退出路径上的清理尽力而为（Linux 同款"不 fail-closed"语义） */
+        if (rc == 0)
+            slog("applocal.shutdown ok");
+        else
+            slog("applocal.shutdown FAILED (exit anyway)");
     } else {
         slog("graceful unavailable (python not ready) -> hard exit");
     }
