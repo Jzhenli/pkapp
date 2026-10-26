@@ -80,6 +80,23 @@ static std::wstring g_title;
 static HWND g_hwnd;
 static HWND g_splash;      /* 启动加载层（自绘 pkSplash 子窗口，覆盖客户区） */
 static volatile LONG g_boot_quit; /* 启动期泵到 WM_QUIT（用户关窗）→ 中止启动、错误 UI 免弹 */
+static volatile LONG g_exiting;   /* graceful 防重入（WM_CLOSE/WM_ENDSESSION/按钮并发） */
+
+typedef void (*fn_Py_Initialize)(void);
+typedef int (*fn_Py_IsInitialized)(void);
+typedef int (*fn_PyRun_SimpleString)(const char *);
+typedef void *(*fn_PyEval_SaveThread)(void);
+/* ★Windows 优雅停服★（与 Linux main.c g_stop 同案对仗）：GUI 壳收不到 CTRL_CLOSE_EVENT
+   （那是控制台事件），真实"信号" = WM_CLOSE（点 X，无时限）+ WM_ENDSESSION（注销/关机，
+   ~5s 宽限）。退出点统一 graceful_and_exit：PyGILState 拿 GIL → applocal.shutdown()
+   （uvicorn should_exit + 排空 ≤5s）→ 清 ready → ExitProcess(code)。主线程同步模型
+   （UI 单线程置位与执行同线程，无跨线程可见性问题）；启动期（g_pRun 未存）降级原
+   DefWindowProc→WM_QUIT→g_boot_quit 路径。致命错误页强杀路径保留 = Linux _exit() 对仗。 */
+typedef int (*fn_PyGILState_Ensure)(void);      /* 返回 PyGILState_STATE，按 int 传递 */
+typedef void (*fn_PyGILState_Release)(int);
+static fn_PyRun_SimpleString g_pRun_g;          /* boot_python 成功后全局保存（局部出栈失效） */
+static fn_PyGILState_Ensure g_pEnsure;
+static fn_PyGILState_Release g_pRelease;
 static ICoreWebView2Environment *g_env2;
 static ICoreWebView2Controller *g_ctl2;
 static ICoreWebView2 *g_web2;
@@ -1263,11 +1280,6 @@ static void on_tick(void) {
 
 /* ================= Python 引导（步骤 6–8，线程模型①） ================= */
 
-typedef void (*fn_Py_Initialize)(void);
-typedef int (*fn_Py_IsInitialized)(void);
-typedef int (*fn_PyRun_SimpleString)(const char *);
-typedef void *(*fn_PyEval_SaveThread)(void);
-
 static int boot_load_codekey(HMODULE py, const std::wstring &runtime_root,
                              const char *code_key_id, char *err, size_t cap);
 static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
@@ -1499,6 +1511,11 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
         diag_write("load", err, "", FALSE);
         return -1;
     }
+    /* ★优雅停服★ GILState 二件套：软要求（缺失只降级为强杀退出，不阻断启动） */
+    g_pEnsure = (fn_PyGILState_Ensure)GetProcAddress(py, "PyGILState_Ensure");
+    g_pRelease = (fn_PyGILState_Release)GetProcAddress(py, "PyGILState_Release");
+    if (!g_pEnsure || !g_pRelease)
+        slog("PyGILState_* missing -> graceful degrade to hard exit");
 
     pInit();
     if (!pIsInit()) {
@@ -1558,9 +1575,41 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
     slog("applocal bootstrap ok");
     set_splash("正在启动应用服务…");
 
-    /* V1（致命）：立即归还 GIL，主线程此后永不触碰 Python C API */
+    /* ★优雅停服★ 全局保存（局部 pRun 出栈失效）；PyGILState 二件套已在上方赋全局 */
+    g_pRun_g = pRun;
+
+    /* V1（致命）：立即归还 GIL，主线程此后永不触碰 Python C API
+       （graceful_and_exit 例外：PyGILState_Ensure 重新拿 GIL 执行 applocal.shutdown） */
     pSave();
     return 0;
+}
+
+/* ================= 优雅停服（★Windows★ 与 Linux main.c graceful_shutdown 同案对仗） ================= */
+
+/* 统一退出点：防重入 → 藏窗（用户视角窗口即关）→ PyGILState 拿 GIL →
+   applocal.shutdown()（uvicorn should_exit + join 排空线程，≤5s）→ 清 ready/握手码
+   → ExitProcess。主线程同步模型：所有调用方都在 UI 线程（WM_CLOSE/WM_ENDSESSION/
+   按钮/主循环收尾），无跨线程可见性问题。
+   启动期（boot_python 未走完）g_pRun_g 为空 → 直接硬退：此时无服务可停，且原
+   DefWindowProc→WM_QUIT→g_boot_quit 路径本就是裸退（语义不变）。
+   致命错误页路径不走这里（ExitProcess 直杀 = Linux _exit() 对仗）。 */
+static __declspec(noreturn) void graceful_and_exit(int code) {
+    if (InterlockedCompareExchange(&g_exiting, 1, 0) != 0)
+        return;                            /* 退出流程已在跑（并发关机+点 X）：吞掉 */
+    slog("graceful exit begin");
+    if (g_hwnd) ShowWindow(g_hwnd, SW_HIDE);
+    if (g_splash) ShowWindow(g_splash, SW_HIDE);
+    if (g_pRun_g && g_pEnsure && g_pRelease) {
+        int st = g_pEnsure();
+        g_pRun_g("import applocal\napplocal.shutdown()\n");
+        g_pRelease(st);
+        slog("applocal.shutdown ok");
+    } else {
+        slog("graceful unavailable (python not ready) -> hard exit");
+    }
+    DeleteFileW(g_ready.c_str());          /* 清存活标记（单实例预清理对仗，防陈旧存活假象） */
+    DeleteFileW(g_handshake.c_str());
+    ExitProcess(code);
 }
 
 /* ================= 单实例互斥（步骤 0，方案 §5.5） ================= */
@@ -1627,10 +1676,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_RESTART) {
-            /* 协议 §11③：重启 = ExitProcess(非零) + 外层看门狗 */
-            ExitProcess(3);
+            /* 协议 §11③：重启 = ExitProcess(非零) + 外层看门狗；运行期先停服再退
+               （退出码仍 3；启动期/Python 未就绪时 graceful 内部降级硬退，同码） */
+            graceful_and_exit(3);
         }
-        if (LOWORD(wp) == IDC_QUIT) ExitProcess(0);
+        if (LOWORD(wp) == IDC_QUIT) graceful_and_exit(0);
+        return 0;
+    case WM_CLOSE:
+        /* ★优雅停服★ 点 X：运行期 → 停服后退出；启动期（Python 未就绪）走原
+           DefWindowProc→Destroy→WM_QUIT→g_boot_quit 路径（中止启动，语义不变） */
+        if (g_pRun_g) graceful_and_exit(0);
+        break;
+    case WM_ENDSESSION:
+        /* ★优雅停服★ 注销/关机（~5s 宽限）：排空 ≤5s 在宽限内；wParam=FALSE =
+           会话未结束（他应用否决）→ 不动作 */
+        if (wp) graceful_and_exit(0);
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -2436,7 +2496,7 @@ static int run_shell(void) {
     /* 步骤 8.5/9：ready 轮询 + 心跳消费（主线程 WM_TIMER；禁独立线程） */
     SetTimer(g_hwnd, IDT_TICK, TICK_MS, NULL);
     run_message_loop();
-    ExitProcess(0);
+    graceful_and_exit(0); /* 兜底退出点（正常路径 WM_CLOSE 已在 graceful 内 ExitProcess） */
 }
 
 /* ================= 入口 ================= */
