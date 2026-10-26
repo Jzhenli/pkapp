@@ -1,9 +1,12 @@
 """组装 pkapp 内置制品目录 _vendor/（CI release 与本地同一条命令）。
 
 输入：仓库根 shell-windows/build/MyApp.exe + WebView2Loader.dll（build.bat 产物）
+      仓库根 shell-linux/build/{myapp,aarch64/myapp,armv7l/myapp}（launcher ELF ×3：
+      x86_64 = build.sh 本地产物；arm 双线 = CI launcher job artifact 落位子目录）
       仓库根 keylib/build/pkapp_key.dll（keylib/build.bat 产物，key-holder 通用件）
       仓库根 shell-android/shell（源码壳模板，★方案A★：排除二进制/jniLibs/assets）
-输出：pkapp/pkapp/_vendor/{shell,shell-android,keylib,wheels}——包内置壳 + android
+输出：pkapp/pkapp/_vendor/{shell,shell-linux/<arch>,keylib,wheels}——包内置壳 +
+      linux launcher ELF（按 arch 分目录，package linux --arch 的壳源）+ android
       模板 + key-holder 件（locate_dll 首选回退位；package 期锚点补丁注入 K）+
       applocal 离线 wheel（applocal 不在 PyPI，build/create 的零配置入口全靠它）。
 
@@ -28,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+from functools import partial
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,7 +47,9 @@ _ANDROID_SKIP_TOP = {"build.bat"}
 # 命中时升级为失败。
 ENTRIES: dict[str, str] = {
     "shell-windows": "包内置壳（MyApp.exe + WebView2Loader.dll）",
-    "shell-linux": "launcher ELF（_vendor/shell-linux/<arch>/myapp，M3 阶段 2）",
+    "shell-linux-x86_64": "launcher ELF x86_64（_vendor/shell-linux/x86_64/myapp，manylinux2014 容器编译）",
+    "shell-linux-aarch64": "launcher ELF aarch64（_vendor/shell-linux/aarch64/myapp，arm runner 容器编译，阶段 5）",
+    "shell-linux-armv7l": "launcher ELF armv7l（_vendor/shell-linux/armv7l/myapp，ubuntu:20.04 交叉编译，阶段 5）",
     "keylib-windows": "key-holder 通用件（pkapp_key.dll，锚点补丁退化位）",
     "keylib-src": "keylib C 源码（key.c/key.h，wheel 形态现场编译供给）",
     "shell-android": "android 壳模板（源码形态）",
@@ -69,24 +75,34 @@ def _vendor_shell_windows(vroot: str, root: str) -> tuple[str, str]:
     return "OK", "_vendor/shell（MyApp.exe + WebView2Loader.dll）"
 
 
-def _vendor_shell_linux(vroot: str, root: str) -> tuple[str, str]:
-    """launcher ELF 收录（★M3 阶段 2 条 5★：wheel 装机后 package linux 的壳源）。
+# launcher ELF 源位（arch → shell-linux/build/ 下相对路径）。x86_64 = build 根
+# （build.sh 本地产物 + CI artifact 直落位）；arm 双线 = build/<arch>/ 子目录
+#（CI artifact 落位，★M3 阶段 5 前置★：release.yml launcher job ×3）。
+_LINUX_ARCH_SOURCES: dict[str, tuple[str, ...]] = {
+    "x86_64": ("myapp",),
+    "aarch64": ("aarch64", "myapp"),
+    "armv7l": ("armv7l", "myapp"),
+}
 
-    源 = shell-linux/build/myapp（build.sh 默认名产物，CI ubuntu job 容器编译
-    后 download-artifact 落位）；录名恒 myapp——launcher 内容与文件名无关
-    （部署期 staging 改名 + ._pth 同名锚），vendored 查找 _find_launcher_linux
-    按 <app 名> 未命中即回退 myapp。arch = x86_64（manylinux2014 容器编译，
-    glibc 2.17 地板）；aarch64/armv7l 随阶段 5 扩展。"""
-    src = os.path.join(root, "shell-linux", "build", "myapp")
-    dest = os.path.join(vroot, "shell-linux", "x86_64")
+
+def _vendor_shell_linux_arch(vroot: str, root: str, arch: str) -> tuple[str, str]:
+    """launcher ELF 按 arch 收录（★M3 阶段 5 前置★：_vendor/shell-linux/<arch>/myapp，
+    wheel 装机后 package linux --arch <arch> 的壳源，消费端 launcher_elf(arch, name)）。
+
+    编译口径：x86_64/aarch64 = manylinux2014（glibc 2.17 地板，aarch64 走 arm
+    runner 原生容器）；armv7l = ubuntu:20.04 交叉链（sysroot glibc 2.31 与板子
+    对齐——manylinux2014 不提供 armhf 交叉链，D-2 两条并行基线勿混读）+ QEMU
+    user 模式 --selftest 关闸（release.yml launcher job ×3）。
+    SKIP 即清本 arch 子树（滞留件照常进 wheel = 静默陈旧变体，H4 同款）。"""
+    src = os.path.join(root, "shell-linux", "build", *_LINUX_ARCH_SOURCES[arch])
+    dest = os.path.join(vroot, "shell-linux", arch)
     if not os.path.isfile(src):
-        shutil.rmtree(os.path.join(vroot, "shell-linux"),
-                      ignore_errors=True)              # SKIP 即清旧产物（同上）
-        return "SKIP", (f"缺 {src}——launcher ELF（manylinux2014 容器编译，"
-                        "shell-linux/build.sh；CI 由 launcher job artifact 供给）")
+        shutil.rmtree(dest, ignore_errors=True)           # SKIP 即清旧产物（本 arch 子树）
+        return "SKIP", (f"缺 {src}——launcher ELF（CI launcher job artifact / "
+                        "本地 shell-linux/build.sh）")
     os.makedirs(dest, exist_ok=True)
     shutil.copyfile(src, os.path.join(dest, "myapp"))
-    return "OK", "_vendor/shell-linux/x86_64（launcher ELF，录名 myapp）"
+    return "OK", f"_vendor/shell-linux/{arch}（launcher ELF，录名 myapp）"
 
 
 def _vendor_keylib_windows(vroot: str, root: str) -> tuple[str, str]:
@@ -188,7 +204,12 @@ def run(argv: list[str] | None = None, root: str = ROOT) -> int:
     results: dict[str, tuple[str, str]] = {}
     hard_rc: dict[str, int] = {}
     for name, fn in (("shell-windows", _vendor_shell_windows),
-                     ("shell-linux", _vendor_shell_linux),
+                     ("shell-linux-x86_64",
+                      partial(_vendor_shell_linux_arch, arch="x86_64")),
+                     ("shell-linux-aarch64",
+                      partial(_vendor_shell_linux_arch, arch="aarch64")),
+                     ("shell-linux-armv7l",
+                      partial(_vendor_shell_linux_arch, arch="armv7l")),
                      ("keylib-windows", _vendor_keylib_windows),
                      ("keylib-src", _vendor_keylib_src),
                      ("shell-android", _vendor_android_shell),

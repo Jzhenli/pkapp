@@ -42,18 +42,89 @@ jobs:
           name: launcher-elf-x86_64
           path: shell-linux/build/myapp
 
+  launcher-linux-aarch64:
+    # ★M3 阶段 5 前置★ aarch64 launcher ELF：原生 arm runner（公共仓库免费）+
+    # manylinux2014_aarch64 容器编译——glibc 2.17 地板与 x86_64 基线同口径（D-2/D-8）。
+    # ★Node24 约束同 x86_64 job★：JS action 走宿主，编译/selftest docker run 进容器。
+    # PYINC 共用 x86_64 pin 快照头：PyConfig 等 C 头 arch 无关（arm 交叉编译器按
+    # 目标 arch 自解类型），仅编译期取头不链 libpython。
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch PBS headers (toolchain pin 同源)
+        run: |
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
+          echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
+      - name: Build launcher (manylinux2014_aarch64 容器内编译)
+        run: >
+          docker run --rm -v /tmp/pbs:/tmp/pbs:ro -v "$PWD":/io -w /io/shell-linux
+          -e PYINC="$PYINC"
+          quay.io/pypa/manylinux2014_aarch64
+          bash -c './build.sh myapp "" "$PYINC"'
+      - name: Selftest (arm runner 容器内原生执行)
+        run: >
+          docker run --rm -v "$PWD":/io -w /io/shell-linux
+          quay.io/pypa/manylinux2014_aarch64 ./build/myapp --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-elf-aarch64
+          path: shell-linux/build/myapp
+
+  launcher-linux-armv7l:
+    # ★M3 阶段 5 前置★ armv7 launcher ELF：ubuntu:20.04 交叉链（D-2 v4 拍板——
+    # manylinux2014 不提供 armhf 交叉链，sysroot glibc 2.31 与板子对齐，与 x86_64
+    # 2.17 为两条并行基线勿混读）。QEMU user 模式跑 --selftest 16 向量关闸
+    #（编译产物 armhf 无法在 x86_64 宿主执行；真机验收随阶段 5 板子线）。
+    # focal 已 EOL：apt 源 archive 失效时回退 old-releases。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch PBS headers (toolchain pin 同源)
+        run: |
+          curl -fsSLo /tmp/pbs.tar.gz "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
+          echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
+      - name: Cross-build + QEMU selftest (ubuntu:20.04 容器内)
+        run: >
+          docker run --rm -v /tmp/pbs:/tmp/pbs:ro -v "$PWD":/io -w /io/shell-linux
+          -e PYINC="$PYINC" -e DEBIAN_FRONTEND=noninteractive
+          ubuntu:20.04 bash -c '
+            set -e
+            apt-get update >/dev/null 2>&1 || {
+              sed -i -e "s|archive.ubuntu.com|old-releases.ubuntu.com|g" -e "s|security.ubuntu.com|old-releases.ubuntu.com|g" /etc/apt/sources.list;
+              apt-get update; }
+            apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf qemu-user >/dev/null
+            CC=arm-linux-gnueabihf-gcc ./build.sh myapp "" "$PYINC"
+            qemu-arm -L /usr/arm-linux-gnueabihf ./build/myapp --selftest
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-elf-armv7l
+          path: shell-linux/build/myapp
+
   pkapp-wheel:
-    needs: launcher-linux
+    needs: [launcher-linux, launcher-linux-aarch64, launcher-linux-armv7l]
     runs-on: windows-latest      # 壳是 MSVC /MT 产物，构建机须带 VS2022 C++ 工具链
     env:
       PYTHONUTF8: "1"            # runner 默认 cp1252，中文输出/构建日志统一 UTF-8
     steps:
       - uses: actions/checkout@v4
-      - name: Download launcher artifact → vendor 源位
+      - name: Download launcher artifacts → vendor 源位（arch 分目录）
+        # x86_64 落 build 根（vendor 基线源位 …/build/myapp）；arm 双线落
+        # build/<arch>/（_vendor_shell_linux_arch 源位，_LINUX_ARCH_SOURCES 口径）
         uses: actions/download-artifact@v4
         with:
           name: launcher-elf-x86_64
-          path: shell-linux/build        # _vendor_shell_linux 源位（…/build/myapp）
+          path: shell-linux/build
+      - uses: actions/download-artifact@v4
+        with:
+          name: launcher-elf-aarch64
+          path: shell-linux/build/aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: launcher-elf-armv7l
+          path: shell-linux/build/armv7l
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -74,9 +145,10 @@ jobs:
       - name: Build keylib key-holder (build.bat)
         working-directory: keylib
         run: .\build.bat
-      - name: Vendor _vendor (shell + keylib + applocal wheel)
-        # 全量 require：发布件完整性闸门（H4 fail-fast）——任何条目缺件拒绝出制品
-        run: python pkapp/scripts/vendor.py --require shell-windows,keylib-windows,keylib-src,shell-android,applocal-wheel
+      - name: Vendor _vendor (shell + launcher ELF ×3 + keylib + applocal wheel)
+        # 全量 require：发布件完整性闸门（H4 fail-fast）——任何条目缺件拒绝出制品；
+        # launcher 三 arch 全 require（arm 双线 job 失败不得静默出缺 arch 的 wheel）
+        run: python pkapp/scripts/vendor.py --require shell-windows,shell-linux-x86_64,shell-linux-aarch64,shell-linux-armv7l,keylib-windows,keylib-src,shell-android,applocal-wheel
       - name: Build pkapp wheel
         run: |
           python -m pip install -q build

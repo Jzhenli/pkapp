@@ -33,7 +33,7 @@ def vendor_mod():
 
 @pytest.fixture
 def fake_repo(tmp_path):
-    """假仓库树：五条目收录原料齐备。keylib/build 额外放 lib_pkapp_key.so
+    """假仓库树：八条目收录原料齐备。keylib/build 额外放 lib_pkapp_key.so
     （android 预编译件——收录时必须被无视，回归锚）。"""
     root = tmp_path / "repo"
     sw = root / "shell-windows" / "build"
@@ -52,9 +52,12 @@ def fake_repo(tmp_path):
     sa.mkdir(parents=True)
     (sa / "AndroidManifest.xml").write_text("<manifest/>", encoding="utf-8")
     (root / "applocal").mkdir()
-    sl = root / "shell-linux" / "build"
-    sl.mkdir(parents=True)
-    (sl / "myapp").write_bytes(b"\x7fELF-fake-launcher")
+    sl = root / "shell-linux" / "build"                   # launcher ELF ×3（arch 分位）
+    (sl / "aarch64").mkdir(parents=True)
+    (sl / "armv7l").mkdir()
+    (sl / "myapp").write_bytes(b"\x7fELF-fake-launcher-x64")
+    (sl / "aarch64" / "myapp").write_bytes(b"\x7fELF-fake-launcher-a64")
+    (sl / "armv7l" / "myapp").write_bytes(b"\x7fELF-fake-launcher-armv7")
     return str(root)
 
 
@@ -74,17 +77,20 @@ def fake_wheel(monkeypatch):
 
 
 def test_full_matrix_ok(vendor_mod, fake_repo, fake_wheel, capsys):
-    """六条目全齐 → rc=0，矩阵逐行 OK，产物落位正确。"""
+    """八条目全齐 → rc=0，矩阵逐行 OK，产物落位正确（launcher ×3 arch 分目录）。"""
     fake_wheel(vendor_mod)
     rc = vendor_mod.run(["--require",
-                         "shell-windows,shell-linux,keylib-windows,keylib-src,"
+                         "shell-windows,shell-linux-x86_64,shell-linux-aarch64,"
+                         "shell-linux-armv7l,keylib-windows,keylib-src,"
                          "shell-android,applocal-wheel"], root=fake_repo)
     assert rc == 0
     out = capsys.readouterr().out
-    assert out.count("[vendor] OK:") == 6
+    assert out.count("[vendor] OK:") == 8
     vroot = os.path.join(fake_repo, "pkapp", "pkapp", "_vendor")
     assert os.path.isfile(os.path.join(vroot, "shell", "MyApp.exe"))
     assert os.path.isfile(os.path.join(vroot, "shell-linux", "x86_64", "myapp"))
+    assert os.path.isfile(os.path.join(vroot, "shell-linux", "aarch64", "myapp"))
+    assert os.path.isfile(os.path.join(vroot, "shell-linux", "armv7l", "myapp"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"))
     assert os.path.isfile(os.path.join(vroot, "keylib", "src", "key.c"))
     assert os.path.isfile(os.path.join(vroot, "shell-android", "app",
@@ -119,11 +125,28 @@ def test_shell_linux_missing_is_skip_not_hard(vendor_mod, fake_wheel, tmp_path,
     open(os.path.join(kb, "pkapp_key.dll"), "wb").close()
     rc_no_require = vendor_mod.run([], root=root)
     assert rc_no_require == 0
-    assert "SKIP: shell-linux" in capsys.readouterr().out
+    assert "SKIP: shell-linux-x86_64" in capsys.readouterr().out
     assert not os.path.isdir(os.path.join(
         root, "pkapp", "pkapp", "_vendor", "shell-linux"))
-    rc_require = vendor_mod.run(["--require", "shell-linux"], root=root)
+    rc_require = vendor_mod.run(["--require", "shell-linux-x86_64"], root=root)
     assert rc_require == 2                       # --require 缺件契约 rc=2（既有语义）
+
+
+def test_shell_linux_arm_arch_skip_local(vendor_mod, fake_repo, fake_wheel, capsys):
+    """★阶段 5 前置★本地形态（WSL 仅构建 x86_64）：arm 双线记 SKIP 不失败；
+    --require 命中 arm 条目才 rc=2（release.yml 全量 require 承载发布完整性）。"""
+    fake_wheel(vendor_mod)
+    os.remove(os.path.join(fake_repo, "shell-linux", "build", "aarch64", "myapp"))
+    os.remove(os.path.join(fake_repo, "shell-linux", "build", "armv7l", "myapp"))
+    assert vendor_mod.run(["--require", "shell-linux-x86_64"],
+                          root=fake_repo) == 0
+    out = capsys.readouterr().out
+    assert "SKIP: shell-linux-aarch64" in out
+    assert "SKIP: shell-linux-armv7l" in out
+    assert not os.path.isdir(os.path.join(fake_repo, "pkapp", "pkapp", "_vendor",
+                                          "shell-linux", "aarch64"))
+    rc_require = vendor_mod.run(["--require", "shell-linux-armv7l"], root=fake_repo)
+    assert rc_require == 2
 
 
 def test_optional_skip_without_require(vendor_mod, fake_repo, fake_wheel, capsys):
@@ -169,6 +192,7 @@ def test_skip_clears_stale_artifacts(vendor_mod, fake_repo, fake_wheel, capsys):
     # 预放"上一次收录"的旧产物
     stale = {
         os.path.join(vroot, "shell", "MyApp.exe"),
+        os.path.join(vroot, "shell-linux", "x86_64", "myapp"),
         os.path.join(vroot, "keylib", "windows", "pkapp_key.dll"),
         os.path.join(vroot, "keylib", "src", "key.c"),
         os.path.join(vroot, "shell-android", "app", "AndroidManifest.xml"),
@@ -177,8 +201,10 @@ def test_skip_clears_stale_artifacts(vendor_mod, fake_repo, fake_wheel, capsys):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(b"stale")
-    # 源全部缺失（shell-windows / keylib-windows / keylib-src / shell-android）
+    # 源全部缺失（shell-windows / shell-linux-x86_64 / keylib-windows /
+    # keylib-src / shell-android）
     os.remove(os.path.join(fake_repo, "shell-windows", "build", "MyApp.exe"))
+    os.remove(os.path.join(fake_repo, "shell-linux", "build", "myapp"))
     os.remove(os.path.join(fake_repo, "keylib", "build", "pkapp_key.dll"))
     os.remove(os.path.join(fake_repo, "keylib", "src", "key.c"))
     shutil.rmtree(os.path.join(fake_repo, "shell-android", "shell"))
