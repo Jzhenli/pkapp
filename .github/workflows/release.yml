@@ -15,8 +15,10 @@ jobs:
     # ★M3 阶段 2 条 6★ launcher ELF（manylinux2014 同容器编译，glibc 2.17 地板
     # 对齐 D-2/D-12 v5）——artifact 供 pkapp-wheel job 收录 _vendor/shell-linux。
     # PYINC：解压同 pin PBS linux 快照取 include/（PyConfig 头，不链 libpython）。
+    # ★Node24 兼容★ GitHub Actions 已强制 JS action 跑 Node24（glibc≥2.28），
+    # manylinux2014（CentOS7，glibc 2.17）容器内无法再执行 checkout/upload 等
+    # JS action → 改宿主跑 checkout/PBS/artifact，仅编译步骤 docker run 进容器。
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
     steps:
       - uses: actions/checkout@v4
       - name: Fetch PBS headers (toolchain pin 同源)
@@ -25,14 +27,16 @@ jobs:
           mkdir -p /tmp/pbs && tar -xzf /tmp/pbs.tar.gz -C /tmp/pbs
           # 跨 step 环境变量必须写 $GITHUB_ENV（echo 裸输出不共享）
           echo "PYINC=$(ls -d /tmp/pbs/python/include/python3.*)" >> "$GITHUB_ENV"
-      - name: Build launcher (build.sh 默认名 myapp)
-        working-directory: shell-linux
-        shell: bash
-        run: ./build.sh myapp "" "$PYINC"
-      - name: Selftest (算法向量)
-        working-directory: shell-linux
-        shell: bash
-        run: ./build/myapp --selftest
+      - name: Build launcher (build.sh 默认名 myapp，manylinux2014 容器内编译)
+        # 编译须在容器内（glibc 2.17 头/链接器地板）；PBS 头只读挂载，PYINC 经
+        # -e 传入（宿主展开），容器内 bash -c 单引号防宿主二次展开。
+        run: >
+          docker run --rm -v /tmp/pbs:/tmp/pbs:ro -v "$PWD":/io -w /io/shell-linux
+          -e PYINC="$PYINC"
+          quay.io/pypa/manylinux2014_x86_64
+          bash -c './build.sh myapp "" "$PYINC"'
+      - name: Selftest (算法向量，宿主执行——glibc 2.31 ≥ 2.17 地板)
+        run: ./shell-linux/build/myapp --selftest
       - uses: actions/upload-artifact@v4
         with:
           name: launcher-elf-x86_64
