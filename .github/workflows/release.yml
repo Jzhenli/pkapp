@@ -179,8 +179,12 @@ jobs:
         run: .\build.bat
       - name: Vendor _vendor (shell + launcher ELF ×3 + keylib dll/so ×4 + applocal wheel)
         # 全量 require：发布件完整性闸门（H4 fail-fast）——任何条目缺件拒绝出制品；
-        # launcher + linux keylib 三 arch 全 require（arm job 失败不得静默出缺 arch 的 wheel）
-        run: python pkapp/scripts/vendor.py --require shell-windows,shell-linux-x86_64,shell-linux-aarch64,shell-linux-armv7l,keylib-windows,keylib-linux-x86_64,keylib-linux-aarch64,keylib-linux-armv7l,keylib-src,shell-android,applocal-wheel
+        # launcher + linux keylib 三 arch 全 require（arm job 失败不得静默出缺 arch 的 wheel）。
+        # pip install -e pkapp：vendor 的锚点字节校验要导入 pkapp.packager.keylib
+        # （ANCHOR_HEX 单源），包元数据未装则 PackageNotFoundError → SKIP（2026-10-26 实测）。
+        run: |
+          python -m pip install -q -e pkapp
+          python pkapp/scripts/vendor.py --require shell-windows,shell-linux-x86_64,shell-linux-aarch64,shell-linux-armv7l,keylib-windows,keylib-linux-x86_64,keylib-linux-aarch64,keylib-linux-armv7l,keylib-src,shell-android,applocal-wheel
       - name: Build pkapp wheel
         run: |
           python -m pip install -q build

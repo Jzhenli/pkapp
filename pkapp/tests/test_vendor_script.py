@@ -250,6 +250,25 @@ def test_keylib_linux_anchor_missing_rejected(vendor_mod, fake_repo, fake_wheel,
     assert rc == 2
 
 
+def test_keylib_linux_import_fail_skips_with_hint(vendor_mod, fake_repo,
+                                                  fake_wheel, capsys,
+                                                  monkeypatch):
+    """锚点校验依赖已安装的 pkapp（包 __init__ 走 metadata）——导入失败 →
+    SKIP 且提示 pip install -e pkapp（★CI release wheel job 实测坑 2026-10-26★：
+    vendor 步未装包时 PackageNotFoundError ⊂ ImportError，三 arch 全 SKIP，
+    --require 全量闸门拦下出制品）。"""
+    import sys
+
+    fake_wheel(vendor_mod)
+    monkeypatch.setitem(sys.modules, "pkapp.packager.keylib", None)
+    assert vendor_mod.run([], root=fake_repo) == 0    # 可选条目，SKIP 不失败
+    out = capsys.readouterr().out
+    assert "SKIP: keylib-linux-x86_64" in out
+    assert "pip install -e pkapp" in out
+    rc = vendor_mod.run(["--require", "keylib-linux-x86_64"], root=fake_repo)
+    assert rc == 2                                    # require 命中 SKIP → 闸门拦截
+
+
 def test_applocal_wheel_clears_stale_wheels(vendor_mod, fake_repo, monkeypatch):
     """★review 修复回归★：_build_applocal_wheel 必须先清 _vendor/wheels——
     applocal 版本 bump 后旧 wheel 滞留会打进 pkapp wheel（旧版 main() 有此清理，

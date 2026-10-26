@@ -140,11 +140,14 @@ def _vendor_keylib_linux_arch(vroot: str, root: str, arch: str) -> tuple[str, st
         return "SKIP", (f"缺 {src}——linux keylib 通用件（CI launcher job "
                         "artifact / linux host 现场编译）")
     try:
-        sys.path.insert(0, os.path.join(root, "pkapp"))
-        from pkapp.packager.keylib import ANCHOR_HEX      # 锚点单源（keylib.py）
+        from pkapp.packager.keylib import ANCHOR_HEX      # 锚点单源（keylib.py）。
+        # 依赖已安装的 pkapp（editable）：包 __init__ 走 importlib.metadata，
+        # 裸 sys.path 指路救不了（PackageNotFoundError ⊂ ImportError）；CI
+        # vendor 步须先 pip install -e pkapp（release.yml 2026-10-26 实测坑）。
     except ImportError as e:
         shutil.rmtree(dest, ignore_errors=True)
-        return "SKIP", f"{src} 锚点校验不可执行（pkapp.packager.keylib 导入失败: {e}）"
+        return "SKIP", (f"{src} 锚点校验不可执行（pkapp.packager.keylib 导入"
+                        f"失败: {e}——先 pip install -e pkapp 再跑 vendor）")
     with open(src, "rb") as f:
         n = f.read().count(bytes.fromhex(ANCHOR_HEX))
     if n < 1:
