@@ -132,13 +132,11 @@ def project(tmp_path, mock_runtime, wheels_dir):
 @pytest.fixture
 def linux_project(tmp_path, mock_runtime, mock_linux_runtime, wheels_dir):
     """★M3 阶段 2★ linux 构建项目：windows mock（借编解释器）+ linux mock 快照
-    （托管路径）+ 激活的 [platforms.linux] 段（模板段为注释态，追加实体段）。"""
+    （托管路径）；[platforms.linux] 段已随模板预置（python_version 族锁声明）。"""
     from pkapp.commands.create import cmd_create
     from pkapp.packager import sign
 
     root = str(tmp_path / "demo")
     assert cmd_create("demo", root, no_venv=True) == 0
-    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.linux]\npython_version = "3.12.14"\n')
     sign.generate_keypair(os.path.join(root, ".pkapp"))
     return root

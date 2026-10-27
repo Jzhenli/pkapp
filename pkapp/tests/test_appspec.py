@@ -179,16 +179,25 @@ def test_build_section_abolished(tmp_path):
         load(os.path.join(root, "pkapp.toml"))
 
 
+def _edit_linux(root, extra: str):
+    """向脚手架预置的 [platforms.linux] 段内插入覆盖行（模板预置生效后，追加同名
+    段 = TOML 重复表定义错误——覆盖配置一律段内插入）。"""
+    path = os.path.join(root, "pkapp.toml")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    assert text.count("[platforms.linux]\n") == 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.replace("[platforms.linux]\n", "[platforms.linux]\n" + extra))
+
+
 def test_linux_abis_default_and_parse(tmp_path):
-    """★R-L17★ [platforms.linux].abis：缺省 ("x86_64",)；显式配置解析（模板段为
-    注释态，追加实体段激活）。"""
+    """★R-L17★ [platforms.linux].abis：缺省 ("x86_64",)；显式配置解析（linux 段
+    已随模板预置 python_version 族锁声明，覆盖配置段内插入激活）。"""
     root = _make(tmp_path, "l1")
     spec = load(os.path.join(root, "pkapp.toml"))
     assert spec.linux.abis == ("x86_64",)
-    assert spec.linux.python_version == "" and spec.linux.runtime_dir == ""
-    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.linux]\nabis = ["aarch64"]\n'
-                'python_version = "3.12.14"\n')
+    assert spec.linux.python_version == "3.12.14" and spec.linux.runtime_dir == ""
+    _edit_linux(root, 'abis = ["aarch64"]\n')
     spec2 = load(os.path.join(root, "pkapp.toml"))
     assert spec2.linux.abis == ("aarch64",)
     assert spec2.linux.python_version == "3.12.14"
@@ -197,8 +206,7 @@ def test_linux_abis_default_and_parse(tmp_path):
 def test_linux_abis_unknown_arch(tmp_path):
     """★R-L17★ 架构值域校验：未知架构报错（x86_64 / aarch64 / armv7l）。"""
     root = _make(tmp_path, "l2")
-    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.linux]\nabis = ["riscv64"]\n')
+    _edit_linux(root, 'abis = ["riscv64"]\n')
     with pytest.raises(SpecError, match="未知架构"):
         load(os.path.join(root, "pkapp.toml"))
 
@@ -206,7 +214,6 @@ def test_linux_abis_unknown_arch(tmp_path):
 def test_linux_abis_multi_rejected(tmp_path):
     """★R-L17★ 单架构约束（对齐 android 单 ABI 构建）：多架构报错、指引分次构建。"""
     root = _make(tmp_path, "l3")
-    with open(os.path.join(root, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.linux]\nabis = ["x86_64", "aarch64"]\n')
+    _edit_linux(root, 'abis = ["x86_64", "aarch64"]\n')
     with pytest.raises(SpecError, match="单架构"):
         load(os.path.join(root, "pkapp.toml"))

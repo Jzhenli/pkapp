@@ -101,29 +101,41 @@ def _deploy_pth_text(python_version: str) -> str:
     return "\n".join(line.format(stem=stem) for line in _DEPLOY_PTH_TMPL) + "\n"
 
 
-def _systemd_unit_text(name: str, desc: str) -> str:
-    """最小可编辑 .service 模板（§5 定案 staging 含 .service；D-1 in-process 常驻
-    + D-6 WatchdogSec 已拍板项落字段，D-7 解包区三选项未定 → ExecStartPre 留白注释，
-    阶段 4 systemd 冒烟对齐真实细节后回填）。"""
-    return f"""\
+def _systemd_unit_text(name: str) -> str:
+    """最小 .service 模板（§5 定案 staging 含 .service）——★正文零注释★，部署者
+    拿到即生效形态，设计说明全量在此承载：
 
+    - D-1 in-process 常驻；Restart=on-failure（launcher 干净退出不重启 = 运维
+      stop 语义）+ RestartSec=3；
+    - D-6 WatchdogSec=30：launcher sd_notify 半周期喂狗（冻结感知，in-process
+      watchdog 随进程冻结故走 sd_notify）；
+    - D-9 StateDirectory + HOME 锚两件套：写路径强制出部署目录/出 /root（真机
+      教训：HOME 失控触发完整性门 fail-closed 拒载或散落 root 家目录）；XDG_*
+      不设——launcher 硬编码 $HOME 点形态回落、applocal 零消费（设了反致第三方
+      库消费时 cache/.cache 目录分裂）；MYAPP_PLATFORM 不设——launcher setenv
+      自设且必然覆盖（模板行永远无效）；
+    - 运行身份默认 root 开箱即用（真机实证：专用账号缺失服务直接 217/USER 起不
+      来）。生产加固可选：`useradd -r -s /usr/sbin/nologin <name> &&
+      chown -R <name> /opt/<name>` 后改 User=<name>（StateDirectory 属主由
+      systemd 随 User= 自动创建/接管，无需手工 chown /var/lib）；
+    - D-7 解包区三选项未定 → ExecStartPre 留白；拍板①（部署目录只读+预解包）后
+      代码回填 `ExecStartPre=+/usr/local/bin/pkapp-unpack <name>`（+ 前缀 =
+      全特权执行，见 D-7 拍板记录）。
+    """
+    return f"""\
 [Unit]
-Description={desc} (pkapp)
+Description={name}
 After=network.target
 
 [Service]
 Type=notify
 ExecStart=/opt/{name}/{name}
-# D-7（解包区三选项）拍板前 ExecStartPre 预解包留白——部署目录可写（选项②）时
-# launcher 首启自解包即可用；拍板①（只读+预解包）后启用：
-# ExecStartPre=+/usr/local/bin/pkapp-unpack {name}
 Restart=on-failure
 RestartSec=3
-# D-6：冻结感知（WATCHDOG_USEC 由 launcher sd_notify 半周期喂狗）
 WatchdogSec=30
-# 运行身份（D-9 部署目录可写，运行账号 owner）：
-User={name}
-Environment=MYAPP_PLATFORM=linux
+User=root
+StateDirectory={name}
+Environment=HOME=/var/lib/{name}
 
 [Install]
 WantedBy=multi-user.target
@@ -238,7 +250,7 @@ def _package_linux(project: str, spec, *, shell: str | None,
         f.write(_deploy_pth_text(spec.linux.python_version))
     with open(os.path.join(stage, f"{name}.service"), "w", encoding="utf-8",
               newline="\n") as f:
-        f.write(_systemd_unit_text(name, spec.name))
+        f.write(_systemd_unit_text(name))
 
     out_dir = os.path.abspath(out or os.path.join(project, "release"))
     os.makedirs(out_dir, exist_ok=True)

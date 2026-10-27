@@ -56,4 +56,6 @@ healthz_interval = 15
 revive_burst_window = 1800
 revive_burst_limit = 3
 healthy_reset_window = 120
-# [platforms.linux]                    # M3 预留；dependencies 同样追加
+[platforms.linux]
+python_version = "3.12.14"     # 族锁（与 toolchain.py PINS 同漂，升级两处同步）→ pkapp fetch linux
+# dependencies = [ ]           # 仅 Linux 装的依赖

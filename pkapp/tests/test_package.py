@@ -18,11 +18,7 @@ _SHELL = os.path.join(_REPO, "shell-windows", "build", "MyApp.exe")
 def _make_project(tmp_path):
     proj = str(tmp_path / "myapp")
     assert main(["create", "myapp", "--dir", proj, "--no-venv"]) == 0
-    # linux 段统一启用（python_version 声明 = package linux 声明闸门必需；
-    # 对 windows/android 用例无害——load 白名单收段）
-    with open(os.path.join(proj, "pkapp.toml"), "a", encoding="utf-8") as f:
-        f.write('\n[platforms.linux]\npython_version = "3.12.14"\n')
-    return proj
+    return proj   # [platforms.linux] 已随模板预置（python_version 族锁声明）
 
 
 def _write_spk(proj, platform):
@@ -654,7 +650,17 @@ def test_package_linux_golden(tmp_path, capsys, monkeypatch):
     assert pub.encode("ascii") in elf                       # 补丁命中项目公钥
     assert winshell._SHELL_DEFAULT_PUB.encode("ascii") not in elf   # 出厂锚已替换
     svc = tarfile.open(tar_path).extractfile("myapp/myapp.service").read().decode()
+    assert svc.startswith("[Unit]")          # 模板零前导空行（文件干净起始）
+    assert "Description=myapp\n" in svc
     assert "ExecStart=/opt/myapp/myapp" in svc and "WatchdogSec=30" in svc
+    # D-9 模板落地（2026-10-27 真机验收修订）：root 开箱即用 + 写路径强制出部署目录
+    assert "User=root" in svc and "StateDirectory=myapp" in svc
+    assert "Environment=HOME=/var/lib/myapp" in svc
+    assert "User=myapp" not in svc   # 专用账号不在模板正文（加固指引在 docstring）
+    # 两件套收敛负断言（review 收敛：冗余/分裂源不入模板）
+    assert "XDG_" not in svc         # launcher 硬编码 $HOME 点形态回落，XDG_* 零消费
+    assert "MYAPP_PLATFORM" not in svc  # launcher setenv 自设且必然覆盖，模板行无效
+    assert "#" not in svc            # 模板正文零注释（设计说明全量在 docstring 承载）
     assert not os.path.isdir(os.path.join(proj, "build", "staging-linux"))  # 成功即焚
 
 

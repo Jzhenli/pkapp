@@ -44,5 +44,6 @@ abis = ["arm64-v8a"]
 extra_index_url = "https://pypi.flet.dev/"   # flet 索引：android 二进制 wheel 源（pydantic_core/numpy 等按 abi 供包）
 # icon = "icons/android/icon.png"    # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；做法参考
                                      #  examples/helloapp：单源 PNG 自动生成全密度 mipmap + 自适应图标）
-# [platforms.linux]                    # M3 预留；dependencies 同样追加
-# python_version = "3.12.14"           # → pkapp fetch linux（PBS 托管快照同版本锁定）
+[platforms.linux]
+python_version = "3.12.14"     # 族锁（与 toolchain.py PINS 同漂，升级两处同步）→ pkapp fetch linux
+# dependencies = [ ]           # 仅 Linux 装的依赖
