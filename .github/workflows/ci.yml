@@ -20,8 +20,8 @@ jobs:
     env:
       PYTHONUTF8: "1"               # runner 默认 cp1252，中文测试输出统一 UTF-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Install applocal + pkapp + pytest
@@ -44,12 +44,13 @@ jobs:
     #   3) applocal 套件 Linux host 口径（POSIX 宿主假设用例随 M3 落地）；
     #   4) pkapp 契约面（manifest 契约 + env 对账锚 + R-L9 公钥补丁断言）。
     # PBS pin 与 release.yml launcher job 同源（cpython-3.12.14+20260929）。
-    runs-on: ubuntu-latest
+    # ★ubuntu-24.04 显式 pin★（ubuntu-latest 2026-10 起漂移 Ubuntu 26，runner-images#14748）
+    runs-on: ubuntu-24.04
     env:
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install deps + editable applocal/pkapp
