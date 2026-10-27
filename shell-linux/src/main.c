@@ -1248,15 +1248,19 @@ static void watchdog_die(const char *reason, long seq, int cold) {
 }
 
 /* ---- D-6：sd_notify（NOTIFY_SOCKET 协议，手写零依赖 ~30 行） ----
- * systemd WatchdogSec= 场景：watchdog 线程按 WatchdogSec/2 周期发 WATCHDOG=1
+ * systemd Type=notify 场景：ready 首次点亮发 READY=1（Job 置 active）；
+ * WatchdogSec= 场景：watchdog 线程按 WatchdogSec/2 周期发 WATCHDOG=1
  * 数据报；abstract socket（@ 开头）sun_path[0] 置 NUL。无 NOTIFY_SOCKET =
  * 非 sd_notify 模式（冒烟/直接运行）→ no-op。发送失败静默（漏拍 → systemd
- * 侧判死重启，合同自洽；杀进程比带病运行好）。 */
-static int sd_notify_watchdog(void) {
+ * 侧判死重启，合同自洽；杀进程比带病运行好）。
+ * ★真机验收修复★（armv7 板 2026-10-27）：原实现只发 WATCHDOG=1 无 READY=1
+ * ——Type=notify 下 start Job 永等 READY 超时（应用实际已 ready，active 卡
+ * activating），systemd 语义缺口只有真机暴露。 */
+static int sd_notify_msg(const char *msg) {
     const char *sock = getenv("NOTIFY_SOCKET");
     struct sockaddr_un sa;
     int at, fd, ok;
-    size_t l, salen;
+    size_t l, salen, mlen;
     ssize_t n;
     if (!sock || !*sock) return 0;
     at = (sock[0] == '@');
@@ -1267,13 +1271,14 @@ static int sd_notify_watchdog(void) {
     memcpy(sa.sun_path + at, sock + at, l);
     /* M4 审查修复：abstract 名按（字节，长度）精确匹配——systemd 以
        offsetof(sun_path)+1+strlen 绑定，sendto 必须同长（sizeof(sa) 带尾部 NUL
-       填充 → 查找不中，WATCHDOG=1 永不可达，启用 WatchdogSec 后健康服务被误杀）；
+       填充 → 查找不中，通知永不可达，启用 WatchdogSec 后健康服务被误杀）；
        路径名则含结尾 NUL */
     salen = offsetof(struct sockaddr_un, sun_path) + (size_t)at + l + (at ? 0 : 1);
+    mlen = strlen(msg);
     fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
-    n = sendto(fd, "WATCHDOG=1", 10, 0, (struct sockaddr *)&sa, (socklen_t)salen);
-    ok = (n == 10) ? 0 : -1;
+    n = sendto(fd, msg, mlen, 0, (struct sockaddr *)&sa, (socklen_t)salen);
+    ok = (n == (ssize_t)mlen) ? 0 : -1;
     close(fd);
     return ok;
 }
@@ -1308,7 +1313,7 @@ static void *watchdog_loop(void *arg) {
             return NULL;
         }
         if (sd_interval_s > 0 && time(NULL) - last_ping >= sd_interval_s) {
-            sd_notify_watchdog();
+            sd_notify_msg("WATCHDOG=1");
             last_ping = time(NULL);
         }
         char *text = read_file(g_ready, NULL);
@@ -1348,6 +1353,7 @@ static void *watchdog_loop(void *arg) {
                 last_seq = seq;
                 slog("ready 点亮 port=%ld seq=%ld（%.0fs）",
                      port, seq, difftime(time(NULL), start));
+                sd_notify_msg("READY=1");   /* ★Type=notify★ Job 置 active（真机验收修复） */
             } else {
                 if (seq > last_seq) {
                     last_seq = seq;
