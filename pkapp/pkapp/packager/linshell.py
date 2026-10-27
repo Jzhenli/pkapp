@@ -4,7 +4,9 @@ android 有 apk.py，linux 对仗建 linshell.py，windows 壳域机制件属地
 
 模式 A（零编译壳）：launcher 五模块直引 shell-windows/src/manifest.c → ELF 内嵌
 与 windows 同一个出厂公钥常量（_SHELL_DEFAULT_PUB）——原位补丁函数（winshell
-属地）直接适用；出货前 --selftest-spk 配对自检（main.c 差分入口，同一函数）。
+属地）直接适用；出货前 --selftest-spk 配对自检（main.c 差分入口，同一函数）；
+host 无法执行目标 ELF 时（nt host / 无 qemu 的交叉件）降级静态配对断言
+（_static_pairing_assert），降级不可用或断言不过照旧拒出货。
 
 组装编排（_package_linux，§5 定案）：launcher（模式 A 补丁 / 模式 B 显式跳过）+
 spk + 部署 ._pth（D-5）+ 完整性侧车（D-4 与 ELF 同级）+ .service 模板 → tar.gz
@@ -21,7 +23,7 @@ from . import integrity, sign
 from .apk import artifact_name
 from .integrity import _extract_integrity_sidecar
 from .spk import _spk_manifest_fields
-from .winshell import _patch_shell_pubkey, _shell_accepts
+from .winshell import _SHELL_DEFAULT_PUB, _patch_shell_pubkey, _shell_accepts
 
 # 部署态 ._pth（D-5 定案：<launcher 名>._pth @ launcher 目录，四行收窄隔离模式，
 # 相对路径以 launcher 目录为基准；壳 spike 四判据实测命中形态）。app/ 不入 ._pth
@@ -31,6 +33,28 @@ from .winshell import _patch_shell_pubkey, _shell_accepts
 # 同款算式——族锁升级两处同漂，不留双源）。
 _DEPLOY_PTH_TMPL = ("_runtime/{stem}.zip", "_runtime/lib-dynload",
                     "_runtime/site-packages/deps.zip", "_runtime/site-packages/loose")
+
+
+def _static_pairing_assert(elf_path: str, pub_hex: str | None) -> tuple[bool, str]:
+    """自检降级闸门（host 无法执行目标 launcher ELF 时）：字节级配对断言。
+
+    断言两件事：补丁公钥在 ELF 内 ≥1 命中（staging 副本上真实落过补丁）且出厂
+    锚清零（未被误替换残留）。运行期验签（manifest hash + Ed25519）不在此覆盖
+    ——由 CI shell-linux harness（16 例）与 linux host 出货路径保障。pub_hex 为
+    None（模式 B 自管件/无私钥）→ 不可断言，如实拒出货（不带病降级）。"""
+    if not pub_hex:
+        return False, ("静态配对断言不可用（模式 B 自管件/无私钥——无从比对配对"
+                       "基准），请在 WSL/CI 完成 package linux")
+    with open(elf_path, "rb") as f:
+        blob = f.read()
+    n_pub = blob.count(pub_hex.encode("ascii"))
+    n_factory = blob.count(_SHELL_DEFAULT_PUB.encode("ascii"))
+    if n_pub == 0 or n_factory != 0:
+        return False, (f"静态配对断言失败——补丁公钥命中 {n_pub} 处（期望 ≥1），"
+                       f"出厂锚残留 {n_factory} 处（期望 0）")
+    return True, (f"★自检降级★ host 无法执行目标 launcher ELF（运行期验签由 CI"
+                  f" shell-linux harness 覆盖）——静态配对断言通过：补丁公钥 "
+                  f"{pub_hex[:12]}… 命中 {n_pub} 处，出厂锚已清零")
 
 
 def _find_launcher_linux(explicit: str | None, arch: str, name: str) -> tuple[str | None, bool]:
@@ -158,17 +182,19 @@ def _package_linux(project: str, spec, *, shell: str | None,
     # 原位改写（64 ASCII hex 同长度替换，ELF .rodata 零扰动）。补丁失败不阻断
     # （--selftest-spk 闸门兜底——验不过即拒出货）。模式 B（显式 --shell /
     # PKAPP_SHELL_ELF，公钥编译期自定）跳过补丁，配对自检闸门兜底（winshell 同口径）。
+    patched_pub: str | None = None               # 自检降级（host 不可执行）时的静态断言基准
     if patchable:
+        key_path = None
         try:
             key_path = sign.resolve_private_key(None, project)
         except sign.SignError as e:
             print(f"[package] {e}")
-            key_path = None
         if key_path is None:
             print("[package] 未定位到签名私钥——launcher 公钥补丁跳过，"
                   "若 spk 用他钥签名配对自检会拦下")
         else:
             pub = sign.public_key_hex(key_path)
+            patched_pub = pub
             try:
                 _patch_shell_pubkey(elf_path, pub)    # 出厂 hex 锚 → 64-hex 唯一段兜底
                 print(f"[package] launcher 公钥已配对项目密钥（{pub[:12]}…）")
@@ -181,6 +207,14 @@ def _package_linux(project: str, spec, *, shell: str | None,
 
     # 出货闸门：--selftest-spk（main.c 差分入口，重算 hash 排除口径同 manifest_verify）
     ok, detail = _shell_accepts(elf_path, spk)
+    if not ok and detail.startswith("壳自检进程启动失败"):
+        # ★自检降级★（2026-10-27 wheel 实测：Windows host 执行 linux launcher
+        # ELF → WinError 193）——host 跑不了目标 ELF 时运行期闸门降级为静态配对
+        # 断言（补丁公钥命中 + 出厂锚清零）；运行期验签由 CI shell-linux harness
+        # 与 linux host 覆盖。降级不可用（模式 B/无私钥）或断言不过 → 照旧拒出货。
+        ok, detail = _static_pairing_assert(elf_path, patched_pub)
+        if ok:
+            print(f"[package] {detail}")
     if not ok:
         print("[package] 配对自检失败——launcher 验不过该 spk（内嵌公钥 ≠ 签名公钥）。\n"
               "  模式 A：pkapp build linux（私钥缺失会自动 keygen）后重跑 package\n"

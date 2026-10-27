@@ -658,6 +658,83 @@ def test_package_linux_golden(tmp_path, capsys, monkeypatch):
     assert not os.path.isdir(os.path.join(proj, "build", "staging-linux"))  # 成功即焚
 
 
+def test_package_linux_nt_host_degrades_static_assert(tmp_path, capsys, monkeypatch):
+    """★自检降级★（2026-10-27 wheel 实测：Windows host 执行 linux launcher ELF →
+    WinError 193）：_shell_accepts 进程启动失败 → 降级静态配对断言（补丁公钥命中 +
+    出厂锚清零）→ 正常出货并明示降级。真实验证场景锚：wheel 内置件 Windows host
+    直出明文包（模式 A 补丁已先行落地，字节断言兜住补丁正确性）。"""
+    import tarfile
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import linshell, winshell
+
+    proj = _make_project(tmp_path)
+    key = sign_mod.generate_keypair(os.path.join(proj, ".pkapp"))[0]
+    pub = sign_mod.public_key_hex(key)
+    _make_signed_spk(proj, "linux", key)
+    launcher = _fake_launcher(tmp_path, winshell._SHELL_DEFAULT_PUB)
+    monkeypatch.setattr(linshell, "_find_launcher_linux",
+                        lambda *a, **k: (launcher, True))
+    monkeypatch.setattr(
+        linshell, "_shell_accepts",
+        lambda *a, **k: (False, "壳自检进程启动失败: [WinError 193] "
+                                "%1 不是有效的 Win32 应用程序。"))
+
+    assert main(["package", "linux", "--project", proj]) == 0
+    out = capsys.readouterr().out
+    assert "★自检降级★" in out and "静态配对断言通过" in out
+    tar_path = os.path.join(proj, "release", "myapp-0.1.0-linux-x86_64.tar.gz")
+    with tarfile.open(tar_path) as tf:
+        elf = tf.extractfile("myapp/myapp").read()
+    assert pub.encode("ascii") in elf                       # 静态断言基准即补丁事实
+    assert winshell._SHELL_DEFAULT_PUB.encode("ascii") not in elf
+
+
+def test_package_linux_exec_fail_without_key_hardfails(tmp_path, capsys,
+                                                       monkeypatch):
+    """自检降级不可用（模式 B 自管件——patched_pub=None）：进程启动失败 →
+    静态断言无从比对基准 → 照旧拒出货 + 指路 WSL/CI（不带病降级）。"""
+    from pkapp.packager import linshell
+
+    proj = _make_project(tmp_path)
+    _write_spk(proj, "linux")
+    paired = str(tmp_path / "paired-launcher")
+    with open(paired, "wb") as f:
+        f.write(b"\x7fELF-payload-tail")
+    monkeypatch.setattr(
+        linshell, "_shell_accepts",
+        lambda *a, **k: (False, "壳自检进程启动失败: [WinError 193] boom"))
+
+    assert main(["package", "linux", "--project", proj, "--shell", paired]) == 2
+    out = capsys.readouterr().out
+    assert "静态配对断言不可用" in out and "WSL/CI" in out
+    assert os.path.isdir(os.path.join(proj, "build", "staging-linux"))
+
+
+def test_package_linux_static_assert_failure_hardfails(tmp_path, capsys,
+                                                       monkeypatch):
+    """降级静态断言不过（补丁未落——monkeypatch 掉 _patch_shell_pubkey 模拟）：
+    补丁公钥零命中 + 出厂锚残留 → 拒出货（降级不放过坏补丁）。"""
+    from pkapp.packager import sign as sign_mod
+    from pkapp.packager import linshell, winshell
+
+    proj = _make_project(tmp_path)
+    key = sign_mod.generate_keypair(os.path.join(proj, ".pkapp"))[0]
+    _make_signed_spk(proj, "linux", key)
+    launcher = _fake_launcher(tmp_path, winshell._SHELL_DEFAULT_PUB)
+    monkeypatch.setattr(linshell, "_find_launcher_linux",
+                        lambda *a, **k: (launcher, True))
+    monkeypatch.setattr(linshell, "_patch_shell_pubkey", lambda *a, **k: None)
+    monkeypatch.setattr(
+        linshell, "_shell_accepts",
+        lambda *a, **k: (False, "壳自检进程启动失败: [WinError 193] boom"))
+
+    assert main(["package", "linux", "--project", proj]) == 2
+    out = capsys.readouterr().out
+    assert "静态配对断言失败" in out
+    assert "补丁公钥命中 0 处" in out and "出厂锚残留 1 处" in out
+    assert os.path.isdir(os.path.join(proj, "build", "staging-linux"))
+
+
 def test_package_linux_gate_rejects_unpaired(tmp_path, capsys, monkeypatch):
     """出货闸门：--selftest-spk 验不过 → 拒出包 + staging 保留现场（windows 同口径）。"""
     from pkapp.packager import sign as sign_mod
