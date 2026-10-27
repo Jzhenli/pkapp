@@ -955,8 +955,6 @@ def test_linux_build_golden(linux_project, wheels_dir, tmp_path):
     """★M3★ linux spk golden：布局 = 定案条 4（libpython 真件 + python312.zip +
     lib-dynload/ + site-packages/ + app/ + ui/）；无 ._pth（D-5）；tcl/tk 与
     保守档死重不进包；验签链全通（G4 linux 面）。"""
-    make_wheel(wheels_dir, "setproctitle", "1.0",
-               {"setproctitle/__init__.py": ""})     # B.y 注入面
     out = str(tmp_path / "demo-linux.spk")
     fields = _build_linux(linux_project, wheels_dir, out)
     assert fields["python_dll"] == "libpython3.12.so.1.0"
@@ -998,7 +996,6 @@ def test_linux_build_encrypted_keylib_failfast(linux_project, wheels_dir,
     monkeypatch.setattr(
         "pkapp.packager.keybuild._compile_linux",
         lambda *a, **k: (_ for _ in ()).throw(KeyLibError("linux 编译器缺失")))
-    make_wheel(wheels_dir, "setproctitle", "1.0", {"setproctitle/__init__.py": ""})
     spec = load(os.path.join(linux_project, "pkapp.toml"))
     spec = replace(spec, code_encryption=True)
     with pytest.raises(BuildError, match="keylib"):
@@ -1009,7 +1006,6 @@ def test_linux_build_encrypted_keylib_failfast(linux_project, wheels_dir,
 
 def test_linux_reproducible(linux_project, wheels_dir, tmp_path):   # G1 linux 面
     """salt 关（默认）→ linux 构建字节级可复现（windows G1 同款口径）。"""
-    make_wheel(wheels_dir, "setproctitle", "1.0", {"setproctitle/__init__.py": ""})
     outs = []
     for i in (1, 2):
         p = str(tmp_path / f"l{i}.spk")

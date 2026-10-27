@@ -136,9 +136,9 @@ PINS: tuple[Pin, ...] = (
     # 内层 python/ 重命名为 <arch>——快照 <arch>/ 即安装根（bin/include/lib/share，
     # libpython3.12.so.1.0 在 lib/ 子目录）；各 arch pin 共享父目录
     # runtimes/pbs-linux-cpython-3.12.14+20260929（snapshot.toml 落此，_install 特判）。
-    # sha256 为 2026-10-23 官方资产实测回填（32.69 MB）。armv7 pin 随阶段 5/D-8=c
-    # 接线（本地实测件为 3.12.15+20261021，与族锁 3.12.14 不同版，届时按当期
-    # release 回填值与族锁对齐策略一并定）。
+    # 三 arch 同 release 20260929 族锁（3.12.14），sha256 均为 2026-10 官方资产实测
+    # 回填（x86_64 32.69 MB / aarch64 29.20 MB / armv7 25.63 MB；arm 双线随阶段 5
+    # 前置接线，与 launcher/keylib CI 供给同 release——族锁对齐无漂移）。
     Pin(id="pbs-linux-cpython-3.12.14-x86_64", platform="linux",
         filename="cpython-3.12.14+20260929-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
         urls=("https://github.com/astral-sh/python-build-standalone/releases/"
@@ -146,6 +146,20 @@ PINS: tuple[Pin, ...] = (
         sha256="ef605200f8174e87ecfc308e52a88127543f85dd5c940dc5e92cab244b98a003",
         kind="tar.gz", dest_parent="runtimes/pbs-linux-cpython-3.12.14+20260929",
         inner_rename="x86_64"),
+    Pin(id="pbs-linux-cpython-3.12.14-aarch64", platform="linux",
+        filename="cpython-3.12.14+20260929-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        urls=("https://github.com/astral-sh/python-build-standalone/releases/"
+              "download/20260929/cpython-3.12.14+20260929-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",),
+        sha256="706111f834ae1557314f48b7293ddc72cc96e952aa75c5d31f56c2b7ddeac3d3",
+        kind="tar.gz", dest_parent="runtimes/pbs-linux-cpython-3.12.14+20260929",
+        inner_rename="aarch64"),
+    Pin(id="pbs-linux-cpython-3.12.14-armv7l", platform="linux",
+        filename="cpython-3.12.14+20260929-armv7-unknown-linux-gnueabihf-install_only_stripped.tar.gz",
+        urls=("https://github.com/astral-sh/python-build-standalone/releases/"
+              "download/20260929/cpython-3.12.14+20260929-armv7-unknown-linux-gnueabihf-install_only_stripped.tar.gz",),
+        sha256="a90f5fa765eb840337fdf3a7695eb943478637ee91fcdc5cf0651c0b84a00307",
+        kind="tar.gz", dest_parent="runtimes/pbs-linux-cpython-3.12.14+20260929",
+        inner_rename="armv7l"),
 )
 
 

@@ -458,10 +458,19 @@ def test_fetch_android_finishes_licenses(tmp_path, monkeypatch):
 
 
 def test_linux_pin_present_and_verified():
-    """★M3 阶段 2★ linux 运行时 pin 在场且 sha256 已核定（x86_64 先行；armv7 随阶段 5）。"""
+    """★M3 阶段 2★ linux 运行时 pin 在场且 sha256 已核定（三 arch 同 release
+    20260929 族锁；arm 双线随阶段 5 前置接线，2026-10 实测回填）。"""
     linux = [p for p in toolchain.PINS if p.platform == "linux"]
-    assert [p.id for p in linux] == ["pbs-linux-cpython-3.12.14-x86_64"]
+    assert [p.id for p in linux] == [
+        "pbs-linux-cpython-3.12.14-x86_64",
+        "pbs-linux-cpython-3.12.14-aarch64",
+        "pbs-linux-cpython-3.12.14-armv7l",
+    ]
     assert all(p.sha256 and p.kind == "tar.gz" for p in linux)
+    # 同 release 族锁 + 内层重命名 = spec.abis 目录段名口径
+    assert all("+20260929-" in p.filename for p in linux)
+    assert [p.inner_rename for p in linux] == ["x86_64", "aarch64", "armv7l"]
+    assert len({p.dest_parent for p in linux}) == 1   # 共享父目录（snapshot.toml 特判）
 
 
 def test_fetch_linux_arch_layout_snapshot_at_parent(tmp_path, monkeypatch):

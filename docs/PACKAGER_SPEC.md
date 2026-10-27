@@ -68,8 +68,12 @@ app/ 不得写入 _pth——由 applocal bootstrap 步骤 1 运行时追加。
 ```
 > 原 v8.0 文本写死 `python312.zip`，与 B.z③"文件名随 python_dll 走"自相矛盾，会把"3.13 升级演练"必炸，故修订。
 
-### B.y Linux 目标默认装入 `setproctitle`
-可选依赖；bootstrap 步骤 0 探测调用，探测不到静默跳过。
+### B.y Linux 目标默认装入 `setproctitle`（★2026-10 废除★）
+已移除：[platforms.linux].setproctitle 字段删除（toml 残留报未知键），依赖闭包
+不再追加 setproctitle（armv7 无官方 wheel，阻塞 arm 双线构建）；Linux 进程标识
+= launcher `exec -a` 单通道（协议 §10）。applocal.set_process_title 同步移除
+（冻结函数 13 → 12）。历史用例如需进程标题可自装 setproctitle（x86_64/aarch64
+有官方 wheel）。
 
 ### B.z golden test 断言（★v8.1 增补 ④⑤★；★v0.3 增补 ⑥★）
 ```

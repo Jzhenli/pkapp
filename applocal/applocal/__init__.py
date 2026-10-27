@@ -1,9 +1,9 @@
 """applocal — pkapp 契约层（协议 A：壳 ⇄ applocal；协议 C：applocal ⇄ 用户代码）。
 
 独立纯 Python 包，零强制依赖（uvicorn 由用户应用自带、惰性导入）。
-12 个冻结函数（§4.1：API 只加不改；差异吸收在函数内部；dev 与 embedded 同一契约）：
+11 个冻结函数（§4.1：API 只加不改；差异吸收在函数内部；dev 与 embedded 同一契约）：
 
-    bootstrap / paths / runtime / native_lib_dir / set_process_title /
+    bootstrap / paths / runtime / native_lib_dir /
     migrate / diag / read_diag / on_background / build_asgi_app /
     start_heartbeat / write_ready
 
@@ -21,7 +21,7 @@ if _os.environ.get("MYAPP_NATIVE_LIB_DIR"):
     _ndk_register(_os.environ["MYAPP_NATIVE_LIB_DIR"])
 
 from ._core import (bootstrap, build_asgi_app, diag, migrate, on_background,
-                    pick_port, read_diag, set_process_title, shutdown,
+                    pick_port, read_diag, shutdown,
                     start_heartbeat, write_ready)
 from ._audit import record_event
 from ._env import ContractError, load_env
@@ -59,8 +59,8 @@ except Exception:
 
 
 __all__ = [
-    # 13 个冻结函数（★阶段 4★ +shutdown：graceful 停服通道，launcher 信号链共用）
-    "bootstrap", "paths", "runtime", "native_lib_dir", "set_process_title",
+    # 12 个冻结函数（★阶段 4★ +shutdown：graceful 停服通道，launcher 信号链共用）
+    "bootstrap", "paths", "runtime", "native_lib_dir",
     "migrate", "diag", "read_diag", "on_background", "build_asgi_app",
     "start_heartbeat", "write_ready", "shutdown",
     # 异常与工具（不算冻结函数，但属公开面）

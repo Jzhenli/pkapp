@@ -326,7 +326,6 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
       _runtime/ 内条目）——consolidate 产出的 windows 形态 _pth 落 stage 即删；
     - 编译面解释器 = windows 快照 python.exe 借编（pyc 字节与目标平台无关，
       android 同款先例；哨兵按"编译器实际版本"校验——pyc.py 已修 .so 版本链归一）；
-    - setproctitle 依赖追加（B.y，spec.linux.setproctitle 缺省开）；
     - wheels 平台标签 manylinux2014_<arch>（D-12 v5 PyPI 交叉下载主路线）；
     - 加密态：运行期 keylib 件 pkapp_key.so 烧 K 进 spk 根（§4.6 条 7——launcher
       dlopen 与 applocal ctypes 同件同源）；供给序 = host 同 arch 现场编译 >
@@ -390,12 +389,10 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
             shutil.copytree(dyn_src, os.path.join(stage, "lib-dynload"),
                             ignore=shutil.ignore_patterns(
                                 ".empty", "_test*", "_ctypes_test*", "_tkinter*"))
-        # 4) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.linux] +
-        #    setproctitle（B.y）；wheels_dir 缺省 → 托管缓存 <root>/wheels/linux/<arch>）
+        # 4) site-packages + B.v certifi 断言（依赖 = 公共 + [platforms.linux]；
+        #    wheels_dir 缺省 → 托管缓存 <root>/wheels/linux/<arch>）
         index_url, extra_index = spec.wheels_index("linux")
         deps = spec.deps_for("linux")
-        if spec.linux.setproctitle:
-            deps = deps + ("setproctitle",)   # B.y：set_process_title 探测项
         sp_dir = _install_site_packages(stage, deps,
                                         wheels_dir or _wheels_cache("linux", arch),
                                         allow_download=wheels_dir is None,

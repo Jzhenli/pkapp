@@ -29,7 +29,7 @@
 
 | 变量 | 含义 | Windows 示例 | 备注 |
 |---|---|---|---|
-| `MYAPP_PLATFORM` | 平台标识 | `windows` \| `android` \| `linux` | 决定 `so` 注入与 setproctitle 行为 |
+| `MYAPP_PLATFORM` | 平台标识 | `windows` \| `android` \| `linux` | 决定 `so` 注入行为 |
 | `MYAPP_DATA_DIR` | 用户数据区（跟着用户走） | `%LOCALAPPDATA%\MyApp\data\` | 绝不写只读区 |
 | `MYAPP_CACHE_DIR` | 缓存区（log/、ready、diag 落此） | `%LOCALAPPDATA%\MyApp\cache\` | 可整删，删后须自愈 |
 | `MYAPP_LOG_DIR` | 日志目录 | `…\cache\log\` | **optional**，缺省＝`MYAPP_CACHE_DIR/log`；壳消费（stdio 落盘 §7），applocal 仅解析 |
@@ -232,7 +232,7 @@ L2：接受 hang 不可检测（显式取舍，登记）
 |---|---|
 | Windows | 进程名＝`MyApp.exe`（任务管理器显示应用名） |
 | Android | package name / label |
-| Linux | `myapp`（`exec -a` + 可选 setproctitle 探测，缺失静默跳过） |
+| Linux | `myapp`（`exec -a`；Python 侧标题由 `sys.argv[0]` 同名自然呈现，★2026-10 B.y 废除★ setproctitle 探测已移除——无 armv7 官方 wheel 的第三方依赖不进依赖闭包） |
 
 ---
 ## 11. 线程模型四条（Windows 壳，★v8.1★）

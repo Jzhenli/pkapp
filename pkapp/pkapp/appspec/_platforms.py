@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 # [platforms.*] 段白名单：未知键报错（同 [network] 精神——拼写错误静默丢弃 =
 # 配置悄悄失效，B.w 兜住）。watcher 跨段合法性由 load 编排预检（仅 android）。
-_PLAT_KEYS = {"dependencies", "icon", "setproctitle", "package", "abis",
+_PLAT_KEYS = {"dependencies", "icon", "package", "abis",
               "keystore", "python_version", "runtime_dir",
               "index_url", "extra_index_url", "watcher"}
 
@@ -92,7 +92,6 @@ class AndroidSpec:
 @dataclass(frozen=True)
 class LinuxSpec:
     """[platforms.linux] 段（M3 目标平台，字段随 M3 扩充）。"""
-    setproctitle: bool = True         # B.y：Linux 目标默认装入 setproctitle 探测项
     # ★R-L17 架构维度★（M3 前置，仿 android.abis 口径）：目标架构元组，元素为
     # 目录/tag 段名（x86_64 / aarch64 / armv7l，与 PBS triple 末端及产物名口径
     # {name}-{version}-linux-{arch}.tar.gz 对齐）。M2.5 仅数据层落位——单架构

@@ -210,8 +210,7 @@ def load(path: str) -> AppSpec:
                     "runtime_dir": str(seg.get("runtime_dir", "")),
                     "watcher": android_watcher}
         # ★R-L17★ linux 架构维度（默认 ("x86_64",)；值域/单架构约束走 LinuxSpec.validate）
-        return {"setproctitle": bool(seg.get("setproctitle", True)),
-                "abis": tuple(seg.get("abis", ("x86_64",))),
+        return {"abis": tuple(seg.get("abis", ("x86_64",))),
                 "python_version": str(seg.get("python_version", "")),
                 "runtime_dir": str(seg.get("runtime_dir", ""))}
 

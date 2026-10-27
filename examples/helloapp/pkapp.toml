@@ -57,4 +57,3 @@ revive_burst_window = 1800
 revive_burst_limit = 3
 healthy_reset_window = 120
 # [platforms.linux]                    # M3 预留；dependencies 同样追加
-# setproctitle = true

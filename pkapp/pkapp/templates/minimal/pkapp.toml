@@ -36,5 +36,4 @@ extra_index_url = "https://pypi.flet.dev/"   # flet 索引：android 二进制 w
 # icon = "icons/android/xplay.png"     # 可选:启动器图标（方形 PNG ≥432×432，建议 1024；
                                       #  自动生成全密度 mipmap + 自适应图标，Briefcase 同式）
 # [platforms.linux]                    # M3 预留；dependencies 同样追加
-# setproctitle = true
 # python_version = "3.12.14"           # → pkapp fetch linux（PBS 托管快照同版本锁定）

@@ -821,12 +821,18 @@ def _codekey_mods():
 
 @pytest.fixture()
 def finder_clean():
-    """防泄漏：finder 持有本次 tmp_path，跨用例残留会污染后续 app.* 导入。"""
+    """防泄漏：finder 持有本次 tmp_path，跨用例残留会污染后续 app.* 导入。
+    前后双清——先跑的 suite（applocal/tests bootstrap 用例经 PathFinder 留下的
+    sys.modules["app.*"]）同样会污染本文件 app.* 导入，进入即清（跨目录并跑卫生）。"""
+    def _sweep():
+        ck, _env = _codekey_mods()
+        sys.meta_path[:] = [f for f in sys.meta_path
+                            if not isinstance(f, ck._EncFinder)]
+        for n in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
+            del sys.modules[n]
+    _sweep()
     yield
-    ck, _env = _codekey_mods()
-    sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, ck._EncFinder)]
-    for n in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
-        del sys.modules[n]
+    _sweep()
 
 
 @pytest.fixture()

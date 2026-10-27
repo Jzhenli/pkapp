@@ -451,9 +451,12 @@ def test_on_background_register_and_fire(env):
 
 def test_frozen_api_surface():
     assert set(applocal.__all__) >= {
-        "bootstrap", "paths", "runtime", "native_lib_dir", "set_process_title",
+        "bootstrap", "paths", "runtime", "native_lib_dir",
         "migrate", "diag", "read_diag", "on_background", "build_asgi_app",
         "start_heartbeat", "write_ready"}
+    # B.y 废除（2026-10）：set_process_title 已移除——冻结面负断言防误恢复
+    assert "set_process_title" not in applocal.__all__
+    assert not hasattr(applocal, "set_process_title")
 
 
 # ---------------------------------------------------------------- 复核修复回归
@@ -770,60 +773,3 @@ def test_bootstrap_old_uvicorn_drops_graceful_kwarg(env, monkeypatch):
     monkeypatch.setattr(sys, "path", list(sys.path))
     port = applocal.bootstrap("app.main:app")                          # 不抛 = 降级成功
     assert port > 0 and strict_errors and "timeout_graceful_shutdown" not in captured["kw"]
-
-
-def test_bootstrap_linux_proctitle_takes_appname_env(env, monkeypatch):
-    """★M3 §4.5★进程标识：标题 = 应用名，主通道 = MYAPP_APPNAME（launcher 注入
-    g_appname，与 staging 同名）。 ._pth 隔离态 sys.executable 为空（部署 rename
-    探针实证，"阶段 0 实证"在该形态不成立）→ env 主通道绝不落常量 "myapp"。"""
-    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
-    monkeypatch.setenv("MYAPP_APPNAME", "hiapp")
-    captured = {}
-
-    class _FakeSPT:
-        @staticmethod
-        def setproctitle(name):
-            captured.setdefault("title", name)
-
-    monkeypatch.setitem(sys.modules, "setproctitle", _FakeSPT)
-    monkeypatch.setattr(sys, "executable", "")          # ._pth 隔离态实证形态（空）
-    _prep_entry(env)
-    _fake_uvicorn(monkeypatch, captured)
-    monkeypatch.setattr(sys, "argv", list(sys.argv))
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    applocal.bootstrap("app.main:app")
-    assert captured["title"] == "hiapp"                 # MYAPP_APPNAME 主通道，非常量
-
-
-def test_bootstrap_linux_proctitle_fallback_executable(env, monkeypatch):
-    """dev 契约（无 MYAPP_APPNAME，windows/旧 launcher）→ sys.executable basename
-    兜底（非 ._pth 态）；仍非 myapp 命名成立（§9#6，硬编码回归）。"""
-    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
-    monkeypatch.delenv("MYAPP_APPNAME", raising=False)
-    captured = {}
-
-    class _FakeSPT:
-        @staticmethod
-        def setproctitle(name):
-            captured.setdefault("title", name)
-
-    monkeypatch.setitem(sys.modules, "setproctitle", _FakeSPT)
-    monkeypatch.setattr(sys, "executable", "/opt/hiapp/hiapp")   # 非 myapp 命名
-    _prep_entry(env)
-    _fake_uvicorn(monkeypatch, captured)
-    monkeypatch.setattr(sys, "argv", list(sys.argv))
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    applocal.bootstrap("app.main:app")
-    assert captured["title"] == "hiapp"                 # sys.executable 兜底，非常量
-
-
-def test_bootstrap_linux_proctitle_missing_wheel_silent(env, monkeypatch):
-    """setproctitle 未装入（[platforms.linux].setproctitle=false 不追加依赖，B.y）
-    → ImportError 静默跳过，引导零扰动。"""
-    monkeypatch.setenv("MYAPP_PLATFORM", "linux")
-    monkeypatch.setitem(sys.modules, "setproctitle", None)            # import → ImportError
-    _prep_entry(env)
-    _fake_uvicorn(monkeypatch, {})
-    monkeypatch.setattr(sys, "argv", list(sys.argv))
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    applocal.bootstrap("app.main:app")                                # 不抛 = 静默跳过
