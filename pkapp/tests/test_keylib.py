@@ -734,8 +734,8 @@ def test_produce_keylib_linux_prefab_fallback(tmp_path, monkeypatch):
 
 def test_produce_keylib_linux_cross_arch_guard(tmp_path, monkeypatch):
     """host-arch 守卫：linux host 交叉目标（host ≠ 目标 arch）不得现场编译——
-    native cc 会静默产错 arch 件，必须走 per-arch 预制件回退。（Windows host
-    无 os.uname → 守卫不触发，走编译失败→回退链，另有用例覆盖。）"""
+    native cc 会静默产错 arch 件，必须走 per-arch 预制件回退。（nt host 守卫
+    见 test_produce_keylib_linux_nt_host_guard——真机教训 2026-10-27。）"""
     from pkapp.packager import keybuild, keylib as kl
 
     if not hasattr(os, "uname"):
@@ -757,6 +757,55 @@ def test_produce_keylib_linux_cross_arch_guard(tmp_path, monkeypatch):
     other = "aarch64" if host_arch != "aarch64" else "x86_64"
     assert keybuild.produce_keylib("linux", k_app, out, arch=other) == "fallback"
     assert not calls                                   # 编译器未被触碰
+
+
+def test_produce_keylib_linux_nt_host_guard(tmp_path, monkeypatch):
+    """★nt host 守卫（真机教训 2026-10-27：hello 加密态 armv7l 板上 dlopen
+    失败）★：Windows host 无 os.uname → host=None——原守卫（host is not None
+    and …）失效，落到 _compile_linux 的 which(cc) 命中 MinGW gcc，"编译成功"
+    产出 PE（MZ 头）静默进 spk。守卫补漏后：host 不可知 → 直接 per-arch 预制
+    件回退，编译器一次都不许被触碰；产物必须 ELF。"""
+    from pkapp.packager import keybuild, keylib as kl
+
+    monkeypatch.delattr(os, "uname", raising=False)    # nt 天然无；POSIX 强制同态
+    calls = []
+
+    def _must_not_compile(*_a, **_k):
+        calls.append(1)
+        raise kl.KeyLibError("守卫失守：nt host 竟走了现场编译")
+
+    prefab = tmp_path / "prefab.so"
+    prefab.write_bytes(b"\x7fELF-fake-so|" + kl.ANCHOR + b"|tail")
+    monkeypatch.setattr(keybuild, "compile_keylib", _must_not_compile)
+    monkeypatch.setattr(keybuild, "locate_linux_keylib",
+                        lambda arch: str(prefab))
+    k_app = hashlib.sha256(b"k-app-nt-guard").digest()
+    out = str(tmp_path / "pkapp_key.so")
+    mode = keybuild.produce_keylib("linux", k_app, out, arch="armv7l")
+    assert mode == "fallback"
+    assert not calls                                   # 编译器未被触碰（MinGW 假成功路径封死）
+    assert open(out, "rb").read(4) == b"\x7fELF"       # 产物是 ELF（不是 PE）
+
+
+def test_compile_keylib_linux_rejects_non_elf(tmp_path, monkeypatch):
+    """★产物架构自证（真机教训 2026-10-27）★：linux keylib 编译产物必须 ELF——
+    native cc 产出 PE/COFF（MZ 头）就地 KeyLibError，错架构件绝不进 spk
+    （纵深防线：守卫失守时兜底）。"""
+    from pkapp.packager import keybuild
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "key.c").write_bytes(b"/* stub */")
+
+    def _fake_compile(_src_dir, _work, out_path):
+        with open(out_path, "wb") as f:                # 模拟 MinGW gcc 假成功
+            f.write(b"MZ\x90\x00\x03\x00\x00\x00PE-fake")
+
+    monkeypatch.setattr(keybuild, "keylib_source_dir", lambda: str(src))
+    monkeypatch.setattr(keybuild, "_compile_linux", _fake_compile)
+    out = str(tmp_path / "pkapp_key.so")
+    with pytest.raises(keybuild.KeyLibError, match="非 ELF"):
+        keybuild.compile_keylib("linux", b"\x00" * 32, out)
 
 
 def test_locate_linux_keylib_per_arch(monkeypatch, tmp_path):

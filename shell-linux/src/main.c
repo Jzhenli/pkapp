@@ -962,8 +962,18 @@ static int boot_load_codekey(void *py, const char *code_key_id,
 
     path_join(klpath, sizeof(klpath), g_runtime, "pkapp_key.so");
     kl = dlopen(klpath, RTLD_NOW | RTLD_LOCAL);
-    if (!kl)
-        return boot_keylib_fail(err, cap, "key-holder 件缺失（_runtime/pkapp_key.so）");
+    if (!kl) {
+        /* ★真机教训 2026-10-27★：统一"缺失"文案掩盖 dlerror 真因（板上件为
+         * MinGW 产 PE——dlopen ELFERR 被误报为文件不存在，诊断走弯路）；
+         * dlerror 详情随报错带出 */
+        const char *dl = dlerror();
+        char why[192];
+        snprintf(why, sizeof(why) - 1,
+                 "key-holder 件不可加载（_runtime/pkapp_key.so）: %s",
+                 dl ? dl : "dlopen 失败（无详情）");
+        why[sizeof(why) - 1] = 0;
+        return boot_keylib_fail(err, cap, why);
+    }
     px4 = (fn_pk_x4)dlsym(kl, "pk_x4");
     if (!px4)
         return boot_keylib_fail(err, cap, "key-holder 件导出不完整（pk_x4）");
@@ -1051,8 +1061,11 @@ static int boot_load_codekey(void *py, const char *code_key_id,
         goto out;
     }
 
-    /* 失败语义映射（Windows 同款三分文案） */
-    snprintf(err, cap - 1, "引导模块解密失败（%s）",
+    /* 失败语义映射（Windows 同款三分文案）★rc 数值随文案带出（真机教训
+     * 2026-10-27：板上"密文损坏"无法区分 E_ARGS/E_FORMAT/E_INTERNAL，诊断
+     * 走弯路——三分族共用兜底文案时 rc 数值是唯一分叉证据） */
+    snprintf(err, cap - 1, "引导模块解密失败（rc=%d，%s）",
+             rc,
              rc == -4 ? "密钥不配对" :
              rc == -2 ? "引导模块超限或装载失败" : "密文损坏");
     err[cap - 1] = 0;

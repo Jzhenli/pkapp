@@ -169,6 +169,13 @@ def compile_keylib(platform: str, k_app: bytes, out_path: str, *,
             _compile_android(src_dir, work, os.path.abspath(out_path), abi)
         elif platform == "linux":
             _compile_linux(src_dir, work, os.path.abspath(out_path))
+            # ★产物架构自证（真机教训 2026-10-27）★：nt host 的 MinGW gcc 会
+            # "成功"产出 PE（MZ 头）——就地拒绝，不放过任何错架构件进 spk
+            with open(os.path.abspath(out_path), "rb") as f:
+                if f.read(4) != b"\x7fELF":
+                    raise KeyLibError(
+                        "linux keylib 编译产物非 ELF（native cc 产了 PE/COFF？"
+                        "host 非 linux 时必须走 per-arch 预制件路径）")
         else:
             raise KeyLibError(f"未知平台: {platform}")
     finally:
@@ -233,7 +240,17 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
         if target is None:
             raise KeyLibError(
                 "linux keylib 须显式 arch（host arch 不可知且未传 arch）")
-        if host is not None and target != host:
+        # ★真机教训 2026-10-27（hello 加密态 armv7l 板上 dlopen 失败）★：nt host
+        # 无 os.uname → host=None → 原守卫（host is not None and …）失效 → 落到
+        # _compile_linux 的 which(cc/gcc) 命中 MinGW gcc → "编译成功"产出 PE
+        # （MZ 头，扩展名 .so）静默进 spk——比编译失败更危险的错架构件。nt host
+        # 的 native cc 只可能产 PE/COFF，linux 目标件必须走 per-arch 预制件
+        # （D-3 修订的 Windows host 正途）；host arch 已知但错配同理。
+        if host is None:
+            return _linux_prefab_fallback(
+                target, k_app, out_path,
+                "host 非 linux（nt：native cc 只能产 PE/COFF，linux 件走预制件）")
+        if target != host:
             return _linux_prefab_fallback(
                 target, k_app, out_path,
                 f"host arch {host} ≠ 目标 arch {target}（native cc 产 host 架构件）")
