@@ -350,7 +350,11 @@ def _package_android(project: str, spec, *, shell_dir: str | None,
         keylib_stage = tempfile.mkdtemp(prefix="pkapp-keylib-android-")
         rc_kl = _stage_keylib(keylib_stage, code_key_id, "android",
                               app_id=spec.name,
-                              salt_hex=spk_fields.get("code_salt", ""))
+                              salt_hex=spk_fields.get("code_salt", ""),
+                              # 与 jniLibs 落位/build_apk 同源（abis 解析链
+                              # build-meta.json > TOML，L285-313）——勿用 TOML
+                              # 当前值，改 TOML 后 package 会产出壳/包 ABI 错配
+                              abi=(abis or ("arm64-v8a",))[0])
         if rc_kl != 0:
             shutil.rmtree(keylib_stage, ignore_errors=True)
             return rc_kl

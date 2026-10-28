@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -138,6 +139,35 @@ def _compile_android(src_dir: str, work: str, out_path: str, abi: str) -> None:
           os.path.join(src_dir, "key.c"), "kdata.c", "-o", out_path], cwd=work)
 
 
+# android abi → (EI_CLASS, e_machine)：产物自证基准（1/2=32/64bit；
+# 40=EM_ARM, 183=EM_AARCH64, 3=EM_386, 62=EM_X86_64）
+_ANDROID_ELF_ABI = {"arm64-v8a": (2, 183), "armeabi-v7a": (1, 40),
+                    "x86_64": (2, 62), "x86": (1, 3)}
+
+
+def _assert_android_elf_abi(out_path: str, abi: str) -> None:
+    """产物架构自证（真机教训 2026-10-28，linux 分支 ELF magic 同式）：abi 接线
+    断裂时 NDK 仍会"成功"产出错 ABI 件（arm64 件打进 armeabi-v7a 包，构建机
+    无法 dlopen 验证 → 静默进 APK，目标机 dlopen 即拒）——就地拒绝，不放过任何
+    错架构件进 APK。"""
+    with open(os.path.abspath(out_path), "rb") as f:
+        hdr = f.read(20)
+    if len(hdr) < 20:
+        raise KeyLibError(f"android keylib 编译产物过短非 ELF（{len(hdr)}B）")
+    if hdr[:4] != b"\x7fELF":
+        raise KeyLibError(f"android keylib 编译产物非 ELF（magic={hdr[:4]!r}）")
+    got = (hdr[4], struct.unpack_from("<H", hdr, 18)[0])
+    want = _ANDROID_ELF_ABI.get(abi)
+    if want is None:
+        raise KeyLibError(f"android abi 无自证基准（未知 ABI: {abi}）——"
+                          "编译三连与自证表必须同步扩展")
+    if got != want:
+        raise KeyLibError(
+            f"android keylib 编译产物 ABI 错架：EI_CLASS={got[0]} "
+            f"e_machine={got[1]} ≠ 目标 {abi} 期望 {want}（NDK target 接线断裂？"
+            "错 ABI 件打进 APK 目标机 dlopen 即拒）")
+
+
 def _compile_linux(src_dir: str, work: str, out_path: str) -> None:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not cc:
@@ -167,6 +197,9 @@ def compile_keylib(platform: str, k_app: bytes, out_path: str, *,
             _compile_windows(src_dir, work, os.path.abspath(out_path))
         elif platform == "android":
             _compile_android(src_dir, work, os.path.abspath(out_path), abi)
+            # ★产物架构自证（真机教训 2026-10-28）★：错 ABI 件就地拒绝进 APK——
+            # abi 接线断裂时 NDK 仍"编译成功"，构建机无法 dlopen 验证，只有这里拦
+            _assert_android_elf_abi(out_path, abi)
         elif platform == "linux":
             _compile_linux(src_dir, work, os.path.abspath(out_path))
             # ★产物架构自证（真机教训 2026-10-27）★：nt host 的 MinGW gcc 会
@@ -280,7 +313,8 @@ def produce_keylib(platform: str, k_app: bytes, out_path: str, *,
 
 
 def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
-                  app_id: str, salt_hex: str = "", arch: str | None = None) -> int:
+                  app_id: str, salt_hex: str = "", arch: str | None = None,
+                  abi: str = "arm64-v8a") -> int:
     """key-holder 件落位 staging + K 派生 + key_id 配对闸门（§6.2 + ★档位1 §3★）。
 
     ★档位1★ K 派生化：code.key 退役——现场 resolve_master_key(create=False，
@@ -333,7 +367,7 @@ def _stage_keylib(stage: str, code_key_id: str, platform: str = "windows", *,
                       "key_id 闸门仅验证 master↔manifest 配对")
             got = KeyLib(out_dll).key_id() if platform == "windows" else expect
         else:
-            mode = produce_keylib(platform, k_app, out_dll, arch=arch)
+            mode = produce_keylib(platform, k_app, out_dll, abi=abi, arch=arch)
             if mode == "fallback":
                 print(f"[package] 警告：keylib 现场编译不可得，退化为预制件锚点补丁"
                       "（件内保留锚点标记，保护面降级——PROTECTION_ROADMAP §3.3）")

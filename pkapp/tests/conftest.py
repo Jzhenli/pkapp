@@ -77,14 +77,22 @@ def android_keylib_so(monkeypatch):
     路径（★H4 2026-10★ 单槽 so 会把错 ABI 件打进 APK，已移除）——fixture 令
     compiled 路径不依赖 NDK 在位。假件落 tmp，仓库树零写入。
     不走 PKAPP_KEYLIB env——那会被 _stage_keylib 判为模式 B 改变被测行为。
-    假产物形态 = 256 零字节 + K_app + 256 零字节（用例可对 staging 落位件做
-    内容断言）。"""
+    假产物形态 = 合法 ELF 头（按收到的 abi 生成，过 _assert_android_elf_abi
+    自证——2026-10-28 接线后 compile_keylib android 分支产完即自证）+ 236 零
+    字节 + K_app + 256 零字节（用例可对 staging 落位件做内容断言）。"""
+    import struct as _struct
     from pkapp.packager import keybuild
+
+    def _elf_hdr(abi):
+        cls, mach = keybuild._ANDROID_ELF_ABI.get(abi, (2, 183))
+        # 4 magic + 3 [class,data,version] + 9 pad = 16，e_type@16 e_machine@18
+        return (b"\x7fELF" + bytes([cls, 1, 1]) + b"\x00" * 9 +
+                _struct.pack("<HH", 3, mach))
 
     def _fake_compile(platform, k_app, out_path, *, abi="arm64-v8a"):
         assert platform == "android"
         with open(out_path, "wb") as f:
-            f.write(b"\x00" * 256 + k_app + b"\x00" * 256)   # K 编译期烧入模拟
+            f.write(_elf_hdr(abi) + b"\x00" * 236 + k_app + b"\x00" * 256)
 
     monkeypatch.setattr(keybuild, "compile_keylib", _fake_compile)
 

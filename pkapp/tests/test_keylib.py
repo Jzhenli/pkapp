@@ -15,6 +15,7 @@ import json
 import marshal
 import os
 import shutil
+import struct
 import sys
 import types
 
@@ -646,7 +647,9 @@ def test_stage_keylib_android_compiles_and_gates(tmp_path, monkeypatch,
     assert os.path.isfile(out)
     with open(out, "rb") as f:
         data = f.read()
-    assert data == b"\x00" * 256 + k_app + b"\x00" * 256   # 编译产物原样落位（无补丁环节）
+    assert data[:4] == b"\x7fELF"                        # 假件带合法 ELF 头（过自证）
+    assert struct.unpack_from("<H", data, 18)[0] == 183  # arm64-v8a 默认 abi 的 e_machine
+    assert data[20:] == b"\x00" * 236 + k_app + b"\x00" * 256   # 编译产物原样落位（无补丁环节）
     assert keylib.ANCHOR not in data                     # compiled 件无锚点常量
     assert k_app in data                                 # K 编译期烧入（fixture 模拟）
 
@@ -686,6 +689,93 @@ def test_stage_keylib_android_compile_fail_fails_hard(tmp_path, monkeypatch):
     assert _stage_keylib(stage, kl.key_id_hex(k_app), "android",
                          app_id="myapp") == 2
     assert not os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))
+
+
+def _elf_bytes(cls: int, mach: int, n: int = 64) -> bytes:
+    """构造 n 字节假 ELF（前 20 字节头：e_type=3 ET_DYN + e_machine）；
+    n < 20 时真实截断头（测短读负断言）。"""
+    hdr = (b"\x7fELF" + bytes([cls, 1, 1]) + b"\x00" * 9 +
+           struct.pack("<HH", 3, mach))
+    if n <= len(hdr):
+        return hdr[:n]
+    return hdr + b"\x00" * (n - len(hdr))
+
+
+def test_assert_android_elf_abi_matrix(tmp_path):
+    """★自证矩阵（2026-10-28 ABI 错架真机教训）★：4 ABI 正向放行 / 错架拒 /
+    非 ELF 拒 / 截断拒 / 未知 abi 拒——错误一律 KeyLibError（android 无 fallback，
+    produce_keylib 捕获后转译 re-raise，裸异常不得逃逸）。"""
+    from pkapp.packager.keybuild import _assert_android_elf_abi
+
+    def write(b: bytes) -> str:
+        p = tmp_path / "k.so"
+        p.write_bytes(b)
+        return str(p)
+
+    ok = [(2, 183, "arm64-v8a"), (1, 40, "armeabi-v7a"),
+          (2, 62, "x86_64"), (1, 3, "x86")]
+    for cls, mach, abi in ok:
+        _assert_android_elf_abi(write(_elf_bytes(cls, mach)), abi)   # 不抛即过
+    bad = [(2, 183, "armeabi-v7a"), (1, 40, "arm64-v8a"),      # 互相错架
+           (1, 1, "armeabi-v7a"), (2, 62, "arm64-v8a")]
+    for cls, mach, abi in bad:
+        with pytest.raises(KeyLibError):
+            _assert_android_elf_abi(write(_elf_bytes(cls, mach)), abi)
+    with pytest.raises(KeyLibError):                       # 非 ELF（PE MZ 头）
+        _assert_android_elf_abi(write(b"MZ" + b"\x00" * 62), "arm64-v8a")
+    with pytest.raises(KeyLibError):                       # 截断（<20B）
+        _assert_android_elf_abi(write(_elf_bytes(2, 183, 10)), "arm64-v8a")
+    with pytest.raises(KeyLibError):                       # 未知 abi 无基准
+        _assert_android_elf_abi(write(_elf_bytes(2, 183)), "riscv64")
+
+
+def test_stage_keylib_android_abi_passthrough(tmp_path, monkeypatch):
+    """abi 参数全链透传断言：_stage_keylib(abi=...) 必达 compile_keylib——
+    接线断裂（本次事故根因）即刻红。"""
+    from pkapp.packager import keybuild
+    from pkapp.packager.keybuild import _stage_keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(keylib.resolve_master_key(create=False)[0], _APP)
+    seen = {}
+
+    def _spy_compile(platform, kk, out_path, *, abi="arm64-v8a"):
+        seen["abi"] = abi
+        with open(out_path, "wb") as f:
+            f.write(_elf_bytes(*{"arm64-v8a": (2, 183), "armeabi-v7a": (1, 40)}
+                                .get(abi, (2, 183))))
+
+    monkeypatch.setattr(keybuild, "compile_keylib", _spy_compile)
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), "android",
+                         app_id=_APP, abi="armeabi-v7a") == 0
+    assert seen["abi"] == "armeabi-v7a"
+
+
+def test_stage_keylib_android_wrong_abi_rejected(tmp_path, monkeypatch):
+    """错 ABI 件全链拒收：NDK 层产 arm64 头件 + abi=armeabi-v7a → rc=2
+    （mock _compile_android 而非 compile_keylib——自证在 compile_keylib 内部，
+    mock 掉 compile_keylib 会连同自证一起 mock 掉，测不到接线）；
+    本测试若接线被回滚立即红，防 Edit 竞态假绿。"""
+    from pkapp.packager import keybuild
+    from pkapp.packager.keybuild import _stage_keylib
+
+    monkeypatch.delenv("PKAPP_KEYLIB", raising=False)
+    _set_master(monkeypatch)
+    k_app = keylib.derive_k_app(keylib.resolve_master_key(create=False)[0], _APP)
+
+    def _arm64_ndk(src_dir, work, out_path, abi):
+        with open(out_path, "wb") as f:
+            f.write(_elf_bytes(2, 183))     # 无视 abi，永远产 64 位件
+
+    monkeypatch.setattr(keybuild, "_compile_android", _arm64_ndk)
+    stage = str(tmp_path / "stage")
+    os.makedirs(stage)
+    assert _stage_keylib(stage, keylib.key_id_hex(k_app), "android",
+                         app_id=_APP, abi="armeabi-v7a") == 2
+    assert os.path.isfile(os.path.join(stage, "lib_pkapp_key.so"))   # 件保留供排查
 
 
 def test_stage_keylib_linux_compile_fail_fails_hard(tmp_path, monkeypatch):
