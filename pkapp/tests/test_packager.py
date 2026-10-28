@@ -79,36 +79,43 @@ def test_managed_wheels_cache(project, wheels_dir, tmp_path, mock_runtime):
 
 def test_conservative_trim_anchor(project, wheels_dir, tmp_path, mock_runtime):
     """保守档精简回归锚（flet python-build 对齐）：工具链自举（ensurepip）/
-    开发玩具（idlelib/turtledemo/彩蛋）/测试扩展（_test*.pyd）不进 spk。
-    mock 快照注入可裁件后构建，断言零残留——防止未来重构静默丢失 ignore
-    清单；同时断言正常 stdlib（os/json）与扩展（_ssl.pyd）保留（防误裁）。"""
+    开发玩具（idlelib/turtledemo/彩蛋）/GUI 栈与自举死重（tkinter/turtle/venv）/
+    测试扩展（_test*.pyd）与 tcl/tk 运行期族（_tkinter.pyd/tcl*/tk* DLL）不进 spk。
+    注入件与禁入断言按 _TRIM_IGNORE_LIB 自动派生（单一事实源，新增条目自动被
+    锚覆盖）；tcl9/tk9 探针件钉住 DLL 前缀裁剪口径（防未来 Tk 改名漏接）；
+    同时断言正常 stdlib（os/json）与扩展（_ssl.pyd）保留（防误裁）。"""
     lib = os.path.join(mock_runtime, "Lib")
-    for sub in ("ensurepip", "idlelib", "pydoc_data", "lib2to3",
-                "turtledemo", "__phello__"):
-        os.makedirs(os.path.join(lib, sub), exist_ok=True)
-        with open(os.path.join(lib, sub, "__init__.py"), "w") as f:
-            f.write("x = 1\n")
-    for fn in ("this.py", "rlcompleter.py", "tabnanny.py",
-               "antigravity.py", "__hello__.py"):
-        with open(os.path.join(lib, fn), "w") as f:
-            f.write("x = 1\n")
-    for fn in ("_testcapi.pyd", "_ctypes_test.pyd"):
+    for pat in assemble._TRIM_IGNORE_LIB:
+        if pat.endswith(".py"):                    # 单文件模块（turtle.py 等）
+            with open(os.path.join(lib, pat), "w") as f:
+                f.write("x = 1\n")
+        else:                                      # 目录（tkinter/venv/ensurepip 等）
+            os.makedirs(os.path.join(lib, pat), exist_ok=True)
+            with open(os.path.join(lib, pat, "__init__.py"), "w") as f:
+                f.write("x = 1\n")
+    banned_dirs = {p for p in assemble._TRIM_IGNORE_LIB if not p.endswith(".py")}
+    banned_stems = {p[:-3] for p in assemble._TRIM_IGNORE_LIB if p.endswith(".py")}
+    dll_probe = ("_testcapi.pyd", "_ctypes_test.pyd", "_tkinter.pyd",
+                 "tcl86t.dll", "tk86t.dll", "tcl9.dll", "tk9.dll", "zlib1.dll")
+    for fn in dll_probe:
         with open(os.path.join(mock_runtime, "DLLs", fn), "wb") as f:
             f.write(b"fake-pe")            # 裁除发生在 copytree，闭包扫描不触及
 
     out = str(tmp_path / "trim.spk")
     _build(project, wheels_dir, out)
 
-    banned_dirs = {"ensurepip", "idlelib", "pydoc_data", "lib2to3",
-                   "turtledemo", "__phello__"}
-    banned_stems = {"this", "rlcompleter", "tabnanny",
-                    "antigravity", "__hello__"}
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
-        # DLLs：测试扩展裁除（限定 DLLs/ 域——"_test" 子串断言扫全 spk 会误伤
-        # 未来 fixture 里 app/ 或 site-packages 的同名件）、正常扩展保留
+        # DLLs：测试扩展 + tcl/tk 运行期族裁除（前缀断言与构建 ignore 的
+        # tcl*/tk*/_tkinter* 口径对称——tcl9/tk9 探针件验证之；限定 DLLs/ 域
+        # 防误伤未来 fixture 里 app/ 或 site-packages 的同名件）、正常扩展保留
         assert not [n for n in names
                     if n.startswith("DLLs/") and "_test" in os.path.basename(n)]
+        assert not [n for n in names
+                    if n.startswith("DLLs/")
+                    and (os.path.basename(n).startswith(("tcl", "tk"))
+                         or os.path.basename(n).startswith("_tkinter")
+                         or os.path.basename(n) == "zlib1.dll")]
         assert any(n.endswith("DLLs/_ssl.pyd") for n in names)
         # stdlib zip：可裁件零残留（pyc/.py 双形态都拦）
         import io

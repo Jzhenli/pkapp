@@ -32,10 +32,17 @@ from .runtime import RuntimeResolveError
 # 保守档精简（flet python-build 同款共识死重，258d7f5 实测 Windows -3.2MB /
 # Linux -2.7MB）：工具链自举/开发工具/彩蛋——正常业务代码物理上不 import。
 # ★两平台同源★（windows Lib 拷贝 + linux stdlib 拷贝共用，防清单漂移）；
-# 回归锚 test_packager.test_conservative_trim_anchor 双向防丢。
+# tkinter/turtle/venv 同源裁除（官方 embedded 同款口径）：pkapp UI 形态定位
+# WebView（ui/ 契约目录），桌面 GUI 不在支持面——tkinter 虽可被业务合法
+# import，但连带 tcl/tk 全家 ~4.5MB 死重（windows: _tkinter.pyd + tcl86t/tk86t
+# DLL + Lib/tkinter + turtle.py + venv），需要 GUI 的项目应走 ui/ 前端路线。
+# ★单一事实源契约★：条目必须为字面量文件/目录名（不支持通配）——回归锚
+# test_conservative_trim_anchor 按本清单自动生成注入件与禁入断言，新增条目
+# 自动被锚覆盖，无需改测试。
 _TRIM_IGNORE_LIB = ("ensurepip", "idlelib", "pydoc_data", "lib2to3",
                     "turtledemo", "rlcompleter.py", "tabnanny.py",
-                    "antigravity.py", "this.py", "__hello__.py", "__phello__")
+                    "antigravity.py", "this.py", "__hello__.py", "__phello__",
+                    "tkinter", "turtle.py", "venv")
 
 
 def _entry_protected_pairs(entry: str) -> frozenset:
@@ -98,11 +105,16 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
                          "".join(c for c in snapshot.python_dll if c.isdigit()))
         # 3) DLLs/（.pyd + 传递原生依赖整体拷入；闭包自检见 step 7 之后——app/ 落盘
         #    后统一扫描，扫描域含 app/（Q5），行为不变仅时序后移）。
-        #    保守档精简：CPython 测试专用扩展（仅被已裁的 Lib/test 引用）
+        #    保守档精简：CPython 测试专用扩展（仅被已裁的 Lib/test 引用）；
+        #    tcl/tk 运行期件（_tkinter.pyd + tcl86t/tk86t，与 _TRIM_IGNORE_LIB
+        #    的 tkinter/turtle 同源联动——pkapp UI 形态 = WebView，桌面 GUI 不在支持面）
         shutil.copytree(os.path.join(snapshot.dir, "DLLs"),
                         os.path.join(stage, "DLLs"),
                         ignore=shutil.ignore_patterns(
-                            "_test*.pyd", "_ctypes_test*.pyd"))
+                            "_test*.pyd", "_ctypes_test*.pyd", "_tkinter*",
+                            "tcl*.dll", "tk*.dll",
+                            "zlib1.dll"))  # 唯一 import 方 = tcl86t（已裁），孤悬件；
+                                           # tcl*/tk* 按前缀裁防未来 Tk 改名漏接
         # 4) _pth 由 5b 收拢函数生成（★P0 §4.1★：path 收窄 + 无 import site，随
         #    散件目录清单动态派生——先于收拢写死会与收拢结果脱钩）
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）
@@ -332,9 +344,10 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
       per-arch 预制件锚点补丁（_vendor/keylib/linux/<arch>，CI launcher job
       同容器编译收录）> fail-fast 指路（2026-10 D-3 边界修订：nt host 加密态
       亦可用包内置预制件出包）。
-    - tcl/tk 运行期库不进 spk（冒烟定案口径，smoke spk 无 tcl/tk）——_tkinter.so +
-      tkinter/ + turtle.py 同步裁除（防"打包成功、运行期 dlopen libtcl 失败"炸弹）；
-      tk 支持随 spec 开关另议（须连带 6.99MB tcl/tk 全家 + TCL_LIBRARY 路径）。
+    - tcl/tk 运行期库不进 spk（冒烟定案口径，smoke spk 无 tcl/tk）——tkinter/ +
+      turtle.py 走 _TRIM_IGNORE_LIB 两平台同源裁除，lib-dynload/_tkinter*.so 仍由
+      步骤 3 显式排除（防"打包成功、运行期 dlopen libtcl 失败"炸弹）；
+      tk 支持随 spec 开关另议（须连带 tcl/tk 全家 + TCL_LIBRARY 路径）。
     - linux 闭包自检（ELF DT_NEEDED 扫描）随后续接线——本阶段动态扩展集 =
       _crypt/_dbm（libc 族依赖），冒烟定案已实证加载链。
     """
@@ -368,8 +381,8 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
         shutil.copyfile(os.path.join(snapshot.dir, "lib", snapshot.python_dll),
                         os.path.join(stage, snapshot.python_dll))
         # 2) 标准库 zip（<arch>/lib/python<maj_min>/ → <stdlib_stem>.zip；保守档清单与
-        #    windows 同源（_TRIM_IGNORE_LIB）；linux 特有排除：lib-dynload/config-*/
-        #    tkinter/turtle——见本函数 docstring）
+        #    windows 同源（_TRIM_IGNORE_LIB，tkinter/turtle 已在内）；linux 特有排除：
+        #    lib-dynload/config-*——见本函数 docstring）
         shutil.copytree(os.path.join(snapshot.dir, "lib", f"python{maj_min}"),
                         lib_work,
                         ignore=shutil.ignore_patterns(
@@ -378,7 +391,6 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
                             # linux 布局特有：
                             "lib-dynload",            # 动态扩展单独拷（步骤 3）
                             "config-*",               # 构建配置/静态库，运行期无用
-                            "tkinter", "turtle.py",   # tcl/tk 运行期库不进 spk（见 docstring）
                         ),
                         dirs_exist_ok=True)  # mkdtemp 已建空目录
         _compile_checked_hash(lib_work, pyc_exe, pyc_dll, unchecked=True)
