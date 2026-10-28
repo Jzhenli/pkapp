@@ -2,6 +2,7 @@
 import hashlib
 import io
 import os
+import re
 import types
 import zipfile
 
@@ -367,13 +368,23 @@ def test_namespace_pkg_goes_loose(project, wheels_dir, tmp_path):
 
 
 # ---------------------------------------------------------------- 代码加密构建链（CODE_PROTECTION_DESIGN §6）
-def _enable_code_encryption(project):
+def _set_app_flag(project, key):
+    """把 [app] 段的 <key> 置 true：模板已含该键则就地改值（防同名键重复导致
+    TOML 解析炸），未含则插入 [app] 表头之后（per_build_salt 类纯 opt-in 键）。"""
     toml = os.path.join(project, "pkapp.toml")
     with open(toml, encoding="utf-8") as f:
         text = f.read()
-    assert "[app]" in text
+    if re.search(rf"(?m)^{key}\s*=", text):
+        text = re.sub(rf"(?m)^{key}\s*=.*$", f"{key} = true", text, count=1)
+    else:
+        assert "[app]" in text
+        text = text.replace("[app]\n", f"[app]\n{key} = true\n", 1)
     with open(toml, "w", encoding="utf-8") as f:
-        f.write(text.replace("[app]\n", "[app]\ncode_encryption = true\n", 1))
+        f.write(text)
+
+
+def _enable_code_encryption(project):
+    _set_app_flag(project, "code_encryption")
 
 
 def _set_master(monkeypatch) -> bytes:
@@ -385,12 +396,7 @@ def _set_master(monkeypatch) -> bytes:
 
 
 def _enable_per_build_salt(project):
-    toml = os.path.join(project, "pkapp.toml")
-    with open(toml, encoding="utf-8") as f:
-        text = f.read()
-    assert "[app]" in text
-    with open(toml, "w", encoding="utf-8") as f:
-        f.write(text.replace("[app]\n", "[app]\nper_build_salt = true\n", 1))
+    _set_app_flag(project, "per_build_salt")
 
 
 def test_build_per_build_salt(tmp_path, project, wheels_dir, monkeypatch):
@@ -488,12 +494,7 @@ def test_android_build_code_encrypted(project, mock_android_runtime, wheels_dir,
 
 # ---------------------------------------------------------------- 构建期混淆层（§13 S3/S4）
 def _enable_code_obfuscation(project):
-    toml = os.path.join(project, "pkapp.toml")
-    with open(toml, encoding="utf-8") as f:
-        text = f.read()
-    assert "[app]" in text
-    with open(toml, "w", encoding="utf-8") as f:
-        f.write(text.replace("[app]\n", "[app]\ncode_obfuscation = true\n", 1))
+    _set_app_flag(project, "code_obfuscation")
 
 
 def _collect_local_names(code):
