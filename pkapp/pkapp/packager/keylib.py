@@ -26,7 +26,7 @@ import hashlib
 import hmac
 import os
 import secrets
-from ctypes import POINTER, c_char_p, c_char, c_size_t, c_int, c_ubyte
+from ctypes import POINTER, c_char_p, c_char, c_uint64, c_int, c_ubyte
 
 # ---- 与 keylib/src/key.h 镜像的补丁契约常量（勿改动；漂移 = 闸门拦截）----
 ANCHOR_HEX = "c47f1a93e5b28d603ad9f641075ce82b961d74af30cb58e26f039ad148b725ec"
@@ -353,11 +353,14 @@ class KeyLib:
             raise KeyLibError(f"key-holder 件加载失败 {path}: {e}") from e
         lib = self._lib
         # 导出名无意义化（2026-10）：x1=encrypt / x2=decrypt / x3=key_id
-        lib.pk_x1.argtypes = [c_char_p, c_char_p, c_char_p, c_size_t,
-                              c_char_p, c_size_t, POINTER(c_size_t)]
+        # ★arm32 教训 2026-10-28★：长度参数一律 c_uint64 对齐 key.h 的
+        # unsigned long long（禁 c_size_t——arm32 上 32/64bit 错位，
+        # 见 applocal/_codekey.py 同款注释）；x64 同宽故 Windows 打包从未暴露。
+        lib.pk_x1.argtypes = [c_char_p, c_char_p, c_char_p, c_uint64,
+                              c_char_p, c_uint64, POINTER(c_uint64)]
         lib.pk_x1.restype = c_int
-        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_size_t,
-                              c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_uint64,
+                              c_char_p, c_uint64, POINTER(c_uint64)]
         lib.pk_x2.restype = c_int
         lib.pk_x3.argtypes = []
         lib.pk_x3.restype = c_char_p
@@ -374,7 +377,7 @@ class KeyLib:
         if len(key) != 32:
             raise KeyLibError("K 须为 32 字节")
         out = ctypes.create_string_buffer(len(payload) + BLOB_OVERHEAD)
-        n = c_size_t(0)
+        n = c_uint64(0)
         rc = self._lib.pk_x1(key, mid, payload, len(payload),
                              out, len(payload) + BLOB_OVERHEAD,
                              ctypes.byref(n))
@@ -387,7 +390,7 @@ class KeyLib:
         if len(blob) < BLOB_OVERHEAD:
             raise KeyLibError(f"blob 过短（{len(blob)}B）: {module_id}")
         out = ctypes.create_string_buffer(len(blob) - BLOB_OVERHEAD)
-        n = c_size_t(0)
+        n = c_uint64(0)
         rc = self._lib.pk_x2(mid, blob, len(blob),
                              out, len(blob) - BLOB_OVERHEAD, ctypes.byref(n))
         if rc != 0:

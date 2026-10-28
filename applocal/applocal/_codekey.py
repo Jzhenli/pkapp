@@ -33,7 +33,7 @@ import sys
 import traceback
 
 from ._core import diag
-from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_size_t, create_string_buffer
+from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_uint64, create_string_buffer
 import hashlib
 
 NEUTRAL = "应用组件缺失或不完整，请重新安装或更新应用"   # §7.3 Q3：错误页唯一文案（勿改）
@@ -79,8 +79,13 @@ class _KeyLib:
     def __init__(self, path: str):
         self._lib = CDLL(path)     # 缺失 / 非 PE / 依赖缺失 → OSError → keylib_load
         lib = self._lib
-        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_size_t,
-                              c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.pk_x2.argtypes = [c_char_p, c_char_p, c_uint64,
+                              c_char_p, c_uint64, POINTER(c_uint64)]
+        # ★真机教训 2026-10-28（armv7l 加密态 "pk_x2 失败(blob 格式非法)"）★：
+        # 长度参数必须 c_uint64 对齐 key.h 的 unsigned long long，禁用 c_size_t
+        # ——arm32 上 size_t=32bit，ctypes 传 32bit 值占 1 寄存器而 C 侧按 EABI
+        # 64bit 寄存器对读 → 6 参数全体错位 → in_len 读成巨值 → PKK1 格式检查
+        # 假失败。x86_64 两类型同宽，Windows/WSL 实测全绿掩盖此错位。
         lib.pk_x2.restype = c_int
         lib.pk_x3.argtypes = []
         lib.pk_x3.restype = c_char_p
@@ -89,7 +94,7 @@ class _KeyLib:
         if len(blob) < BLOB_OVERHEAD:
             raise ValueError(f"blob 过短（{len(blob)}B）")
         out = create_string_buffer(len(blob) - BLOB_OVERHEAD)
-        n = c_size_t(0)
+        n = c_uint64(0)
         rc = self._lib.pk_x2(module_id.encode("utf-8"), blob, len(blob),
                              out, len(blob) - BLOB_OVERHEAD, byref(n))
         if rc != 0:
