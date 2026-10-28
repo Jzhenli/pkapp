@@ -1,15 +1,17 @@
 # pkapp — 跨平台 Python 应用打包 CLI
 
-把一个纯 Python（ASGI）应用打包成**自包含、免安装、双击即用**的桌面/移动交付物：
-Windows → zip，Android → apk（Linux → tar.gz 规划中）。运行时内嵌 CPython，
-前端跑在系统 WebView 里，不依赖用户机器装任何 Python 环境。
+把一个纯 Python（ASGI）应用打包成**自包含、免安装、开箱即用**的交付物：
+Windows → zip，Linux → tar.gz（x86_64 / aarch64 / armv7l 三架构），
+Android → apk（arm64-v8a / armeabi-v7a 双 ABI）。运行时内嵌 CPython，
+前端跑在系统 WebView 里，不依赖目标机器装任何 Python 环境；
+Windows 宿主可直接构建三平台全部产物。
 
 ## 工作原理
 
 ```
 pkapp create ──► 应用项目（pkapp.toml + app/main.py + dist/ 前端）
 pkapp build  ──► runtime.spk（Ed25519 签名的 zip 容器：Python 运行时 + applocal + 应用）
-pkapp package ─► 交付容器落 <项目>/release/（zip / apk）
+pkapp package ─► 交付容器落 <项目>/release/（zip / tar.gz / apk）
 ```
 
 - **壳（shell）** = dumb loader：只负责"让一个可信的 Python 在正确的位置醒来"——
@@ -27,6 +29,7 @@ pkapp package ─► 交付容器落 <项目>/release/（zip / apk）
 | `pkapp/` | CLI（create / dev / build / check / doctor / package）+ 打包引擎 + 测试 |
 | `applocal/` | 运行时库（随 spk 分发，不发布 PyPI） |
 | `shell-windows/` | Windows C++ 壳（WebView2 + JNI 式九步引导，纯 C17/C++17，/MT 静态 CRT） |
+| `shell-linux/` | Linux C 壳（launcher：验签解压 + dlopen 引导 CPython + systemd 通知，x86_64/aarch64/armv7l 三架构） |
 | `shell-android/` | Android Kotlin 壳（JNI 引导 CPython + 前台服务 + 握手镜像） |
 | `docs/` | SHELL_PROTOCOL / PACKAGER_SPEC / 打包方案 v8 |
 
@@ -46,20 +49,44 @@ pkapp dev          :: 起开发服务，浏览器直连
 pkapp fetch windows
 pkapp build windows
 pkapp package windows   :: 产物：release\myapp-0.1.0-windows-x86_64.zip，双击即用
+
+:: Linux 三架构（tar.gz；systemd 零前置部署，Windows 宿主直接出包）
+pkapp fetch linux
+pkapp build linux --arch armv7l
+pkapp package linux --arch armv7l
+                        :: 产物：release\myapp-0.1.0-linux-armv7l.tar.gz
+                        :: --arch 亦可选 x86_64 / aarch64
+
+:: Android 双 ABI（apk；需 JDK17 + Gradle 8.9 + SDK 35 + NDK 27 工具链）
+pkapp fetch android
+pkapp build android --arch arm64-v8a
+pkapp package android --arch arm64-v8a
+                        :: 产物：release\myapp-0.1.0-android-arm64_v8a.apk
+                        :: --arch 亦可选 armeabi-v7a（NDK 命名）
 ```
 
-**构建前提**：项目 `pkapp.toml` 的 `[platforms.windows].python_version` 声明运行时意图
-（create 模板已内置），`pkapp fetch windows` 把 PBS CPython 快照下载进托管缓存
-（PKAPP_CACHE / %LOCALAPPDATA%/pkapp；build 不隐式联网）。applocal 不在 PyPI——
-wheel 安装形态由内置离线 wheel 命中；源码形态先 `pip install -e applocal && pip install -e pkapp`。
-Android 打包另需 `pkapp fetch android`（JDK17 + Gradle 8.9 + SDK 35 + NDK 27 + py-android 运行时），
-或设 `PKAPP_ANDROID_TOOLCHAIN` 指向手工布置的整体根，
+**架构一览**（`--arch` 仅本次生效，不写回 TOML；持久声明写在对应平台段 `abis`）：
+
+| 平台 | `--arch` 合法值（缺省取 TOML `abis[0]`） | 产物 | 备注 |
+|---|---|---|---|
+| windows | —（x86_64 单架构） | `*-windows-x86_64.zip` | WebView2 运行时系统自带 |
+| linux | `x86_64` / `aarch64` / `armv7l` | `*-linux-<arch>.tar.gz` | manylinux2014 基线（glibc ≥ 2.17），tar 六件套结构冻结 + systemd 零前置部署 |
+| android | `arm64-v8a` / `armeabi-v7a` | `*-android-<abi>.apk` | ABI 写入 `lib/<abi>/`，pydantic_core 等按 abi 供包走 flet 索引 |
+
+**构建前提**：项目 `pkapp.toml` 的 `[platforms.<平台>].python_version` 声明运行时意图
+（create 模板已内置），`pkapp fetch windows|linux|android` 把对应运行时快照下载进
+托管缓存（PKAPP_CACHE / %LOCALAPPDATA%/pkapp；build 不隐式联网）。applocal 不在
+PyPI——wheel 安装形态由内置离线 wheel 命中；源码形态先 `pip install -e applocal && pip install -e pkapp`。
+Linux 打包零额外工具链：wheel 内置三架构 launcher 与 keylib 预编译件
+（manylinux2014 编译基线，glibc ≥ 2.17——低于此基线的板卡需源码态出包）。
+Android 打包另需 `pkapp fetch android`（JDK17 + Gradle 8.9 + SDK 35 + NDK 27 +
+py-android 运行时），或设 `PKAPP_ANDROID_TOOLCHAIN` 指向手工布置的整体根，
 布局约定见 [shell-android/README.md](shell-android/README.md)。
 
 **发布制品**（[.github/workflows/release.yml](.github/workflows/release.yml)）：tag 推送
-自动构建 pkapp wheel（内置 Windows 壳 + applocal wheel）发 GitHub Release；
-本机自建同一条路：`shell-windows\build.bat` → `python pkapp/scripts/vendor.py` →
-`python -m build --wheel pkapp`。
+自动构建 pkapp wheel（内置 Windows 壳 + Linux 三架构 launcher/keylib 预编译件 +
+applocal wheel）发 GitHub Release；本机自建同一条路：`shell-windows\build.bat` →
+`python pkapp/scripts/vendor.py` → `python -m build --wheel pkapp`。
 
 **GitHub 直连不稳时**用 `PKAPP_MIRROR_*` 前缀替换镜像（值为「镜像地址 + 原始前缀」
 拼接段，注意 gh-proxy 类要带完整 `https://github.com` 尾巴）：
@@ -98,8 +125,10 @@ CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）跑前两层；壳�
 ## 平台状态
 
 - **Windows** ★v8.4b★：全链路走通（spk → 预编译壳 + 配对自检闸门 → zip）。
-- **Android** ★v8.4★：全链路走通（Magic6 Pro / MagicOS 真机验证，九步锚点全绿）。
-- **Linux**：规划中（M3，tar.gz 形态）。
+- **Linux** ★v0.1.10★：全链路走通（x86_64 / aarch64 / armv7l 三架构 launcher CI 编译收录
+  + keylib 预编译件；加密态 T113 armv7l 真机闭环，systemd 零前置部署 + 指纹自愈升级）。
+- **Android** ★v0.1.10★：全链路走通（arm64-v8a / armeabi-v7a 双 ABI；加密态真机闭环，
+  keylib 产物 ABI 自证）。
 
 当前为早期开发阶段，接口与格式可能变动（文档内 ★vX.Y★ 为变更标记）。
 

@@ -6,6 +6,8 @@ entry = "app.main:app"
 min_app_version = "0.1.0"      # V9 防回滚地板：低于此版本的签名包将被壳拒绝
 min_pkapp_version = "0.1.0"
 coexist = false                # 升级共存开关（默认关闭）
+code_encryption = false        # 代码加密（默认关闭）
+code_obfuscation = false       # 代码混淆（默认关闭）
 
 [dependencies]
 python = [
