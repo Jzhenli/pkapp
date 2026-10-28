@@ -913,7 +913,12 @@ typedef void *(*fn_PyModule_GetDict)(void *);
 typedef void *(*fn_PyObject_GetAttrString)(void *, const char *);
 typedef void *(*fn_PyObject_CallObject)(void *, void *);
 typedef void *(*fn_PyTuple_Pack)(Py_ssize_t, ...);
-typedef void *(*fn_PyBytes_FromStringAndSize)(const char *, long long);
+/* ★真机教训 2026-10-28（armv7l 加密态 "rc=0，密文损坏"）★：第二参数必须
+ * Py_ssize_t——arm32 上 Py_ssize_t=32bit 而 long long=64bit，64bit 参数按
+ * EABI 占 r2:r3 寄存器对（跳过 r1），CPython 从 r1 读 len → 寄存器残渣
+ * （负数）→ PyBytes_FromStringAndSize 返回 NULL → px4 成功（rc=0）却落
+ * 解密失败分支。x86_64 两类型同宽，Windows/WSL 实测全绿掩盖此错位。 */
+typedef void *(*fn_PyBytes_FromStringAndSize)(const char *, Py_ssize_t);
 typedef void *(*fn_PyEval_EvalCode)(void *, void *, void *);
 typedef int (*fn_PyObject_SetAttrString)(void *, const char *, void *);
 typedef void (*fn_Py_DecRef)(void *);
@@ -1010,7 +1015,7 @@ static int boot_load_codekey(void *py, const char *code_key_id,
     if (rc == -2 && need > 0 && need <= PKKEY_BOOT_MAX) {
         rc = px4(g_runtime, buf, need, &need);
         if (rc == 0) {
-            bobj = pBytes((const char *)buf, (long long)need);
+            bobj = pBytes((const char *)buf, (Py_ssize_t)need);
             secure_zero(buf, need);   /* bytes 已持拷贝，明文即焚 */
         }
     }
