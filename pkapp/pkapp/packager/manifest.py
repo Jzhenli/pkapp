@@ -18,7 +18,9 @@ REQUIRED_NONEMPTY = KEYS + ("signature",)  # G2：全键非空
 # 按未知键忽略——明文包/老壳零回归。canonical_bytes 原样保留 → Ed25519 签名覆盖。
 # code_salt（★档位1 §3.2 R-2★）：仅 per_build_salt 档写入（64 hex），壳忽略未知键，
 # package 期 _stage_keylib 读它重派生 K_app。
-EXT_KEYS = ("code_key_id", "code_salt")
+# drop_spk（安装包语义）：[app].drop_spk = true 写入 "1"，applocal ready 后删安装
+# 目录 .spk；壳 C 解析器按未知键忽略。
+EXT_KEYS = ("code_key_id", "code_salt", "drop_spk")
 
 
 def render(fields: dict, signature: str | None = None) -> str:

@@ -96,7 +96,7 @@ def test_ext_keys_consumed_by_packager():
     consumed: set[str] = set()
     for py in (_REPO / "pkapp" / "pkapp" / "packager").glob("*.py"):
         consumed |= {s for s in _str_literals(str(py))
-                     if re.fullmatch(r"code_[a-z_]+", s)}
+                     if re.fullmatch(r"code_[a-z_]+", s) or s in manifest.EXT_KEYS}
     missing = [k for k in manifest.EXT_KEYS if k not in consumed]
     assert not missing, f"EXT_KEYS 中无 packager 消费方字面量的键: {missing}"
 

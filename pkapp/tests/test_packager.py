@@ -416,6 +416,16 @@ def test_build_per_build_salt(tmp_path, project, wheels_dir, monkeypatch):
     bytes.fromhex(f1["code_salt"])                             # 64 hex 可读回（package 期契约）
 
 
+def test_build_drop_spk(tmp_path, project, wheels_dir):
+    """drop_spk 端到端（appspec → emit → manifest）：缺省构建无此键（保留 spk 供
+    损坏自愈）；[app].drop_spk = true 投影 drop_spk = "1"（可选扩展键，签名面覆盖）。"""
+    f0 = _build(project, wheels_dir, str(tmp_path / "keep.spk"))
+    assert "drop_spk" not in f0                                # 缺省 = 保留 spk
+    _set_app_flag(project, "drop_spk")
+    f1 = _build(project, wheels_dir, str(tmp_path / "drop.spk"))
+    assert f1["drop_spk"] == "1"                               # 安装包语义开启
+
+
 def test_build_code_encrypted(project, wheels_dir, tmp_path, monkeypatch):   # §6.1 + G5 加密态
     from pkapp.packager import keylib
 

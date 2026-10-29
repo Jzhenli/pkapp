@@ -626,6 +626,68 @@ def test_first_beat_race_ramp(env, monkeypatch):
     # 不断言精确探测次数：全量跑时其它用例遗留的 daemon 心跳线程会共用本用例的假 opener
 
 
+# ---------------------------------------------------------------- drop_spk 契约
+def _spk_name() -> str:
+    """部署合同：spk 与 launcher 同名派生；嵌入式 Python 的 sys.executable 即
+    launcher exe——测试进程下即 pytest 解释器名（python.spk）。"""
+    return os.path.splitext(os.path.basename(sys.executable))[0] + ".spk"
+
+
+def test_drop_spk_removes_only_namesake_spk(env):
+    (env / "runtime" / "manifest").write_text(
+        "app_version = 1.4.2\ndrop_spk = 1\n", encoding="utf-8")
+    (env / _spk_name()).write_bytes(b"PK")
+    (env / "demo-backup.spk").write_bytes(b"PK")                   # 修复包/备份副本
+    (env / "integrity.manifest").write_bytes(b"x")
+    _core._drop_spk(load_env(refresh=True))
+    assert not (env / _spk_name()).exists()                        # 同名 spk 被删
+    assert (env / "demo-backup.spk").exists()                      # 非同名件不误删（回归钉）
+    assert (env / "integrity.manifest").exists()                   # 邻接文件不伤
+
+
+def test_drop_spk_disabled_keeps_spk(env):
+    (env / _spk_name()).write_bytes(b"PK")
+    _core._drop_spk(load_env(refresh=True))                           # manifest 无键 = 缺省关
+    assert (env / _spk_name()).exists()                               # 保留 spk（损坏自愈来源）
+
+
+def test_drop_spk_env_override(env, monkeypatch):
+    monkeypatch.setenv("MYAPP_DROP_SPK", "1")
+    (env / _spk_name()).write_bytes(b"PK")
+    _core._drop_spk(load_env(refresh=True))
+    assert not (env / _spk_name()).exists()                           # MYAPP_* 运维覆盖层照常生效
+
+
+def test_drop_spk_skips_dev(env, monkeypatch):
+    monkeypatch.setenv("MYAPP_DEV", "1")
+    (env / "runtime" / "manifest").write_text("drop_spk = 1\n", encoding="utf-8")
+    (env / _spk_name()).write_bytes(b"PK")
+    _core._drop_spk(load_env(refresh=True))
+    assert (env / _spk_name()).exists()                               # dev 不删（保护开发目录）
+
+
+def test_drop_spk_skips_android(env, monkeypatch):
+    monkeypatch.setenv("MYAPP_PLATFORM", "android")
+    (env / "runtime" / "manifest").write_text("drop_spk = 1\n", encoding="utf-8")
+    (env / _spk_name()).write_bytes(b"PK")
+    _core._drop_spk(load_env(refresh=True))
+    assert (env / _spk_name()).exists()                               # android assets 只读，无安装目录语义
+
+
+def test_drop_spk_wired_to_first_ready(env, monkeypatch):
+    """接线钉住：_drop_spk 必须挂在 _beat 首跳成功分支（定义在、调用无 = 此红）。
+    manifest drop_spk=1 → 首拍 /healthz 成功点亮 ready → 安装目录同名 .spk 被删。"""
+    (env / "runtime" / "manifest").write_text(
+        "app_version = 1.4.2\ndrop_spk = 1\n", encoding="utf-8")
+    (env / _spk_name()).write_bytes(b"PK")
+    monkeypatch.setattr(_core, "_OPENER", _FakeOpener())
+    applocal.start_heartbeat(12345, load_env(refresh=True), interval=0.02, timeout=0.2)
+    deadline = time.time() + 3
+    while (env / _spk_name()).exists() and time.time() < deadline:
+        time.sleep(0.02)
+    assert not (env / _spk_name()).exists()                           # 首跳健康 → 删除生效
+
+
 def _fake_uvicorn(monkeypatch, captured):
     """注入假 uvicorn 模块，捕获 Server.run 收到的 sockets/Config。
 

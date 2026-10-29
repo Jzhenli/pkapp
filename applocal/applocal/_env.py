@@ -65,6 +65,7 @@ class Runtime:
     strict_auth: bool = False                      # MYAPP_STRICT_AUTH ∈ {"1","true"}（大小写不敏感；契约主取值为 1）
     port_pref: int = 0                             # 端口偏好；实际端口以 ready 文件为准
     dev: bool = False                              # MYAPP_DEV：dev 权限覆盖报告（§9.3）等 dev 专属行为开关
+    drop_spk: bool = False                         # manifest drop_spk=1：ready 后删安装目录 .spk（MYAPP_DROP_SPK 可覆盖）
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,7 @@ def load_env(refresh: bool = False) -> Cfg:
         strict_auth=_opt("MYAPP_STRICT_AUTH").lower() in ("1", "true"),
         port_pref=port_pref,
         dev=_opt("MYAPP_DEV").lower() in ("1", "true"),
+        drop_spk=_pick("MYAPP_DROP_SPK", "drop_spk", manifest).lower() in ("1", "true"),
     )
     _cfg = Cfg(paths=paths, runtime=runtime, token=_opt("MYAPP_TOKEN"),
                network=_network(runtime.manifest))

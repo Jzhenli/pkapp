@@ -106,6 +106,31 @@ def _clear_startup_diag(cfg: Cfg) -> None:
         pass
 
 
+def _drop_spk(cfg: Cfg) -> None:
+    """首跳健康后删除安装目录 .spk（manifest drop_spk=1；安装包语义：展开 + 指纹
+    记账完成后安装包使命结束——记账先于 Python bootstrap，此刻删除不存在
+    "spk 已删而记账未写"的中间态；bootstrap 失败不会走到这里，自愈来源仍完整）。
+
+    目标精确锁定 launcher 同名件（部署合同：spk 与 launcher 同名派生；嵌入式
+    Python 的 sys.executable 即 launcher exe）——按后缀 glob 会误删用户按
+    fail-closed 提示放回的修复包/备份副本。android（spk 在 APK assets 内只读，
+    无"安装目录"概念）与 dev 跳过；stem 推导失败（sys.executable 异常为空）时
+    宁可不删也不猜。
+    best-effort 静默：瞬时握柄（AV/索引器）等失败下次启动 ready 后自然重试
+    （文件已删 = 幂等无操作），持久失败只影响磁盘占用不影响运行。
+    """
+    if not cfg.runtime.drop_spk or cfg.runtime.platform == "android" or cfg.runtime.dev:
+        return
+    stem = os.path.splitext(os.path.basename(sys.executable))[0]
+    if not stem:
+        return
+    try:
+        os.remove(os.path.join(os.path.dirname(os.path.dirname(cfg.paths.manifest_path)),
+                               f"{stem}.spk"))
+    except OSError:
+        pass
+
+
 def _clear_healthz_diag(cfg: Cfg) -> None:
     """抖动恢复后清掉心跳自己写的失败记录（§9：diag 只留"当前失败原因"）。
 
@@ -345,6 +370,7 @@ def start_heartbeat(port: int, cfg: Cfg | None = None, interval: float = 5.0,
             fails = 0
             if state["seq"] == 0:
                 _clear_startup_diag(cfg)   # 首跳成功 ⇒ 已健康，清掉 bootstrap 起始记录
+                _drop_spk(cfg)             # 首跳健康 ⇒ 安装包使命完成（manifest drop_spk=1 时删）
             state["seq"] += 1
             try:
                 write_ready(ready, port, state["seq"])

@@ -8,6 +8,7 @@ min_pkapp_version = "0.1.0"
 coexist = false                # 升级共存开关（默认关闭）
 code_encryption = false        # 代码加密（默认关闭）
 code_obfuscation = false       # 代码混淆（默认关闭）
+drop_spk = false               # 首次健康启动后删除安装目录 .spk（安装包语义，默认保留以便损坏自愈；android 不适用——spk 在 APK 内只读）
 
 [dependencies]
 python = [

@@ -38,6 +38,8 @@ def _manifest_fields(spec: AppSpec, platform: str, python_dll: str,
         fields["code_key_id"] = code_key_id    # 可选扩展键（§7.3；明文构建无此键）
     if code_salt:
         fields["code_salt"] = code_salt        # per_build_salt 档（壳忽略未知键）
+    if spec.drop_spk:
+        fields["drop_spk"] = "1"               # 安装包语义：applocal ready 后删安装目录 .spk
     fields.update(spec.network.manifest_keys())   # [network] 透传（§5；未配置 = 零键）
     fields.update(spec.android.watcher_manifest_keys())   # §8 watcher 透传（未配置 = 零键，壳默认值兜底）
     return fields
