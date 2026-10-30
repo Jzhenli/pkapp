@@ -1,18 +1,20 @@
-/* shell.cpp — pkapp Windows 壳（协议 A v1.2 §3 九步职责）。
+/* shell.cpp — pkapp Windows 壳（协议 A v1.4 §3 九步职责 + §3.1 壳形态三模式）。
  *
  * 职责边界：壳 = dumb loader（"让一个可信的 Python 在正确的位置醒来"）。
  *   0  单实例互斥（覆盖验签→LoadLibrary 全程）
+ *   0.5 壳形态读取（v1.4 §3.1：exe 旁 <stem>.ini [shell] mode=ui|console|headless，
+ *      枚举钳制回落 ui；读取先于 stdio 重定向与九步引导——模式决定 stdio 归宿）
  *   1  验签（format_version → Ed25519 → 版本单调性 → spk_hash）
  *   2  指纹比对 / 全量解压（staging → 原子 rename）
  *   3  预清理旧 ready 与旧握手码
  *   4  设置环境变量（含新 token）
- *   5  stdio 重定向（双保险，覆盖 Initialize 前窗口期）
+ *   5  stdio 重定向（ui/headless 双保险；console 直通终端，§7 三策略）
  *   6  LoadLibraryEx(manifest.python_dll, LOAD_WITH_ALTERED_SEARCH_PATH)
  *   7  记账 runtime.version（LoadLibrary 成功后——指纹规则③′）
  *   8  import applocal; bootstrap(entry) → PyEval_SaveThread（V1 致命条款）
- *   8.5 等待 ready（seq 主判据 + 冷启动 120s 档）→ 握手码导航
- *   9  心跳消费（30s seq 无增长 / ready 消失 / ready{false} → 判死 → diag 错误页）
- * 线程模型四注记见 README.md；退出一律 ExitProcess（不做 Py_Finalize）。
+ *   8.5 等待 ready（seq 主判据 + 冷启动 120s 档）→ ui 握手码导航 / 无窗 URL 外化（§8）
+ *   9  心跳消费（30s seq 无增长 / ready 消失 / ready{false} → 判死 → diag → 错误页/退出）
+ * 线程模型五注记见 README.md（v1.4 增⑤ Ctrl handler 线程）；退出一律 ExitProcess（不做 Py_Finalize）。
  */
 #ifndef UNICODE
 #define UNICODE
@@ -80,21 +82,34 @@ static std::wstring g_title;
 static HWND g_hwnd;
 static HWND g_splash;      /* 启动加载层（自绘 pkSplash 子窗口，覆盖客户区） */
 static volatile LONG g_boot_quit; /* 启动期泵到 WM_QUIT（用户关窗）→ 中止启动、错误 UI 免弹 */
-static volatile LONG g_exiting;   /* graceful 防重入（WM_CLOSE/WM_ENDSESSION/按钮并发） */
+static volatile LONG g_exiting;   /* graceful 防重入（WM_CLOSE/WM_ENDSESSION/按钮/Ctrl handler 并发） */
+
+/* ---------- 壳形态三模式（协议 v1.4 §3.1） ----------
+ * ui       ：可见主窗 + WebView2 + 错误页，stdio 重定向日志（现状，逐位不变）
+ * console  ：无窗 + stdio 直通终端 + 横幅/URL 外化；AttachConsole 失败（双击）→ headless 语义
+ * headless ：无窗 + stdio 落日志；供 NSSM/systemd 类看门狗托管
+ * 无窗两形态同构：message-only window 承载 WM_TIMER 轮询（独立轮询线程禁令不变，§5），
+ * 不建 WebView2；错误面 = slog + 退出码（§9），服务形态禁弹窗。 */
+enum ShellMode { SM_UI = 0, SM_CONSOLE = 1, SM_HEADLESS = 2 };
+static ShellMode g_mode = SM_UI;
+static BOOL g_stdio_is_console; /* console 直通已就绪（终端/句柄二选一，§7a/§7b）；FALSE=stdio 落日志 */
 
 typedef void (*fn_Py_Initialize)(void);
 typedef int (*fn_Py_IsInitialized)(void);
 typedef int (*fn_PyRun_SimpleString)(const char *);
 typedef void *(*fn_PyEval_SaveThread)(void);
-/* ★Windows 优雅停服★（与 Linux main.c g_stop 同案对仗）：GUI 壳收不到 CTRL_CLOSE_EVENT
-   （那是控制台事件），真实"信号" = WM_CLOSE（点 X，无时限）+ WM_ENDSESSION（注销/关机，
-   ~5s 宽限）。退出点统一 graceful_and_exit：PyGILState 拿 GIL → applocal.shutdown()
+/* ★Windows 优雅停服★（与 Linux main.c g_stop 同案对仗）：ui 形态收不到 CTRL_CLOSE_EVENT
+   （那是控制台事件；console/headless 的对应通道 = Ctrl handler，§11⑤），真实"信号" =
+   WM_CLOSE（点 X，无时限）+ WM_ENDSESSION（注销/关机，~5s 宽限）。退出点统一
+   graceful_and_exit：PyGILState 拿 GIL → applocal.shutdown()
    （uvicorn should_exit + 排空 ≤5s）→ 清 ready → ExitProcess(code)。主线程同步模型
    （UI 单线程置位与执行同线程，无跨线程可见性问题）；启动期（g_pRun 未存）降级原
    DefWindowProc→WM_QUIT→g_boot_quit 路径。致命错误页强杀路径保留 = Linux _exit() 对仗。 */
 typedef int (*fn_PyGILState_Ensure)(void);      /* 返回 PyGILState_STATE，按 int 传递 */
 typedef void (*fn_PyGILState_Release)(int);
-static fn_PyRun_SimpleString g_pRun_g;          /* boot_python 成功后全局保存（局部出栈失效） */
+static fn_PyRun_SimpleString volatile g_pRun_g; /* boot_python 成功后全局保存（局部出栈失效）。
+   volatile：Ctrl handler（他线程，§11⑤）以「见非 NULL ⇒ GIL 已放」为跨线程依据，
+   写点在 PyEval_SaveThread 之后、读点在 handler 内——volatile 序足够，无需原子/临界区 */
 static fn_PyGILState_Ensure g_pEnsure;
 static fn_PyGILState_Release g_pRelease;
 static ICoreWebView2Environment *g_env2;
@@ -307,6 +322,116 @@ static void slog(const char *s) {
     printf("[+%5llu ms] [shell] %s\n",
            (unsigned long long)(GetTickCount64() - g_t0), s);
     fflush(stdout);
+}
+
+/* ================= 壳形态三模式（协议 v1.4 §3.1） =================
+ * 读取时机：setup_paths 之后（exe 身份已知）、stdio 重定向与九步引导之前。
+ * 钳制：大小写不敏感精确匹配三枚举；缺文件/缺键/空值/非法值一律回落 ui。 */
+
+static const char *shell_mode_name(void) {
+    switch (g_mode) {
+        case SM_CONSOLE:  return "console";
+        case SM_HEADLESS: return "headless";
+        default:          return "ui";
+    }
+}
+
+static void read_shell_mode_ini(void) {
+    wchar_t ini[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, ini, MAX_PATH)) return; /* 回落 ui（g_mode 初值） */
+    std::wstring inip(ini);
+    size_t slash = inip.find_last_of(L'\\');
+    size_t dot = inip.find_last_of(L'.');
+    /* <stem>.ini：stem = 最后一个分隔符后、最后一个 '.' 前（'.' 必须在文件名段内） */
+    if (dot == std::wstring::npos || dot == 0 ||
+        (slash != std::wstring::npos && dot < slash))
+        inip += L".ini";
+    else
+        inip = inip.substr(0, dot) + L".ini";
+    if (!file_exists(inip)) return; /* 无 ini = ui：双击形态零变化 */
+
+    wchar_t val[32] = L"";
+    GetPrivateProfileStringW(L"shell", L"mode", L"", val, 32, inip.c_str());
+    /* 变换为小写再精确比对（不做模糊前缀匹配——非法值必须落 ui 并留痕） */
+    std::wstring v(val);
+    std::transform(v.begin(), v.end(), v.begin(), ::towlower);
+    if (v == L"ui") {
+        g_mode = SM_UI;
+    } else if (v == L"console") {
+        g_mode = SM_CONSOLE;
+    } else if (v == L"headless") {
+        g_mode = SM_HEADLESS;
+    } else {
+        g_mode = SM_UI; /* 钳制回落（§3.1）；留痕由 run_shell 步骤 5 后的模式行统一落日志
+                           （此时 stdio 尚未就位，slog 会先于重定向丢失并污染 g_t0 基线） */
+    }
+}
+
+/* §7 console 形态三策略（调用时机＝九步步骤 5，与 ui 的 stdio_redirect_to_log 互斥）：
+ *   a) 父进程已传有效 std 句柄（测试管道 / `> file`）→ fd 层重绑（_dup2）保
+ *      FILE* 与 fd 双通道直写；仍 AttachConsole(父) 仅为收 Ctrl 事件（不动 stdio 归宿）。
+ *   b) 无句柄且 AttachConsole 成功 → CRT 重绑 CONOUT$ + CP_UTF8
+ *      （GUI 子系统 CRT stdio 与控制台无连接，重绑理由同双保险）。
+ *   c) 两者皆无（双击启动）→ 显式回落 headless 语义：stdio 落日志。
+ * 返回 TRUE = stdio 直通（a/b），FALSE = 已回落日志形态（c）。 */
+static BOOL console_mode_setup(void) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    BOOL has_out = hOut && hOut != INVALID_HANDLE_VALUE;
+    BOOL has_err = hErr && hErr != INVALID_HANDLE_VALUE;
+
+    if (!has_out && !has_err) {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+            /* §7c：无父控制台（双击启动）→ 显式回落 headless（模式留痕由
+             * run_shell 的模式行统一落日志；此处 stdio 未就位，slog 无处可落） */
+            g_mode = SM_HEADLESS;
+            stdio_redirect_to_log();
+            return FALSE;
+        }
+        /* §7b：CRT stdio 与父控制台无连接，重绑 CONOUT$ + UTF-8 码页 */
+        FILE *f1 = _wfreopen(L"CONOUT$", L"wt", stdout);
+        FILE *f2 = _wfreopen(L"CONOUT$", L"wt", stderr);
+        if (!f1 || !f2) { /* 重绑失败罕见；落日志兜底 */
+            stdio_redirect_to_log();
+            return FALSE;
+        }
+        SetConsoleOutputCP(CP_UTF8);
+    } else {
+        /* §7a：fd 层重绑（_dup2）——GUI 子系统 CRT 的 FILE*↔fd 绑定不可靠
+         * （stdio_redirect_to_log 同款教训），OS 句柄已到手，重绑保证双通道 */
+        if (has_out) {
+            int fd = _open_osfhandle((intptr_t)hOut, _O_WRONLY | _O_TEXT);
+            if (fd >= 0) { _dup2(fd, 1); _close(fd); }
+        }
+        if (has_err) {
+            int fd = _open_osfhandle((intptr_t)hErr, _O_WRONLY | _O_TEXT);
+            if (fd >= 0) { _dup2(fd, 2); _close(fd); }
+        }
+        AttachConsole(ATTACH_PARENT_PROCESS); /* 失败可容忍：Ctrl 事件不可得而已 */
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    g_stdio_is_console = TRUE;
+    /* Ctrl+C 投递前提（§11⑤ 实测三件套）：CONIN$ 句柄 + ENABLE_PROCESSED_INPUT +
+     * handler 注册晚于 attach（run_shell 已保证）。
+     * GUI 进程无原生 stdin——CTRL_CLOSE 能达而 CTRL_C 被过滤的根因：
+     * 没有 CONIN$ 句柄时 SetConsoleMode 无从落地，conhost 便不给本进程投递
+     * 处理型 Ctrl 事件（CLOSE 是强制事件，不经输入处理）。显式开 CONIN$。 */
+    {
+        HANDLE hIn = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, 0, NULL);
+        if (hIn != INVALID_HANDLE_VALUE) {
+            DWORD inmode = 0;
+            if (GetConsoleMode(hIn, &inmode))
+                SetConsoleMode(hIn, inmode | ENABLE_PROCESSED_INPUT);
+            SetStdHandle(STD_INPUT_HANDLE, hIn);
+        }
+    }
+    /* CI 锚点（§7）：console 直通形态的 probe 落终端/句柄，不落日志 */
+    printf("PRE-INIT-PROBE\n");
+    fflush(stdout);
+    return TRUE;
 }
 
 /* ================= 目录契约与 B.t③ 防御 ================= */
@@ -635,6 +760,8 @@ typedef HRESULT(WINAPI *PFN_CreateEnv)(PCWSTR, PCWSTR,
 
 /* 前置声明（WebView2 回调内使用错误页与代理清理） */
 static void show_error_ui(const char *summary_utf8, int recoverable);
+/* 前置声明（Ctrl handler / WM_CLOSE / WM_ENDSESSION 共用统一退出点；定义在窗口层之后） */
+static __declspec(noreturn) void graceful_and_exit(int exit_code);
 
 /* 浏览器进程退出后代理已死：必须整体置空。任何残留的非空指针被再次触
  * 虚调用（如 WM_SIZE → put_Bounds）都是 0xC0000005（实测崩溃 @wnd_proc）。 */
@@ -1178,7 +1305,79 @@ static void run_message_loop(void) {
     }
 }
 
+/* ================= 无窗形态基础设施（v1.4 §3.1/§5：console/headless） =================
+ * message-only window（HWND_MESSAGE）仅为 WM_TIMER 提供泵居所——协议禁独立轮询
+ * 线程，on_tick 状态机原样复用。独立类名 <class>-msg：第二实例 FindWindow(可见窗
+ * 类) 永不命中 message-only 窗（§3.1 无窗激活空操作）。 */
+
+static HWND g_msgwnd;
+static std::wstring g_msgclass; /* WNDCLASS.lpszClassName 不拷贝字符串——必须常驻存储 */
+
+static void on_tick(void); /* 前置声明（msg_wnd_proc 复用 ui 心跳状态机，定义见下） */
+
+static LRESULT CALLBACK msg_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_TIMER:
+        if (wp == IDT_TICK) on_tick();
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static int ensure_message_window(HINSTANCE hInst, char *err, size_t cap) {
+    WNDCLASSEXW mc;
+    ZeroMemory(&mc, sizeof(mc));
+    mc.cbSize = sizeof(mc);
+    mc.lpfnWndProc = msg_wnd_proc;
+    mc.hInstance = hInst;
+    g_msgclass = g_class + L"-msg";
+    mc.lpszClassName = g_msgclass.c_str();
+    if (!RegisterClassExW(&mc)) {
+        _snprintf(err, cap - 1, "message-only 窗口类注册失败 (GetLastError=%lu)",
+                  GetLastError());
+        err[cap - 1] = 0;
+        return FALSE;
+    }
+    g_msgwnd = CreateWindowExW(0, g_msgclass.c_str(), L"", 0, 0, 0, 0, 0,
+                               HWND_MESSAGE, NULL, hInst, NULL);
+    if (!g_msgwnd) {
+        _snprintf(err, cap - 1, "message-only 窗口创建失败 (GetLastError=%lu)",
+                  GetLastError());
+        err[cap - 1] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* 模式适配层：ui → 可见主窗；console/headless → message-only window。
+ * 失败返回 FALSE 并填 err（无窗形态同样 fail-closed：无法轮询 = 无法判活）。 */
+static int shell_ensure_window(HINSTANCE hInst, char *err, size_t cap) {
+    if (g_mode == SM_UI) {
+        ensure_window();
+        return TRUE;
+    }
+    return ensure_message_window(hInst, err, cap);
+}
+
+/* §9 无窗错误面：绝不渲染 UI、绝不阻塞等待——diag 已由调用方写入，
+ * slog 摘要（console→终端 / headless→日志）后立即退出。 */
+static void shell_show_error(const char *summary_utf8, int exit_code) {
+    char line[768];
+    _snprintf(line, sizeof(line) - 1, "fatal: %s (exit %d)", summary_utf8,
+              exit_code);
+    line[sizeof(line) - 1] = 0;
+    slog(line);
+    ExitProcess(exit_code);
+}
+
 static void show_error_ui(const char *summary_utf8, int recoverable) {
+    if (g_mode != SM_UI) { /* §9 无窗错误面：运行期死亡 = exit 3（ui"重启"按钮码对仗） */
+        shell_show_error(summary_utf8, 3);
+        return;
+    }
     RECT zero = {0, 0, 0, 0};
     if (g_splash) { /* 错误页接管：撤掉加载层 */
         DestroyWindow(g_splash);
@@ -1216,6 +1415,10 @@ static void show_error_ui(const char *summary_utf8, int recoverable) {
 
 /* 启动早期失败路径：窗口可能尚未创建（§9 绝不黑屏——原生错误页兜底） */
 static void show_error_ui_at_startup(const char *summary, int recoverable) {
+    if (g_mode != SM_UI) { /* §9：启动期失败 = exit 2（无窗形态绝不阻塞等待用户） */
+        shell_show_error(summary, 2);
+        return;
+    }
     if (g_boot_quit) return; /* 用户启动期主动关窗：不弹错误 UI，随返回码退出 */
     show_error_ui(summary, recoverable);
     run_message_loop(); /* 阻塞至用户关闭/重启 */
@@ -1227,6 +1430,11 @@ static void on_tick(void) {
     ReadyInfo ri;
     DWORD now = GetTickCount();
 
+    /* ★竞态守卫（§11⑤）★：Ctrl 线程 graceful 删 ready → ExitProcess 之间有
+     * ≤500ms 窗口，本函数若在此读到 ready 消失会误入判死 → exit 3 覆盖退出码 0。
+     * 优雅退出进行中一律停摆（g_exiting 写点在 graceful 防重入 CAS，volatile 读） */
+    if (g_exiting) return;
+
     if (g_phase == PH_COLD) {
         ready_read(&ri);
         if (ri.exists && ri.ready && ri.port > 0) {
@@ -1234,7 +1442,16 @@ static void on_tick(void) {
             g_last_seq = ri.seq;
             g_last_seq_change = now;
             g_phase = PH_RUNTIME;
-            if (g_web2) navigate_to_app();
+            if (g_web2) {
+                navigate_to_app();
+            } else if (g_mode != SM_UI) {
+                /* §8 URL 外化：printf 即归宿（console→终端 / headless→日志），禁附 token */
+                char url[96];
+                _snprintf(url, sizeof(url) - 1, "ready: http://127.0.0.1:%d/\n", g_port);
+                url[sizeof(url) - 1] = 0;
+                fputs(url, stdout);
+                fflush(stdout);
+            }
             {
                 char line[96];
                 _snprintf(line, sizeof(line) - 1, "ready seen port=%d seq=%ld",
@@ -1588,8 +1805,11 @@ static int boot_python(const char *python_dll_utf8, const char *entry_utf8,
 
 /* 统一退出点：防重入 → 藏窗（用户视角窗口即关）→ PyGILState 拿 GIL →
    applocal.shutdown()（uvicorn should_exit + join 排空线程，≤5s）→ 清 ready/握手码
-   → ExitProcess。主线程同步模型：所有调用方都在 UI 线程（WM_CLOSE/WM_ENDSESSION/
-   按钮/主循环收尾），无跨线程可见性问题。
+   → ExitProcess。调用方两类：主线程（WM_CLOSE/WM_ENDSESSION/按钮/主循环收尾）
+   与 Ctrl 线程（§11⑤ handler）。
+   Ctrl 线程调用安全性：ShowWindow 仅在 g_hwnd 非空时调——无窗形态 g_hwnd 恒 NULL
+   天然短路，ui 形态 Ctrl 事件不可达（GUI 进程无控制台），两路都碰不到跨线程窗口
+   API；其余路径（slog printf / PyGILState / DeleteFile / ExitProcess）均线程合法。
    启动期（boot_python 未走完）g_pRun_g 为空 → 直接硬退：此时无服务可停，且原
    DefWindowProc→WM_QUIT→g_boot_quit 路径本就是裸退（语义不变）。
    致命错误页路径不走这里（ExitProcess 直杀 = Linux _exit() 对仗）。 */
@@ -1622,6 +1842,25 @@ static __declspec(noreturn) void graceful_and_exit(int code) {
     ExitProcess(code);
 }
 
+/* ★v1.4 §11⑤ Ctrl handler（三模式恒注册）★：ui 分支直接 return FALSE——GUI 进程
+ * 没有控制台，事件不可达，行为与未注册等价。console/headless 的 handler 跑在控制台
+ * 子系统代建的 OS 线程（非 UI 线程）：禁触窗口 API/WebView2/COM（无 STA 泵），
+ * 只走 graceful_and_exit（PyGILState_Ensure 任意线程可重取 GIL）。
+ * 竞态守卫 = g_exiting（graceful 内 InterlockedCompareExchange 防重入）+ g_pRun_g
+ * volatile 写序（见全局注记）。退出码 0 = 受控停止（喂 NSSM 认成功停服）。 */
+static BOOL WINAPI shell_ctrl_handler(DWORD ctrl_type) {
+    { /* 事件类型留痕（区分「事件没产生」vs「handler 没跑」；console 模式落日志） */
+        char b[64];
+        sprintf(b, "ctrl handler entered type=%lu", (unsigned long)ctrl_type);
+        slog(b);
+    }
+    if (g_pRun_g && g_pEnsure && g_pRelease)
+        graceful_and_exit(0); /* noreturn：内部 ExitProcess */
+    /* 引导期（boot_python 未走完）无服务可停 → 硬退（与启动期 WM_CLOSE 裸退同语义）。
+       两分支皆 noreturn，函数无返回路径（handler 永不归还，系统不强求返回值） */
+    ExitProcess(0);
+}
+
 /* ================= 单实例互斥（步骤 0，方案 §5.5） ================= */
 
 static BOOL acquire_single_instance(char *err, size_t cap) {
@@ -1635,9 +1874,12 @@ static BOOL acquire_single_instance(char *err, size_t cap) {
             SetForegroundWindow(prev);
         } else {
             /* 已有实例但窗口尚未创建（首启验签/解压中）：必须给出可见反馈，
-             * 否则连点看起来像"没反应" */
-            std::wstring msg = g_appname + L" 已在启动中，请稍候几秒。";
-            MessageBoxW(NULL, msg.c_str(), g_appname.c_str(), MB_OK | MB_ICONINFORMATION);
+             * 否则连点看起来像"没反应"。服务形态（console/headless）禁弹窗（§3.1） */
+            if (g_mode == SM_UI) {
+                std::wstring msg = g_appname + L" 已在启动中，请稍候几秒。";
+                MessageBoxW(NULL, msg.c_str(), g_appname.c_str(),
+                            MB_OK | MB_ICONINFORMATION);
+            }
         }
         _snprintf(err, cap - 1, "已有实例在运行");
         err[cap - 1] = 0;
@@ -2324,12 +2566,32 @@ static int run_shell(void) {
         return 2;
     }
 
-    /* 步骤 0：单实例互斥（覆盖验签→LoadLibrary 全程） */
+    /* 步骤 0.5：壳形态读取（v1.4 §3.1）——身份派生后、stdio 与引导之前 */
+    read_shell_mode_ini();
+
+    /* 步骤 0：单实例互斥（覆盖验签→LoadLibrary 全程；模式已定 → 无窗第二实例不弹窗） */
     if (!acquire_single_instance(err, sizeof(err))) return 0;
 
-    /* stdio 双保险提前到验签/解压之前：引导期任何卡点都必须可见于日志 */
-    stdio_redirect_to_log();
-    slog("single-instance ok, stdio->log");
+    /* 步骤 5（stdio 归宿，§7）：ui/headless → 日志重定向；console → 直通终端三策略 */
+    if (g_mode == SM_CONSOLE) {
+        console_mode_setup(); /* 失败已在函数内回落 headless + 落日志（§7c） */
+        printf("banner: %s (%s mode)\n", wide_to_utf8(g_appname).c_str(),
+               shell_mode_name());
+        fflush(stdout);
+    } else {
+        stdio_redirect_to_log();
+    }
+    {
+        std::string m = std::string("single-instance ok, mode=") +
+                        shell_mode_name() + ", stdio=" +
+                        (g_stdio_is_console ? "console" : "log");
+        slog(m.c_str()); /* 模式留痕恒落日志（ui/headless）或终端（console），钳制可回溯 */
+    }
+
+    /* Ctrl handler 三模式恒注册（§11⑤）——★必须在 stdio 分派（console 的
+     * AttachConsole）之后★：无控制台时注册对后续 attach 无效（实测 Ctrl+C 不达）。
+     * ui 下无控制台事件不可达（无害）；console/headless 白赚优雅停服。 */
+    SetConsoleCtrlHandler(shell_ctrl_handler, TRUE);
 
     if (!check_install_dir_clean(err, sizeof(err))) {
         diag_write("verify", err, "", FALSE);
@@ -2340,8 +2602,14 @@ static int run_shell(void) {
     /* 窗口先立（★P2 首启观感★）：验签/解压/完整性门全程可见 splash 进度，
      * 不再出现 40s 无窗口裸等。WebView2 环境创建仍须在 boot_python 之后
      * （pCreate 完成回调依赖 STA 消息泵，见下方原注释）——这里只是普通
-     * Win32 窗口 + 加载层，无 WebView2 依赖，提前安全。 */
-    ensure_window();
+     * Win32 窗口 + 加载层，无 WebView2 依赖，提前安全。
+     * 无窗形态（v1.4）：message-only window（只承载 WM_TIMER），splash 函数
+     * 自带 !g_splash 空守卫 → 启动期进度恒落 slog。 */
+    if (!shell_ensure_window(GetModuleHandleW(NULL), err, sizeof(err))) {
+        diag_write("bootstrap", err, "", FALSE);
+        show_error_ui_at_startup(err, FALSE);
+        return 2;
+    }
     set_splash_stage(20, "正在准备运行环境…");
     slog("window up (early)");
 
@@ -2500,11 +2768,16 @@ static int run_shell(void) {
     slog("python boot ok");
     free(manifest_text); /* manifest_text 已随 doc 使用完毕 */
 
-    webview_start();
-    slog("webview env requested");
+    if (g_mode == SM_UI) {
+        webview_start();
+        slog("webview env requested");
+    } else {
+        slog("webview skipped (windowless mode)"); /* §3.1：无窗形态不建 WebView2 */
+    }
 
-    /* 步骤 8.5/9：ready 轮询 + 心跳消费（主线程 WM_TIMER；禁独立线程） */
-    SetTimer(g_hwnd, IDT_TICK, TICK_MS, NULL);
+    /* 步骤 8.5/9：ready 轮询 + 心跳消费（WM_TIMER：ui=主窗 / 无窗=message-only
+     * window；禁独立线程） */
+    SetTimer(g_mode == SM_UI ? g_hwnd : g_msgwnd, IDT_TICK, TICK_MS, NULL);
     run_message_loop();
     graceful_and_exit(0); /* 兜底退出点（正常路径 WM_CLOSE 已在 graceful 内 ExitProcess） */
 }

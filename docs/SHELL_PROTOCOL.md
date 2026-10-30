@@ -1,5 +1,5 @@
 # SHELL_PROTOCOL.md — 协议 A 事实源（壳 ⇄ applocal）
-**版本**：v1.2（v1.1 契约复核补丁 + ★applocal 复核修复同步：静态豁免面补 HEAD★，明细见 §13）
+**版本**：v1.4（v1.1 契约复核补丁 + applocal 复核修复同步 + v1.3 Android M2 注记 + ★v1.4 壳形态三模式★，明细见 §13）
 **地位**：本文件是**三份壳模板与 applocal 之间契约的唯一事实源**。任何壳/applocal 的行为差异，以本文件为准；改动需同时更新 §末尾变更记录与三份壳契约测试。
 **约束**：**壳 = dumb loader**（只做"让一个可信的 Python 在正确的位置醒来"），不得理解 app 语义。
 
@@ -88,6 +88,27 @@ $ python.exe -I -c "import sys; print(sys.path)"
    原文"无条件重写新码"与 8.5 自相矛盾——壳自身导航也触发步骤 9，URL 码≠文件码，页面 /auth 恒 403。
    副作用：同 URL 重载（F5）码重新入文件可再次握手；一次性消费语义不变（服务端验过即删）。★
 ```
+### 3.1 ★v1.4★ 壳形态三模式（Windows 单 exe；ini 装载）
+单 exe 三形态，由 exe 旁 `<EXE-stem>.ini` 选择（无 ini = ui，双击形态零变化）：
+```ini
+[shell]
+mode = ui|console|headless
+```
+```
+读取时机：setup_paths 派生 exe 名定位 ini 之后、stdio 重定向与九步引导之前
+  （§1.1③：模式决定 stdio 归宿，必须先于任何输出）。
+钳制：大小写不敏感精确匹配三枚举；缺文件/缺键/空值/非法值一律回落 ui（负例进契约测试）。
+语义：
+  ui       —— 现行为逐位不变：可见主窗 + splash + WebView2 + 错误页；stdio 重定向日志（§7）。
+  console  —— 无窗服务形态（与 headless 同构：message-only window 轮询 §5、不建 WebView2），
+              stdio 直通终端（§7 console 形态）+ 启动横幅 + ready 后外化 URL（§8）；
+              AttachConsole 失败（双击启动无父控制台）→ 显式回落 headless 语义（stdio 落日志）。
+  headless —— 无窗服务形态：stdio 重定向日志；供 NSSM/systemd 类看门狗托管。
+退出码三模式统一：0 = 正常退出/受控停止（graceful）；2 = 启动期失败；3 = 运行期死亡
+  （= ui 重启按钮码，喂外部看门狗重启）。
+单实例互斥三模式同键（步骤 0）；第二实例激活对无窗形态自然空操作——轮询窗用独立类名
+  `<class>-msg` 的 message-only window，FindWindow(可见窗类) 永不命中（也不应命中）。
+```
 
 ---
 ## 4. 目录契约（四铁律）
@@ -126,6 +147,9 @@ $ python.exe -I -c "import sys; print(sys.path)"
   超时独立档：默认 120s（AppSpec 可调）→ 渲染"启动失败"错误页
 → 一律读 diag.json → 错误页 / 可重启；Linux 除外，走 L0/L1/L2（§10.3）
 ```
+**★v1.4 轮询两形态★**：ui = 可见主窗 WM_TIMER；console/headless = **message-only window**（HWND_MESSAGE，
+独立类名 `<class>-msg`）承载同一 `WM_TIMER`/`on_tick` 状态机——**独立轮询线程禁令不变**，
+判死分档与计时起点两形态完全同源。
 
 ---
 ## 6. 探测式心跳（applocal 侧）
@@ -159,6 +183,16 @@ setvbuf(stdout, NULL, _IONBF, 0);
 ```
 其他：GUI 子系统 stdout 是黑洞，本条款是唯一观测手段；日志**按天轮转留 7 份**；uvicorn `access_log=False`（避免每请求刷盘）。
 **CI 断言用例**：在 `Py_Initialize` 之前故意 `printf("PRE-INIT-PROBE")`，断言该行出现在日志文件中。
+**★v1.4 console 形态三策略★**（ui/headless 维持上款日志重定向不变）：
+```
+a) 父进程已传有效 std 句柄（测试管道 / `> file` 重定向）→ 原样直写，
+   并 AttachConsole(父) 仅为收 Ctrl 事件（不动 stdio 归宿）；
+b) 无句柄且 AttachConsole(ATTACH_PARENT_PROCESS) 成功 → CRT 重绑 CONOUT$ +
+   SetConsoleOutputCP(CP_UTF8)（GUI 子系统 CRT stdio 与控制台无连接，重绑理由同双保险）；
+c) 两者皆无（双击启动）→ 显式回落 headless 语义（stdio 落日志）——
+   GUI 子系统双击永不弹控制台，属预期而非错误。
+PRE-INIT-PROBE CI 锚点仅对日志形态（ui/headless/回落）断言；console 直通形态该行落终端。
+```
 
 ---
 ## 8. 握手鉴权
@@ -179,6 +213,9 @@ setvbuf(stdout, NULL, _IONBF, 0);
 dev：MYAPP_STRICT_AUTH=0 默认旁路（免打扰）；
      pkapp dev --strict-auth → MYAPP_STRICT_AUTH=1，启用生产同款中间件+握手端点，
      暴露"忘带 X-MYAPP-Token 头"这类只在 embedded 爆的 401 bug
+★v1.4 URL 外化★：console/headless 形态 ready 点亮后向 stdout 打一行
+  `ready: http://127.0.0.1:{port}/`（console → 终端；headless → 日志文件，随模式 stdio 归宿）；
+  供脚本/运维发现实际端口，禁止附 token。ui 形态不打印（URL 只进握手里程碑日志）。
 ```
 
 ---
@@ -191,6 +228,7 @@ dev：MYAPP_STRICT_AUTH=0 默认旁路（免打扰）；
  "ts": 1234567890}
 ```
 **渲染规则**：ready{false} / 验签失败 / 解压失败 / 加载失败 → 一律读 diag.json 渲染错误页，**绝不黑屏**；`recoverable=true` 时提供"重启"按钮。
+**★v1.4 无窗错误面（console/headless）★**：不渲染任何 UI、绝不阻塞等待用户——slog 摘要（同步落 diag.json 的调用方不变）后立即退出：启动期失败 exit 2；运行期判死/冷启动超时 exit 3（= ui "重启"按钮码 → 外部看门狗重启语义）。服务形态禁止弹窗。
 
 ---
 ## 10. 三端差异与职责投影（职责同、实现异）
@@ -246,6 +284,23 @@ L2：接受 hang 不可检测（显式取舍，登记）
 ④ 嵌入态派生受限（R25）：bootstrap 第 0 步自行设置 sys.argv
    （sys.executable 由嵌入初始化给出，M0 D2 实测确认；★v1.1 与实现对齐：applocal 只设 argv★）；
    multiprocessing 默认 spawn 与 uvicorn --reload 不可用，dev 侧禁 reload
+⑤ ★v1.4 Ctrl handler 线程（console/headless 优雅停服）★：SetConsoleCtrlHandler 三模式恒注册；
+   ui 分支直接 return FALSE（无控制台事件不可达，行为与未注册等价）。console/headless 的
+   handler 跑在控制台子系统代建的 OS 线程（非 UI 线程）：
+     - 禁触窗口 API/WebView2/COM（无 STA 泵）——只走 graceful_and_exit
+       （PyGILState_Ensure 任意线程可重取 GIL，§11① 的既有例外通道）；
+     - 竞态守卫 = g_exiting（InterlockedCompareExchange 防重入，第二调用者自旋等待收场）
+       + g_pRun_g volatile 写序（handler 仅在见非 NULL 后走 graceful——那时主线程已
+       PyEval_SaveThread 释放 GIL，Ensure 必不与引导期长持锁相撞）；
+     - g_pRun_g == NULL（引导期）= 无服务可停 → ExitProcess(0)，与启动期 WM_CLOSE 裸退同语义；
+     - handler 清 ready 与主线程 on_tick 读 ready 的窗口期由 g_exiting 收敛：on_tick 若因
+       ready 消失误入判死分支，graceful 防重入保证单次执行、绝不二次 shutdown。
+     - ★投递前提与实测（2026-10-30）★：处理型 CTRL_C 送达需 进程持 CONIN$ 句柄 +
+       输入 mode 含 ENABLE_PROCESSED_INPUT + handler 注册晚于 AttachConsole
+       （GUI 进程三者皆缺，console_mode_setup 显式补齐）；**Windows Terminal（Win11
+       默认终端）把 Ctrl+C 绑定为"复制"→ 处理型事件根本不产生**——人工验证须用
+       强制事件 Ctrl+Break（同 handler 链，实测 graceful 排空 203ms）；看门狗
+       （NSSM）用 CTRL_BREAK/CTRL_CLOSE 强制事件，不经终端截获，不受影响。
 ```
 **★v8.1 V2 否决★**：不采用 `python3.dll`（稳定 ABI 代理）——实测其**不导出 `PyRun_SimpleString`**，且版本绑定会引入"加载到系统里另一个 Python"的不确定性。
 
@@ -278,3 +333,4 @@ APK 签名承担，跳过；⑤⑦ 属 Windows/Linux 形态。Linux M3。
 | v1.1 | ★契约复核补丁（applocal 0.1.0 实现对账，零机制变更）★：§2 补 optional 标注并与实现必填集合对齐（LOG_DIR/PORT/TOKEN/HANDSHAKE_FILE/NATIVE_LIB_DIR/STRICT_AUTH）；entry 经 manifest.entry 传递（步骤 8 禁硬编码，同 python_dll 键模式）；§2.1 悬空引用 "G10" 改指 B.t③；步骤 3 预清理增握手码文件、插步骤 8.5"等待 ready 再导航"；§5 判死分档（计时起点＝首见 ready、冷启动独立 120s 档、ready 消失补"曾出现过"前提）、pid 备注修正；§8 豁免面精确化（SPA 兜底）+ 静态缓存头（index.html no-store）+ embedded 必设 STRICT_AUTH=1；§11④ sys.argv 措辞对齐实现；§12.1 端口措辞修正；§12.2 增⑧；applocal 0.1.0 代码复核修复同步：§2 明文 app/ 目录派生规则（manifest 同级、sys.path 末尾追加）、§6 心跳连续 2 拍失败写 diag |
 | v1.2 | ★applocal 复核修复同步（零机制变更）★：§8① 静态豁免面补 **HEAD**（GET/HEAD 同一豁免规则；applocal 侧：HEAD 只回响应头、body 置空、content-length 为实体长度）。理由：嵌入端探测方拿不到 token，同一资源 GET 豁免而 HEAD 401 属规则漏洞而非有意设计；豁免面即鉴权边界，故条款化。同步三壳契约测试断言：HEAD dist 内实存文件在 strict 下亦豁免。另有步骤 9 握手镜像修正：壳自身导航带码时镜像入文件，仅无码导航写新随机码（URL 码≠文件码 → /auth 403 实证） |
 | v1.3 | §10.2 Android M2 落地注记（sys.path 四条目契约 / jniLibs W^X / MagicOS 后台冻结与 onResume 宽限重置）；§12.2 Android 真机契约子集 8 例（shell-android/tests） |
+| v1.4 | ★壳形态三模式（Windows 单 exe + ini）★：§3.1 新增 `ui\|console\|headless` 模式契约——exe 旁 `<stem>.ini` 的 `[shell] mode`、枚举钳制回落 ui、读取时机先于 stdio 重定向与九步引导；console 与 headless 同构无窗（message-only window 轮询、不建 WebView2），console 增 stdio 直通/横幅/URL 外化，AttachConsole 失败（双击）显式回落 headless；退出码 0/2/3 三模式统一。§5 轮询两形态（独立轮询线程禁令不变）；§7 console stdio 三策略（句柄直写 / CONOUT$ 重绑 / 回落日志）；§8 URL 外化行（禁附 token）；§9 无窗错误面（绝不阻塞 UI，exit 2/3）；§11⑤ Ctrl handler 线程模型与竞态守卫（g_exiting 防重入 + g_pRun_g volatile 写序） |

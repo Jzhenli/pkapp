@@ -1,12 +1,12 @@
-# shell-windows — pkapp Windows C++ 壳 ★v8.2★
+# shell-windows — pkapp Windows C++ 壳 ★v8.3★
 
-协议 A（v1.2）的 Windows 实现。壳 = **dumb loader**：只做"让一个可信的 Python 在正确的位置醒来"，不理解 app 语义。本目录是 M1 交付物，对应方案 v8 §5.5 四阶段路线中的 Windows 壳模板。
+协议 A（**v1.4**，新增 §3.1 壳形态三模式）的 Windows 实现。壳 = **dumb loader**：只做"让一个可信的 Python 在正确的位置醒来"，不理解 app 语义。本目录是 M1 交付物，对应方案 v8 §5.5 四阶段路线中的 Windows 壳模板。
 
 **事实源**（行为差异以文档为准）：
 
 | 文档 | 地位 |
 |---|---|
-| `docs/SHELL_PROTOCOL.md`（v1.2） | 壳 ⇄ applocal 契约唯一事实源 |
+| `docs/SHELL_PROTOCOL.md`（v1.4） | 壳 ⇄ applocal 契约唯一事实源 |
 | `docs/PACKAGER_SPEC.md`（v0.4） | spk 打包格式 |
 | `docs/pkapp打包方案v8.md` §5.5 | 总体路线 |
 
@@ -26,7 +26,8 @@ shell-windows/
 │   └── manifest.h/.c      # manifest 键提取（python_dll / entry 等，禁止壳内硬编码）
 ├── third_party/           # WebView2 SDK：WebView2.h + WebView2Loader(.dll/.lib)
 ├── tests/
-│   └── test_shell_contract.py   # 15 例差分契约测试（§12.2①②③）
+│   ├── test_shell_contract.py    # 15 例差分契约测试（§12.2①②③）
+│   └── test_shell_modes_e2e.py   # 6 例三形态 e2e（§3.1/§7/§8/§9/§11⑤）
 └── build/                 # 构建产物（MyApp.exe + WebView2Loader.dll）
 ```
 
@@ -36,11 +37,32 @@ shell-windows/
 
 ```bat
 cd /d %REPO%\shell-windows
-build.bat            :: 默认 MyApp；build.bat MyApp2 改产物名
+build.bat            :: 默认 MyApp；第 2 参 = 项目 Ed25519 公钥 raw hex（/DPKAPP_PUB_HEX 注入）
+build.bat MyApp  <根项目公钥>       :: 契约测试用（.pkapp\sign.key 配对）
+build.bat hello <hello 工作区公钥>  :: e2e 用（out\hello\.pkapp\sign.key 配对，验 hello.spk + integrity 侧车）
 build\MyApp.exe --selftest          :: 算法向量自检（SHA-256 / Ed25519 / spk_hash）
 ```
 
 要点：纯 C17 + C++17、**/MT 静态 CRT**（避免 CRT 实例分裂导致 stdio 重定向静默失效）、GUI 子系统、仅依赖系统库 user32/gdi32/advapi32/bcrypt/ole32/shell32 + WebView2Loader.dll。
+
+## 壳形态三模式（协议 v1.4 §3.1）
+
+exe 旁 `<exe-stem>.ini`（如 `MyApp.ini`）`[shell] mode = ui|console|headless`；值非法/键缺失一律钳制回落 `ui`（读取先于 stdio 重定向与九步引导）。
+
+| mode | 窗口 | stdio 归宿（§7 三策略） | 用途 |
+|---|---|---|---|
+| `ui`（默认） | 可见主窗 + WebView2 | 重定向日志 | 桌面用户（现状，逐位不变） |
+| `console` | 无窗（message-only） | 直通终端（§7a/§7b）；**双击无控制台 → §7c 自动回落 headless** | 终端前台运维 |
+| `headless` | 无窗（message-only） | 落日志 | NSSM/计划任务等看门狗托管 |
+
+无窗两形态：不建 WebView2；服务 URL 就绪后按 §8 外化——console 打到 stdout（`ready: http://127.0.0.1:<port>/`），headless 打进日志；错误面 = slog + 退出码（§9），**服务形态禁弹窗**。三模式恒注册 `SetConsoleCtrlHandler`（§11⑤）：Ctrl+C/Ctrl+Break/关控制台 → `graceful_and_exit(0)`（applocal.shutdown 排空 ≤5s → 清 ready → 退出码 0，喂看门狗认成功停服）。
+
+```bat
+:: console 形态前台跑（Ctrl+C 优雅停服）
+echo [shell] & echo mode=console > MyApp.ini & MyApp.exe
+:: headless 挂 NSSM（stdout 落日志，URL 在 %LOCALAPPDATA%\<stem>\cache\log\<stem>-YYYYMMDD.log）
+echo mode=headless > MyApp.ini & nssm install MyApp MyApp.exe
+```
 
 ## 四阶段路线（本目录已全部走通）
 
@@ -60,6 +82,30 @@ build\MyApp.exe --selftest          :: 算法向量自检（SHA-256 / Ed25519 / 
 2. **主线程 WM_TIMER 轮询**（500ms 节拍），协议**禁止独立轮询线程**——独立线程会把大依赖慢启动 import 误杀在 30s 判死窗口内；冷启动超时独立档（默认 120s）。
 3. **心跳在 applocal 后台线程**：只有 uvicorn 所在进程能真实探测 uvicorn；壳只消费 ready（seq 判活主判据，30s 无增长 / ready 消失 / ready{false} → 判死 → diag 错误页）。
 4. **退出一律 `ExitProcess`，不做 `Py_Finalize`**（uvicorn 后台线程下 Finalize 是经典死锁源）。
+5. **Ctrl handler 跑在控制台子系统代建的 OS 线程**（§11⑤，v1.4）：非 UI 线程禁触窗口 API/WebView2/COM；只走 `graceful_and_exit`——`PyGILState_Ensure` 任意线程可重取 GIL，跨线程判据 = `g_pRun_g`（volatile，写点在 `PyEval_SaveThread` 之后）+ `g_exiting` 防重入 CAS。ui 形态 GUI 进程无控制台，handler 直接 `return FALSE`（与未注册等价）。
+
+## e2e 自动化（三形态，tests/test_shell_modes_e2e.py）
+
+```bat
+:: 前置：build.bat hello <hello 工作区公钥>（须验 out\hello 发布目录的 hello.spk + integrity 侧车）
+::       + pkapp 打包的 hello 发布目录 out\hello\release\hello-0.1.0-windows-x86_64\hello\ 存在
+cd /d %REPO%
+%REPO%\.venv\Scripts\python.exe -m pytest shell-windows/tests/test_shell_modes_e2e.py -q
+```
+
+6 例覆盖：headless 无窗 ready + URL 外化进日志 + stdout 恒空；console stdio 直通管道（横幅/PRE-INIT-PROBE/模式行/`ready:` URL）+ `/healthz` 200；console 双击回落 headless（DETACHED helper + `AttachConsole`/`FreeConsole` 斩控制台链 + `CreateProcessW` NULL 三句柄 = 资源管理器双击语义）；ini 非法值钳制回落 ui（真窗口立起）；第二实例无窗秒退 0 不弹窗；**优雅停服**（WM_CLOSE ⇄ Ctrl handler 共享 `graceful_and_exit`：退出码 0 + ready 清除 + 日志 shutdown 痕迹）。
+
+> **控制台 Ctrl+C 投递无法在沙箱内自动化**（`GenerateConsoleCtrlEvent` 与
+> `WriteConsoleInputW` 注入键击均不投递、API 却返回成功——conhost 事件合成被屏蔽）。
+> **真实终端 Ctrl+C 不退 ≠ 壳缺陷（2026-10-30 实测定案）**：Windows Terminal
+> （Win11 默认终端）把 Ctrl+C 绑定为"复制"，处理型事件根本不产生；壳的 handler
+> 链完好——**Ctrl+Break（笔记本 Ctrl+Fn+B）正常触发 graceful，shutdown 排空 203ms**。
+> 强制事件 CTRL_BREAK / CTRL_CLOSE（NSSM/看门狗用）不经 WT 截获，不受影响。
+> 手动验证：`mode=console` 前台跑 → ready 后按 **Ctrl+Break**（或传统 conhost 里
+> Ctrl+C）→ 进程 30s 内退出码 0、日志含 `graceful exit begin` +
+> `applocal.shutdown ok`、`cache\ready` 已清除。handler 入口有事件类型留痕
+> （`ctrl handler entered type=N`，落日志可区分「事件没产生」vs「handler 没跑」）。
+> 壳侧 handler 逻辑本身与 WM_CLOSE 同路径，已由 e2e 覆盖。
 
 ## e2e 手工复现
 
@@ -106,6 +152,10 @@ cd /d %REPO%\pkapp
 | `spk.c` spk_hash 同法重算 | PACKAGER_SPEC §6 |
 | `shell.cpp` 指纹三规则 / promote_staging | §3 步骤 2、§4 四铁律 |
 | `shell.cpp` stdio 重定向 + PRE-INIT-PROBE | §7（v8.1 V8 双保险） |
+| `shell.cpp` read_shell_mode_ini / 三模式分派 | §3.1（v1.4 壳形态三模式） |
+| `shell.cpp` console_mode_setup（§7a/§7b/§7c 三策略） | §3.1、§7 |
+| `shell.cpp` 无窗基建（msg_wnd_proc / message-only）+ §8 URL 外化 | §5（轮询两形态）、§8 |
+| `shell.cpp` shell_ctrl_handler（三模式恒注册） | §11⑤（v1.4 线程注记⑤） |
 | `shell.cpp` ready 状态机（PH_COLD/PH_RUNTIME/PH_DEAD） | §5（v8.1 V6/V7） |
 | `shell.cpp` diag_write/diag_read_summary | §9 |
 | `shell.cpp` 握手码导航（每次导航重写） | §8 |
