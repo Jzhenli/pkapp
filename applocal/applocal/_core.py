@@ -549,6 +549,16 @@ def bootstrap(entry: str = "app.main:app") -> int:
     """壳唯一入口（§4.2 五步）。返回实际监听端口；ready 由心跳线程负责。"""
     _t0 = _t = time.perf_counter()                 # _t0 = 引导起点（total 打点用；_t 走段链）
     cfg = _env.load_env()
+    if os.environ.get("MYAPP_BOOT_FAULTHANDLER", "").lower() in ("1", "true"):
+        # ★诊断开关★（常驻能力，默认关闭）：壳内硬死亡（native 层无痕退出、无 Python
+        # traceback）抓 C 栈落 cache/faulthandler.log；运维在启动器环境注入该变量排查。
+        # 布尔语义对齐 _env.py 既定约定（"1"/"true" 才启用）。
+        import faulthandler as _fh
+        try:
+            _fh.enable(open(os.path.join(cfg.paths.cache_dir,
+                                         "faulthandler.log"), "w"))
+        except Exception:
+            pass
     try:
         _tlog = os.path.join(cfg.paths.cache_dir, "boot-timing.log")
     except Exception:
