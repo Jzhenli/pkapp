@@ -960,6 +960,49 @@ def test_consolidate_top_level_same_stem_clash_fails_fast(tmp_path):
             str(tmp_path / "stage"), str(sp), "", "", "py")
 
 
+def test_consolidate_dist_info_licenses_subdir_is_lazy():
+    """PEP 639 dist-info/licenses/ 子目录放行（paho_mqtt 2.2.0 实证：licenses/edl-v10
+    无扩展名 → 旧闸门误判非惰性，deps.zip fail-fast 误伤正常依赖）。同时钉负例：
+    非 dist-info 路径下的无后缀数据文件维持 fail-fast 判定（走 loose 散件化）。"""
+    assert consolidate_mod._is_lazy_file(
+        "paho_mqtt-2.2.0.dist-info/licenses/edl-v10")
+    assert consolidate_mod._is_lazy_file(
+        "paho_mqtt-2.2.0.dist-info/licenses/epl-v20")
+    assert consolidate_mod._is_lazy_file(
+        "Foo-1.0.dist-info/licenses/BSD-3-Clause")
+    # 负例：无 dist-info 段 → 非惰性（_unit_needs_loose 整目录散件化承接）
+    assert not consolidate_mod._is_lazy_file("certifi/data/edl-v10")
+    assert not consolidate_mod._is_lazy_file("pkg/licenses/unknown-blob")
+    # 负例：dist-info 下但非 licenses/ 子目录的无后缀文件维持原判
+    assert not consolidate_mod._is_lazy_file("Foo-1.0.dist-info/headers/x.h")
+
+
+def test_pack_deps_zip_accepts_dist_info_licenses_subdir(tmp_path):
+    """集成钉（原 bug 爆点 = _pack_deps_zip 打包闸门本身）：含 PEP 639 licenses/
+    无后缀文件的 dist-info 单元能通过 copy → flat 编译 → 闸门校验 → 落 zip 全链。
+    旧闸门在 zip 校验步报 BuildError"deps.zip 收入非惰性文件"。python_exe 传空串
+    走打包机解释器进程内回退编译（mock/测试可接受路径），测试保持 hermetic。"""
+    sp = tmp_path / "sp"
+    di = sp / "paho_mqtt-2.2.0.dist-info"
+    (di / "licenses").mkdir(parents=True)
+    (di / "licenses" / "edl-v10").write_text("EDL v10 text", encoding="utf-8")
+    (di / "METADATA").write_text("Metadata-Version: 2.1\nName: paho-mqtt\n",
+                                 encoding="utf-8")
+    pkg = sp / "plainpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    out = str(tmp_path / "deps.zip")
+    n = consolidate_mod._pack_deps_zip(
+        [str(di), str(pkg)], out, "", "python312.dll", str(tmp_path / "work"))
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+    assert "paho_mqtt-2.2.0.dist-info/licenses/edl-v10" in names
+    assert "paho_mqtt-2.2.0.dist-info/METADATA" in names
+    assert "plainpkg/__init__.pyc" in names   # 混合单元：py 编译 flat pyc 同闸门通过
+    assert n == 3
+
+
 # ---- ★M3 阶段 2★ linux 构建（_build_spk_linux）----
 
 def _build_linux(project, wheels_dir, out, **kw):

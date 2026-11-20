@@ -23,8 +23,11 @@ def _is_lazy_file(rel: str) -> bool:
 
     = 文档/类型桩（.md/.rst/.txt/.pyi/.json）+ dist-info 元数据（INSTALLER/
     METADATA/RECORD/WHEEL/py.typed 等）+ 许可证前缀（LICENSE*/COPYING*/NOTICE*，
-    大小写不敏感）。原生件（.pyd/.so/.dll）与 .pth 不在列——前者必须散件化
-    （Windows 不能从 zip 加载 pyd），后者在隔离模式本就不执行、出现即判漏洞。
+    大小写不敏感）+ PEP 639 dist-info/licenses/ 子目录（paho_mqtt 2.2.0 实证：
+    licenses/edl-v10 无后缀形态，纯法律文本不参与执行）。原生件（.pyd/.so/.dll）
+    与 .pth 不在列——前者必须散件化（Windows 不能从 zip 加载 pyd），后者在隔离
+    模式本就不执行、出现即判漏洞。非 dist-info 路径下的无后缀数据文件维持
+    fail-fast（由 _unit_needs_loose 整目录散件化承接）。
     """
     base = rel.rsplit("/", 1)[-1].lower()
     if base.endswith(_LAZY_SUFFIXES):
@@ -32,7 +35,10 @@ def _is_lazy_file(rel: str) -> bool:
     if base in {"py.typed", "installer", "metadata", "record", "wheel",
                 "zip-safe", "not-zip-safe", "requested"}:   # pip --target 写 REQUESTED
         return True
-    return base.startswith(("license", "copying", "notice"))
+    if base.startswith(("license", "copying", "notice")):
+        return True
+    low = rel.lower()
+    return ".dist-info/" in low and "/licenses/" in low
 
 
 def _has_namespace_pkg(unit_dir: str) -> bool:
