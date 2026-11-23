@@ -317,7 +317,7 @@ def test_default_layout_p0_consolidated(project, wheels_dir, tmp_path):
     """★P0 §4.1★ 收拢布局：site-packages = deps.zip（内 pyc-only，无 .py 源）
     + 散件目录（applocal/certifi flat pyc，数据文件原样）；zip 与散件均无
     __pycache__；app/ 恒保留源码；golden B.z 仍过；format_version = 2
-    （integrity 侧车契约）。（mock 快照 python.exe 为占位、回退打包机解释器编译。）"""
+    （integrity 侧车契约）。（mock 快照 python.exe 为占位、回退打包机解释器子进程编译。）"""
     out = str(tmp_path / "v7.spk")
     fields = _build(project, wheels_dir, out)
     assert fields["format_version"] == "2"
@@ -981,7 +981,7 @@ def test_pack_deps_zip_accepts_dist_info_licenses_subdir(tmp_path):
     """集成钉（原 bug 爆点 = _pack_deps_zip 打包闸门本身）：含 PEP 639 licenses/
     无后缀文件的 dist-info 单元能通过 copy → flat 编译 → 闸门校验 → 落 zip 全链。
     旧闸门在 zip 校验步报 BuildError"deps.zip 收入非惰性文件"。python_exe 传空串
-    走打包机解释器进程内回退编译（mock/测试可接受路径），测试保持 hermetic。"""
+    走打包机解释器子进程回退编译（mock/测试可接受路径），测试保持 hermetic。"""
     sp = tmp_path / "sp"
     di = sp / "paho_mqtt-2.2.0.dist-info"
     (di / "licenses").mkdir(parents=True)

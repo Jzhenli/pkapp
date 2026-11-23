@@ -10,15 +10,12 @@
 """
 from __future__ import annotations
 
-import io
 import json
 import os
-import py_compile
 import re
 import shutil
 import subprocess
 import sys
-import tokenize
 import zipfile
 
 from ..util import SPK_DATE, walk_files
@@ -96,95 +93,64 @@ def _compile_checked_hash(root: str, python_exe: str | None = None,
     dfile=相对路径：pyc 的 co_filename 不携带临时 staging 绝对路径——
     既保证 G1 字节级可复现（staging 路径每次不同），运行期 traceback 也显示包内相对路径。
 
-    编译解释器优先用快照本体（python.exe 子进程，PYTHONHASHSEED=0）：
-    ① pyc 版本标签 = 运行时版本（打包机 3.10 编出的 cpython-310 pyc 在 3.12 运行时
-       根本不会被 importlib 读取——死重）；② 子进程隔离消除解释器状态依赖的
-       marshal ref-memo 不确定性（实测：同进程两次 build pyc 字节漂移，G1 随机翻车）。
-    mock 快照的 python.exe 是占位文本 → CreateProcess OSError → 回退打包机解释器。
+    编译解释器序（★两态均为子进程隔离编译★，PYTHONHASHSEED=0）：
+    ① 快照本体优先：pyc 版本标签 = 运行时版本（打包机 3.10 编出的 cpython-310 pyc
+       在 3.12 运行时根本不会被 importlib 读取——死重）；
+    ② mock 快照（占位 exe → CreateProcess OSError）→ 打包机解释器子进程
+       （pyc 标签 = 打包机版本；与 python_dll 不对齐时 child 版本哨兵拦）。
+    ★子进程隔离是 G1/G5 确定性纪律★：marshal 的 interned/ref 标记随宿主进程
+    对象状态漂移——同进程两次 build pyc 字节漂移（2026-11 xmod G5 翻车实证：
+    旧"进程内编译回退"对同一字符串跨跑写出 0xDA/0xFA 两种编码；该回退已废，
+    两态统一走子进程，打包机回退 = sys.executable）。
     ★RFT 两遍★：obf 态先全树读源 → build_rename_plan（跨模块统一映射，G5 依据
     = sorted rel UTF-8 字节序 + symtable 序 + 全局计数器）→ 逐模块带 plan 编译。
     """
     child_mode = "unchecked" if unchecked else "checked"
     obf_flag = "obf" if obfuscate else "plain"
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    if python_exe and python_dll and os.path.isfile(python_exe):
-        argv_extra = ([f"key={obf_key.hex()}" if obf_key else "key=",
-                       f"pairs={json.dumps(sorted(protected_pairs))}",
-                       "rft" if rft else "local"] if obfuscate else [])
+    argv_extra = ([f"key={obf_key.hex()}" if obf_key else "key=",
+                   f"pairs={json.dumps(sorted(protected_pairs))}",
+                   "rft" if rft else "local"] if obfuscate else [])
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PYTHON")} | {
+        "PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1",
+        "PYTHONIOENCODING": "utf-8"}    # 子进程 stdio 强制 UTF-8（对拍消息含中文）
+    dll_arg = python_dll or ""          # None/空名 → child 版本哨兵跳过（测试直调形态）
+
+    # 编译解释器序：快照本体 → 打包机解释器（mock 快照占位 exe 不可执行时回退）。
+    # 两态都是子进程（见 docstring——G1/G5 确定性纪律）；快照态 rc!=0 = 快照真
+    # 故障，必须炸出来，不得静默换解释器。
+    for exe, label, is_snap in ((python_exe, "快照解释器", True),
+                                (sys.executable, "打包机解释器", False)):
+        if is_snap and not (python_exe and python_dll
+                            and os.path.isfile(python_exe)):
+            continue                    # 无快照 / mock 占位 → 直接打包机回退
         try:
             r = subprocess.run(
-                [python_exe, "-c", _COMPILE_CHILD, root, python_dll, child_mode,
+                [exe, "-c", _COMPILE_CHILD, root, dll_arg, child_mode,
                  obf_flag, pkg_dir] + argv_extra,
                 capture_output=True, text=True, timeout=600,
-                encoding="utf-8", errors="replace",   # 子进程输出恒按 UTF-8 读（GBK 环境兜底）
-                env={k: v for k, v in os.environ.items()
-                     if not k.startswith("PYTHON")} |
-                    {"PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1",
-                     "PYTHONIOENCODING": "utf-8"})    # 子进程 stdio 强制 UTF-8（对拍消息含中文）
-        except OSError:            # mock 占位 python.exe：不可执行 → 回退
-            r = None
-        if r is not None:
-            so, se = r.stdout or "", r.stderr or ""   # 解码失败时可能为 None
-            if r.returncode == 2:  # 快照解释器与 python_dll 版本不符：快照损坏，须炸出来
+                encoding="utf-8", errors="replace")   # 子进程输出恒按 UTF-8 读（GBK 环境兜底）
+        except subprocess.TimeoutExpired as e:
+            # 超时 = 解释器/编译挂死真故障：不回退（防慢快照静默换打包机解释器）
+            raise BuildError(f"{label} pyc 编译超时（{e.timeout}s）——解释器挂死或杀软锁扫描")
+        except OSError:
+            if is_snap:
+                continue                # mock 占位 python.exe：不可执行 → 打包机回退
+            raise BuildError(f"打包机解释器不可执行: {exe}")
+        so, se = r.stdout or "", r.stderr or ""   # 解码失败时可能为 None
+        if r.returncode == 2:           # 版本哨兵：快照损坏 / 打包机与运行时版本不符（防线 B 同语义）
+            if is_snap:
                 raise BuildError(f"快照解释器版本与 {python_dll} 不符，快照损坏:\n{se[-2000:]}")
-            if r.returncode == 3:  # ★R-13★ 对拍闸：符号面差异无两表解释，到不了打包
-                raise BuildError(f"R-13 双编译对拍失败:\n{so[-2000:]}\n{se[-2000:]}")
-            if r.returncode != 0 or "PYC-OK" not in so:
-                raise BuildError(f"快照解释器 pyc 编译失败:\n{so[-2000:]}\n{se[-2000:]}")
-            return _parse_pyc_stats(so)
-    # 回退路径：打包机解释器进程内编译（pyc 版本标签可能与运行时不一致——仅 mock/测试可接受）
-    from importlib.util import cache_from_source, source_hash
-    from importlib._bootstrap_external import _code_to_hash_pyc
-    from ..util import walk_files
-    from .obfuscate import build_rename_plan, compile_obfuscated, verify_parity
-
-    mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if unchecked
-            else py_compile.PycInvalidationMode.CHECKED_HASH)
-    renamed = stripped = strings = 0
-    exempt: dict = {}
-    if obfuscate:
-        # ★RFT 两遍★（rft=True）：先全树读源建统一改名计划，再逐模块带 plan 编译；
-        # rft=False（applocal flat 树）= 纯期1（plan=None，模块级名不参与改名）
-        sources = {}
-        raws = {}
-        for rel in walk_files(root):
-            if rel.endswith(".py"):
-                with open(os.path.join(root, rel.replace("/", os.sep)), "rb") as f:
-                    raw = f.read()
-                enc = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
-                raws[rel] = raw
-                sources[rel] = raw.decode(enc)      # ★OB-2★ 解码与 py_compile 同语义
-        plan = (build_rename_plan(sources, protected_pairs=protected_pairs)
-                if rft else None)
-        exempt = dict(plan.stats) if plan is not None else {}
-        for rel in sorted(sources, key=lambda s: s.encode("utf-8")):
-            src = os.path.join(root, rel.replace("/", os.sep))
-            pyc = cache_from_source(src)
-            os.makedirs(os.path.dirname(pyc), exist_ok=True)
-            code, st = compile_obfuscated(sources[rel], rel,
-                                          string_key=obf_key, module_id=rel,
-                                          plan=plan)
-            verify_parity(sources[rel], rel, code, st,       # ★R-13★ 每模块对拍闸
-                          string_key=obf_key, module_id=rel)
-            with open(pyc, "wb") as f:
-                f.write(_code_to_hash_pyc(code, source_hash(raws[rel]),
-                                          checked=not unchecked))
-            renamed += st["renamed"]
-            stripped += st["stripped"]
-            strings += st.get("strings", 0)
-    else:
-        for rel in walk_files(root):
-            if not rel.endswith(".py"):
-                continue
-            src = os.path.join(root, rel.replace("/", os.sep))
-            pyc = cache_from_source(src)
-            os.makedirs(os.path.dirname(pyc), exist_ok=True)
-            py_compile.compile(src, cfile=pyc, dfile=rel, doraise=True, quiet=2,
-                               invalidation_mode=mode)
-    out = {"renamed": renamed, "stripped": stripped, "strings": strings}
-    if obfuscate:
-        out["exempt"] = exempt
-    return out
+            raise BuildError(f"打包机解释器 {sys.version_info[:2]} 与运行时 "
+                             f"{python_dll} 版本不符——pyc 标签将与运行时不一致，"
+                             f"拒绝产出:\n{se[-2000:]}")
+        if r.returncode == 3:           # ★R-13★ 对拍闸：符号面差异无两表解释，到不了打包
+            raise BuildError(f"R-13 双编译对拍失败:\n{so[-2000:]}\n{se[-2000:]}")
+        if r.returncode != 0 or "PYC-OK" not in so:
+            raise BuildError(f"{label} pyc 编译失败:\n{so[-2000:]}\n{se[-2000:]}")
+        return _parse_pyc_stats(so)
+    raise BuildError("无可执行编译解释器（快照与打包机解释器均不可用）")
 
 
 def _parse_pyc_stats(stdout: str) -> dict:
@@ -215,13 +181,13 @@ def _parse_pyc_stats(stdout: str) -> dict:
 # PYC-OK 行后打印 RENAME-EXEMPT 豁免统计。普通分支原 py_compile 逻辑不变。
 _COMPILE_CHILD = """\
 import os, sys
-expected = sys.argv[2]                     # 形如 python312.dll
+expected = sys.argv[2]                     # 形如 python312.dll；空名 = 无运行时声明（测试直调）→ 跳过哨兵
 # ★M3★ .so 版本链归一：libpython3.12.so.1.0 → libpython3.12.so（裸版本后缀数字
 # 会污染抽取得 (312,10)；剥离 .so 后链再抽即 (3,12)，docstring 口径本就如此）
 if ".so" in expected:
     expected = expected.split(".so")[0] + ".so"
 digits = "".join(c for c in expected if c.isdigit())
-if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
+if digits and sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     print("PYC-VERSION-MISMATCH", sys.version)
     sys.exit(2)
 import importlib.util
@@ -269,7 +235,7 @@ if obf:
     plan = (obfuscate.build_rename_plan(sources, protected_pairs=pairs)
             if rft else None)
     exempt = dict(plan.stats) if plan is not None else {}
-    # 第二遍：sorted rel UTF-8 字节序逐模块带 plan 编译（与回退路径同序，G5 依据）
+    # 第二遍：sorted rel UTF-8 字节序逐模块带 plan 编译（sorted 序即 G5 依据）
     for rel in sorted(sources, key=lambda s: s.encode("utf-8")):
         p = os.path.join(root, rel.replace("/", os.sep))
         pyc = importlib.util.cache_from_source(p)
@@ -323,7 +289,7 @@ expected = os.path.basename(sys.argv[1])
 if ".so" in expected:
     expected = expected.split(".so")[0] + ".so"
 digits = "".join(c for c in expected if c.isdigit())
-if sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
+if digits and sys.version_info[:2] != (int(digits[:-2] or 3), int(digits[-2:])):
     sys.exit(2)
 py_compile.compile(sys.argv[2], cfile=sys.argv[3], dfile=sys.argv[4],
                    doraise=True, quiet=2,
@@ -350,7 +316,9 @@ def _dll_version_pair(python_dll: str) -> tuple[int, int]:
 
 def _compile_one_pyc(python_exe: str | None, python_dll: str,
                      src: str, out_pyc: str, dfile_rel: str) -> None:
-    """单文件 pyc 编译：快照解释器子进程优先，mock 快照回退打包机解释器。
+    """单文件 pyc 编译：快照解释器子进程优先，mock 快照回退打包机解释器
+    （★同为子进程隔离★——进程内 py_compile 会把 marshal interned/ref 状态引入
+    宿主进程，同进程双 build 字节漂移，2026-11 xmod G5 翻车实证）。
 
     site-packages 恒只带 .py（★v0.7★）——不能走整树编译（__pycache__ 副产物
     污染 site-packages），_codekey blob 化前单独编这一个文件到临时区。
@@ -364,6 +332,8 @@ def _compile_one_pyc(python_exe: str | None, python_dll: str,
                 env={k: v for k, v in os.environ.items()
                      if not k.startswith("PYTHON")} |
                     {"PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1"})
+        except subprocess.TimeoutExpired as e:
+            raise BuildError(f"快照解释器 pyc 编译超时（{e.timeout}s）——解释器挂死或杀软锁扫描")
         except OSError:            # mock 占位 python.exe：不可执行 → 回退
             r = None
         if r is not None:
@@ -374,9 +344,10 @@ def _compile_one_pyc(python_exe: str | None, python_dll: str,
                 raise BuildError(f"_codekey pyc 编译失败:\n"
                                  f"{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
             return
-    # ★review 后补防线 B★ 回退打包机解释器：打包机版本必须与 python_dll 名
-    # 一致（子进程比对不再兜底）——否则静默编出运行期才炸的 marshal 载荷。
-    # 文件名形态未知（抽不出版本）则维持旧行为不阻塞。
+    # ★review 后补防线 B★ 回退打包机解释器（★子进程隔离，同 _compile_checked_hash★）：
+    # 打包机版本必须与 python_dll 名一致（child 哨兵比对不再兜底）——否则静默编出
+    # 运行期才炸的 marshal 载荷。文件名形态未知（抽不出版本）则不阻塞（child 哨兵
+    # 对空 digits 跳过）。
     if python_dll:
         pair = _dll_version_pair(python_dll)
         if pair != (0, 0) and pair != sys.version_info[:2]:
@@ -384,9 +355,24 @@ def _compile_one_pyc(python_exe: str | None, python_dll: str,
                 f"打包机解释器 {sys.version_info[:2]} 与运行时 {python_dll} "
                 f"版本不符（{_dll_version_pair(python_dll)}）——注册匹配快照"
                 f"或改用打包机同版运行时，避免产出运行期不兼容的 pyc 载荷")
-    py_compile.compile(src, cfile=out_pyc, dfile=dfile_rel, doraise=True,
-                       quiet=2,
-                       invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", _COMPILE_ONE, python_dll or "", src, out_pyc,
+             dfile_rel],
+            capture_output=True, text=True, timeout=120,
+            env={k: v for k, v in os.environ.items()
+                 if not k.startswith("PYTHON")} |
+                {"PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1"})
+    except subprocess.TimeoutExpired as e:
+        raise BuildError(f"打包机解释器 pyc 编译超时（{e.timeout}s）")
+    except OSError as e:
+        raise BuildError(f"打包机解释器不可执行: {sys.executable}（{e}）")
+    if r.returncode == 2:                  # 版本哨兵（防线 B 预检后的双保险）
+        raise BuildError(f"打包机解释器 {sys.version_info[:2]} 与运行时 "
+                         f"{python_dll} 版本不符:\n{r.stderr[-2000:]}")
+    if r.returncode != 0:
+        raise BuildError(f"_codekey pyc 编译失败:\n"
+                         f"{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
 
 
 def _compile_flat_tree(root: str, python_exe: str | None, python_dll: str, *,
