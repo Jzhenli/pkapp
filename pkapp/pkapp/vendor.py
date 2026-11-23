@@ -25,6 +25,26 @@ def wheels_dir() -> str | None:
     return p if os.path.isdir(p) else None
 
 
+def applocal_wheel_version() -> str | None:
+    """内置 applocal wheel 的版本号（文件名 applocal-<ver>-*.whl 解析）——工具期望
+    契约层版本的单一事实源：工具升级 → 内置 wheel 升级 → 期望版本自动抬升。
+    规范发布恒为单 wheel（scripts/vendor.py 组装前 rmtree）；若手工放置多版本，
+    按 PEP 440 元组取 max（字典序会错选："0.1.9" > "0.1.10"）。无 _vendor/
+    （源码仓库形态）或目录内无 applocal wheel → None（调用方跳过比对）。"""
+    d = wheels_dir()
+    if not d:
+        return None
+    wheels = []
+    for fn in os.listdir(d):
+        parts = fn.split("-")
+        if fn.endswith(".whl") and len(parts) >= 2 and parts[0] == "applocal":
+            wheels.append(fn)
+    if not wheels:
+        return None
+    return max(wheels, key=lambda fn: tuple(int(p) if p.isdigit() else -1
+                                            for p in fn.split("-")[1].split("."))).split("-")[1]
+
+
 def launcher_elf(arch: str, name: str) -> str | None:
     """包内置 launcher ELF（★M3★ shell-linux 容器编译产物，按 arch 分目录）。
 

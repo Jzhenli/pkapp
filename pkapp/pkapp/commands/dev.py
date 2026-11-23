@@ -16,6 +16,25 @@ from ..appspec import AppSpec, SpecError, load
 from ..util import atomic_write
 
 DEV_PORT = 8765
+# 已装 applocal 版本 + editable 标记探测（对齐前置；editable = 源码调试契约层，绝不 clobber）
+# 注：定位 dist-info 走 m.files()（公开 API，3.11+ 稳定）——Distribution.path 在
+# 3.12 是私有 _path（3.14 才转正），真机冒烟踩过（AttributeError → probe 假失败）
+_APPLOCAL_PROBE = """
+import importlib.metadata as m, json
+v = m.version('applocal')
+e = False
+for f in (m.files('applocal') or []):
+    if str(f).endswith('direct_url.json'):
+        try:
+            with open(f.locate(), encoding='utf-8') as fh:
+                e = bool(json.load(fh).get('dir_info', {}).get('editable'))
+        except Exception:
+            pass
+        break
+print(v, int(e))
+"""
+_PROBE_TIMEOUT = 60    # probe 有界（杀软扫描/解释器挂死不让 dev 卡死）
+_ALIGN_TIMEOUT = 120   # pip 离线单 wheel 安装上界
 _BOOTSTRAP_SHIM = """
 import threading
 import applocal
@@ -90,6 +109,10 @@ def cmd_dev(project: str, *, strict_auth: bool = False, port: int = DEV_PORT,
     if py is None:
         print("[dev] 未找到项目 .venv——先 pkapp create 或用 --python 指定解释器")
         return 2
+    try:
+        _align_applocal(py)   # 契约层漂移自动对齐（有漂移才动手；成功/失败均有可见输出）
+    except FileNotFoundError:
+        pass                  # 坏 --python 路径：随后的 shim run 统一报"解释器不可用"
 
     full_env = dict(os.environ)
     full_env.update(env)
@@ -107,6 +130,56 @@ def cmd_dev(project: str, *, strict_auth: bool = False, port: int = DEV_PORT,
         print(f"[dev] 解释器不可用: {py}")
         return 2
     return r.returncode
+
+
+def _align_applocal(py: str) -> None:
+    """契约层漂移自动对齐：工具内置 applocal wheel 新于当前解释器已装版本 →
+    离线安装（--no-index --find-links 内置 wheel + 精确 pin）对齐到工具版本。
+
+    - 仅契约层一个 wheel：秒级、完全离线、确定性；业务依赖一律不碰。
+    - editable 安装（pip install -e applocal 源码调试契约层）绝不 clobber
+      （direct_url.json 的 dir_info.editable 识别后跳过）。
+    - 无内置 wheel（源码仓库形态）→ 整个检查跳过。
+    - 对齐成功打印变更行（透明，非静默魔法）；失败回退提示模式。
+    - probe/pip 均有 timeout（有界子进程惯例）——挂死不让 dev 卡死。
+    """
+    from .. import vendor
+    want = vendor.applocal_wheel_version()
+    wd = vendor.wheels_dir()
+    if want is None or not wd:
+        return
+    try:
+        r = subprocess.run([py, "-c", _APPLOCAL_PROBE],
+                           capture_output=True, text=True, timeout=_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return                      # 对齐是尽力而为：probe 超时静默让位主流程
+    have = editable = None
+    if r.returncode == 0:
+        try:
+            v, e = r.stdout.split()
+            have, editable = v, e == "1"
+        except ValueError:
+            pass
+    if editable:
+        return
+    if have is not None:
+        from ..appspec._core import _ver_tuple
+        if _ver_tuple(have) >= _ver_tuple(want):
+            return
+    try:
+        s = subprocess.run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                            "--no-index", "--find-links", wd, f"applocal=={want}"],
+                           capture_output=True, text=True, timeout=_ALIGN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        s = None
+    if s is not None and s.returncode == 0:
+        print(f"[dev] applocal {'missing' if have is None else have} → {want}"
+              "（离线对齐工具内置 wheel）")
+        return
+    err = "" if s is None else s.stderr.strip()[-200:]
+    print(f"[dev] applocal 自动对齐失败（内置 {want}，已装 {have or 'missing'}）——手动：\n"
+          f"  \"{py}\" -m pip install -U applocal --find-links \"{wd}\"\n"
+          f"  {err}")
 
 
 def _venv_python(project: str) -> str | None:

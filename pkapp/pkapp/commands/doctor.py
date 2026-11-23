@@ -130,11 +130,11 @@ def cmd_doctor(project: str, integrity_dir: str | None = None) -> int:
     try:
         spec = load(os.path.join(project, "pkapp.toml"))
         al = _venv_applocal_version(project)
-        ok = al and not al.startswith("missing")
-        if ok:
-            from ..appspec._core import _ver_tuple
-            ok = _ver_tuple(al) >= _ver_tuple("0.1.0")
-        print(f"[doctor] applocal in .venv: {al}（契约层，区间下限随 AppSpec 升级）")
+        from ..appspec._core import _ver_tuple
+        from ..vendor import applocal_wheel_version
+        floor = applocal_wheel_version() or "0.1.0"   # 单一事实源=内置 wheel；无 _vendor 退回历史下限
+        ok = bool(al) and not al.startswith("missing") and _ver_tuple(al) >= _ver_tuple(floor)
+        print(f"[doctor] applocal in .venv: {al}（契约层，下限={floor} 随工具内置 wheel 抬升）")
         if not ok:
             problems += 1
     except SpecError as e:
