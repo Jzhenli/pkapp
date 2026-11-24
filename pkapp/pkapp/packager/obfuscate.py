@@ -1209,7 +1209,11 @@ def verify_parity(src_text: str, filename: str, obf_code: types.CodeType,
         sa = {c for c in a if not isinstance(c, types.CodeType)}
         sb = {c for c in b if not isinstance(c, types.CodeType)}
         ra, rb = sa - sb, sb - sa
-        added_strs = {c for c in rb if isinstance(c, str)}
+        # ★退化散现串判定★：不能用「新现散串 = rb 中的 str」（SET 差）——
+        # 真实案例 config.py 的 'data' 既是路径段又是退化 dict 的键，co_consts
+        # 去重后「散现」与「原池已有」是同一常量，被差集抵消致整条键元组误判。
+        # 改用混淆侧字符串常量池全集：退化散现的键必在其中（无论原池是否已有）。
+        obf_strs = {c for c in sb if isinstance(c, str)}
 
         def all_str_tuple(c) -> bool:
             return isinstance(c, tuple) and c and all(isinstance(x, str) for x in c)
@@ -1226,14 +1230,16 @@ def verify_parity(src_text: str, filename: str, obf_code: types.CodeType,
             """★P1.5★ 伴生规则：全常量键 dict 编译为 BUILD_CONST_KEY_MAP（键 =
             str 元组常量）；任一键 ≥_MIN_STR 被加密替换为 _pkobf_d(idx) Call 后
             3.12 编译器退化 BUILD_MAP——键元组消失、未加密键散为独立常量、加密
-            键进密钥表。逐元素 ∈ (str_table ∪ 新现散串) 全命中才放行——部分
-            命中（既未加密也未散现）必是真实漂移，拒绝。
-            ★评审已知窗口★（接受并声明）：added_strs 是新现散串全集，无「同源
-            dict」结构校验——无关漂移串凑巧逐元素全命中时会漏检。不收紧原因：
-            退化触发条件是「任一值被加密」（含全 <8 未加密键的 dict），t 元素
-            是否进密钥表与是否散现无必然绑定，任何同源判据都会误伤多 dict 共键
-            场景；漏检风险由 co_names/locals diff 与端到端冒烟独立兜底。"""
-            return all(x in str_table or x in added_strs for x in t)
+            键进密钥表。逐元素 ∈ (str_table ∪ 混淆侧字符串池) 全命中才放行——
+            部分命中（既未加密也未散现）必是真实漂移，拒绝。字符串池取 sb 全集
+            而非 rb 差集：散现键可能与同 scope 他处常量同串（如 config.py 的
+            'data'），co_consts 去重后差集无法分辨。
+            ★评审已知窗口★（接受并声明）：字符串池无「同源 dict」结构校验——
+            无关漂移串凑巧逐元素全命中时会漏检。不收紧原因：退化触发条件是
+            「任一值被加密」（含全 <8 未加密键的 dict），t 元素是否进密钥表
+            与是否散现无必然绑定，任何同源判据都会误伤多 dict 共键场景；
+            漏检风险由密文重算验真、co_names/locals diff 与端到端冒烟独立兜底。"""
+            return all(x in str_table or x in obf_strs for x in t)
 
         def str_leaves(x, acc=None):
             """嵌套常量容器的 str 叶子集（None/int 等非 str 叶子忽略）。"""
@@ -1245,21 +1251,22 @@ def verify_parity(src_text: str, filename: str, obf_code: types.CodeType,
                     acc.add(e)
             return acc
 
-        added_tuple_leaves = set()
-        for u in rb:
+        obf_tuple_leaves = set()
+        for u in sb:
             if isinstance(u, (tuple, frozenset)) and u:
-                str_leaves(u, added_tuple_leaves)
+                str_leaves(u, obf_tuple_leaves)
 
         def fold_degraded(t) -> bool:
             """★真实项目伴生★：全常量容器字面量（list-of-tuples 路由权限表 /
             set 字面量折叠为 frozenset）被 3.12 编译器整体折叠为常量；任一 str
             叶子被加密替换为 _pkobf_d(idx) Call 后整体折叠失效——未加密叶子以
             更低折叠粒度散现（子元组或散串）、加密叶子进密钥表。递归 str 叶子
-            逐个 ∈ (str_table ∪ 新现散串 ∪ 新现子元组叶子) 全命中才放行，部分
-            命中必是真实漂移。"""
+            逐个 ∈ (str_table ∪ 混淆侧字符串池 ∪ 混淆侧子元组叶子池) 全命中才放行；
+            两池同 keymap_degraded 取 sb 全集（避免同串被 co_consts 去重后
+            从差集消失），部分命中必是真实漂移。"""
             leaves = str_leaves(t)
-            return bool(leaves) and all(x in str_table or x in added_strs
-                                        or x in added_tuple_leaves
+            return bool(leaves) and all(x in str_table or x in obf_strs
+                                        or x in obf_tuple_leaves
                                         for x in leaves)
 
         def fold_member(x) -> bool:

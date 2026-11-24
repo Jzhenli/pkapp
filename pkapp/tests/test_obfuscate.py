@@ -1286,6 +1286,45 @@ def test_parity_constkey_map_degraded_negative():
                       module_id="app.m")
 
 
+def test_parity_constkey_degraded_key_reused_in_scope():
+    """★回归★ 退化 dict 的短键在同一 code object 另有独立出现（真实项目
+    config.py：'data' 既是路径段 ".xcontrol"/"data" 又是外层 dict 键）——
+    co_consts 去重后 SET 差把它抵消成「既不消失也不新现」，致整条键元组
+    无合法解释；散现池改取混淆侧常量全集后须放行。"""
+    src = ('def go(v):\n'
+           '    p = "data"\n'
+           '    return {"log": 1, "data": p, "simulator": v}\n')
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="app.m")
+    assert "simulator" in stats["str_table"]      # 长键加密 → BUILD_MAP 退化
+    verify_parity(src, "m.py", code, stats, string_key=_KEY, module_id="app.m")
+
+
+def test_parity_fold_degraded_leaf_reused_in_scope():
+    """★回归★ 同类 SET 差抵消：全常量 set 折叠体的短叶子在同 scope 另有
+    独立出现——加密叶子使折叠失效后该叶子散现，co_consts 去重致「新现散串」
+    判定漏掉它、fold_degraded 误拒；散现池取混淆侧全集后须放行。"""
+    src = ('SHORT = "viewer"\n'
+           'ROLES = {"admin", "viewer", "device.read"}\n')
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="app.m")
+    assert "device.read" in stats["str_table"]
+    verify_parity(src, "m.py", code, stats, string_key=_KEY, module_id="app.m")
+
+
+def test_parity_fold_degraded_leaf_reused_negative():
+    """验牙⑤：散现池放宽到混淆侧全集后仍能验真——抽走加密叶子的密钥表条目，
+    该叶子既不在表也不在混淆侧常量池（已密文化）→ 部分命中必拒。"""
+    src = ('SHORT = "viewer"\n'
+           'ROLES = {"admin", "viewer", "device.read"}\n')
+    code, stats = compile_obfuscated(src, "m.py", string_key=_KEY,
+                                     module_id="app.m")
+    stats["str_table"] = [s for s in stats["str_table"] if s != "device.read"]
+    with pytest.raises(ParityError, match="消失常量"):
+        verify_parity(src, "m.py", code, stats, string_key=_KEY,
+                      module_id="app.m")
+
+
 def test_parity_docstring_none_slot():
     """docstring 剥离伴生（真实项目 db.py 抓出）：3.12 函数 scope const 池恒带
     docstring 槽位，无 docstring 时填 None 占位——原码「docstring + 全函数无

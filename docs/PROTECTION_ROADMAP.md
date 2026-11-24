@@ -151,7 +151,7 @@ v1.0 的 per-app × per-build salt 设计**推翻了 G5 的跨构建稳定前提
 
 ### 4.2 P1.5-mix-str：覆盖面扩两项，降级执行
 
-- ① JoinedStr（f-string）常量段放开——收益低（多为日志文案），后置；② `_MIN_STR` 16→8（forbidden 机制已防同串断裂）——随 P1 顺手做 ✅（落地含伴生对拍规则：全常量键 dict 任一键被加密后 3.12 由 BUILD_CONST_KEY_MAP 退化 BUILD_MAP，键元组消失/未加密键散现，verify_parity 按「键元组逐元素 ∈ str_table ∪ 新现散串」全命中放行）。技术上无不可落地项，性价比低于 RFT，不单独立项。
+- ① JoinedStr（f-string）常量段放开——收益低（多为日志文案），后置；② `_MIN_STR` 16→8（forbidden 机制已防同串断裂）——随 P1 顺手做 ✅（落地含伴生对拍规则：全常量键 dict 任一键被加密后 3.12 由 BUILD_CONST_KEY_MAP 退化 BUILD_MAP，键元组消失/未加密键散现，verify_parity 按「键元组逐元素 ∈ str_table ∪ 混淆侧散现串池」全命中放行；散现池取混淆侧常量全集而非差集——同 scope 他处同串会被 co_consts 去重抵消，差集判定误杀）。技术上无不可落地项，性价比低于 RFT，不单独立项。
 
 ---
 
