@@ -50,7 +50,8 @@
 - 改名面扩到模块级 def/async def + 顶层变量：全局唯一计数器分配 _o{n}（★R-12★
   与函数局部续位不重号）；类名豁免（cls-v1，理由见 build_rename_plan docstring）。
 - 消费端同步三通道：模块内引用（self_map 预填 root + _lookup 上溯到 module
-  scope，global 引用/递归自引用同步）；import 属性链（import_roots + 链解析
+  scope；global 引用/递归自引用同步，★global 声明语句★名串亦须同步，否则
+  函数体引用被编译为局部名 → 赋值前读取 UnboundLocalError）；import 属性链（import_roots + 链解析
   内→外，子模块名前进/map 命中改写；rebind 防线 + 站点级遮蔽检查）；from-import
   （from_rewrite 改源名 + asname 回填保绑定名）。
 - 豁免合同（六类 reason 常驻构建日志）：str-hit / submodule-shadow /
@@ -242,34 +243,47 @@ class _Renamer(ast.NodeTransformer):
         ★RFT★ plan 在位时两处放宽：function scope 的 global 引用不再止步
         （继续上溯到 module scope 查 self_map——模块级名参与改名后，函数内的
         global 引用/递归自引用必须同步，否则 global x = ... 赋旧名 = 断裂）；
-        module scope 查 self_map 命中即改。plan 缺省 → 与一期逐位一致。"""
+        module scope 查 self_map 命中即改。plan 缺省 → 与一期逐位一致。
+        ★R-13★ 台账在此统一登记——所有改名都经 lookup（含 except/match 捕获名、
+        nonlocal/global 声明名等字符串字段），避免散落入口漏登导致对拍误报。
+        ★global 声明★：一旦途经的 function scope 把名字标为 global，后续中间
+        函数/类作用域的同名局部绑定与映射一律跳过，直取模块级映射——否则
+        `global X` 会被误改成外层同名局部变量的新名。"""
         s: _Scope | None = self._stack[-1]
+        new: str | None = None
+        global_decl = False
         while s is not None:
             if s.kind == "function":
-                new = s.mapping.get(name)
-                if new is not None:
-                    return new
                 sym = s.symbols.get(name)
-                if sym is not None and (sym.is_local() or sym.is_parameter()):
-                    return None          # 本层绑定（含参数遮蔽）→ 止步不改
+                if sym is not None and sym.is_global():
+                    global_decl = True
+                if not global_decl:
+                    new = s.mapping.get(name)
+                    if new is not None:
+                        break
+                    new = None
+                    if sym is not None and (sym.is_local() or sym.is_parameter()):
+                        return None      # 本层绑定（含参数遮蔽）→ 止步不改
                 if (self._plan is None and sym is not None and sym.is_global()):
                     return None          # 一期：global → 止步不改
             elif s.kind == "class":
                 sym = s.symbols.get(name)
-                if sym is not None and sym.is_local():
+                if not global_decl and sym is not None and sym.is_local():
                     return None          # 类体内名是合同（pydantic 字段等）
             elif s.kind == "module":
                 if self._plan is not None:
                     new = self._plan.self_map.get(self._mid, {}).get(name)
                     if new is not None:
-                        return new       # 模块级名映射（RFT）
+                        break            # 模块级名映射（RFT）
                 return None              # builtins / 未映射名
             else:
                 sym = s.symbols.get(name)
-                if sym is not None and sym.is_local():
+                if not global_decl and sym is not None and sym.is_local():
                     return None          # type parameter 等包装块的绑定名（类型形参）
             s = s.parent
-        return None
+        if new is not None:
+            self.ledger.add((name, new))  # ★R-13★ 对拍第一表：lookup 改名统一登记
+        return new
 
     # ---- docstring 剥离 ----
     def _strip_docstring(self, node) -> None:
@@ -433,9 +447,8 @@ class _Renamer(ast.NodeTransformer):
 
     # ---- 表达式级节点 ----
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        new = self._lookup(node.id)
+        new = self._lookup(node.id)              # 命中即由 _lookup 统一登记台账
         if new is not None:
-            self.ledger.add((node.id, new))     # ★R-13★ 对拍台账
             node.id = new                       # ctx 无关：Store/Load/Del 统一（漏改 Del 会 NameError）
         return node
 
@@ -506,6 +519,12 @@ class _Renamer(ast.NodeTransformer):
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> ast.Nonlocal:
         # nonlocal 语句名串须与定义 scope 的映射一致（漏改 = SyntaxError 断裂）
+        node.names = [self._lookup(nm) or nm for nm in node.names]
+        return node
+
+    def visit_Global(self, node: ast.Global) -> ast.Global:
+        # global 语句名串同步模块级改名；漏改会让函数体引用编译为局部名 →
+        # 赋值前读取抛 UnboundLocalError（global 无字节码，R-13 对拍看不见）
         node.names = [self._lookup(nm) or nm for nm in node.names]
         return node
 

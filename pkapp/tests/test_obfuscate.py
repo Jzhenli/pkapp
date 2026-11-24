@@ -1325,6 +1325,113 @@ def test_parity_fold_degraded_leaf_reused_negative():
                       module_id="app.m")
 
 
+def test_parity_unused_except_name_in_ledger():
+    """★回归★ except-as 捕获名未在块体内使用（真实项目 opcua/params.py 的 e）：
+    字符串字段改名绕开 visit_Name，须由 visit_ExceptHandler 补登台账。"""
+    src = ('def f(v):\n'
+           '    try:\n'
+           '        x = float(v)\n'
+           '    except (TypeError, ValueError) as e:\n'
+           '        raise ValueError("bad") from None\n'
+           '    return x\n')
+    code, stats = compile_obfuscated(src, "m.py")
+    assert any(o == "e" for o, _ in stats["ledger"])
+    verify_parity(src, "m.py", code, stats)
+    stats["ledger"] = frozenset(x for x in stats["ledger"] if x[0] != "e")
+    with pytest.raises(ParityError, match="locals"):
+        verify_parity(src, "m.py", code, stats)
+
+
+def test_parity_unused_match_capture_in_ledger():
+    """★回归★ match 捕获名（MatchAs / MatchStar / MatchMapping.rest）未在 case
+    体内使用：三处字符串字段改写都须补登台账，否则 locals 出现无来源漂移。"""
+    src = ('def f(v):\n'
+           '    match v:\n'
+           '        case {"a": x, **rest}:\n'
+           '            pass\n'
+           '        case [first, *tail]:\n'
+           '            pass\n'
+           '        case last:\n'
+           '            pass\n'
+           '    return 1\n')
+    code, stats = compile_obfuscated(src, "m.py")
+    captures = {"x", "rest", "first", "tail", "last"}
+    assert captures <= {o for o, _ in stats["ledger"]}
+    verify_parity(src, "m.py", code, stats)
+    stats["ledger"] = frozenset(
+        x for x in stats["ledger"] if x[0] not in captures)
+    with pytest.raises(ParityError, match="locals"):
+        verify_parity(src, "m.py", code, stats)
+
+
+def test_parity_nonlocal_name_in_ledger():
+    """nonlocal 声明名字符串字段同步登记台账（与外层局部绑定同一映射）。"""
+    src = ('def outer():\n'
+           '    v = 1\n'
+           '    def inner():\n'
+           '        nonlocal v\n'
+           '    inner()\n'
+           '    return v\n')
+    code, stats = compile_obfuscated(src, "m.py")
+    new_v = next(new for old, new in stats["ledger"] if old == "v")
+    tree, _ = transform(ast.parse(src), "m.py")
+    nonlocal_names = [n.names for n in ast.walk(tree)
+                      if isinstance(n, ast.Nonlocal)]
+    assert nonlocal_names == [[new_v]]           # 声明名字符串字段同步改名并入台账
+    assert ("v", new_v) in stats["ledger"]
+    verify_parity(src, "m.py", code, stats)
+
+
+def test_rft_global_declaration_renamed():
+    """★回归★ RFT 模块级名改名时 global 声明名串须同步：漏改会让函数体对
+    全局的读写被编译为局部名，赋值前读取抛 UnboundLocalError。global 语句
+    无字节码，R-13 对拍天然看不见——旧版本构建通过、打包后启动才炸。"""
+    src = ('FLAG = False\n'
+           'def f():\n'
+           '    global FLAG\n'
+           '    if FLAG:\n'
+           '        return 1\n'
+           '    FLAG = True\n'
+           '    return 2\n')
+    plan = build_rename_plan({"m.py": src})
+    code, stats = compile_obfuscated(src, "m.py", plan=plan)
+    verify_parity(src, "m.py", code, stats)
+    new_flag = next(new for old, new in stats["ledger"] if old == "FLAG")
+    tree, _ = transform(ast.parse(src), "m.py", plan=plan)
+    g = next(n for n in ast.walk(tree) if isinstance(n, ast.Global))
+    assert g.names == [new_flag]                   # 声明名与模块级新名一致
+    new_f = next(new for old, new in stats["ledger"] if old == "f")
+    ns = {}
+    exec(code, ns)
+    f = ns[new_f]
+    assert (f(), f()) == (2, 1)                    # 运行期全局状态真实生效
+
+
+def test_rft_global_declaration_vs_outer_local():
+    """★回归★ 内层 `global X` 与外层局部 X 同名：声明名只取模块级映射，
+    不能误取外层同名局部变量的新名（否则运行期写错作用域）。"""
+    src = ('X = 0\n'
+           'def outer():\n'
+           '    X = 1\n'
+           '    def inner():\n'
+           '        global X\n'
+           '        X = 2\n'
+           '    inner()\n'
+           '    return X\n')
+    plan = build_rename_plan({"m.py": src})
+    code, stats = compile_obfuscated(src, "m.py", plan=plan)
+    verify_parity(src, "m.py", code, stats)
+    module_x = plan.map[("app.m", "X")]
+    tree, _ = transform(ast.parse(src), "m.py", plan=plan)
+    g = next(n for n in ast.walk(tree) if isinstance(n, ast.Global))
+    assert g.names == [module_x]                   # 模块级 X，而非外层局部 X
+    new_outer = next(new for old, new in stats["ledger"] if old == "outer")
+    ns = {}
+    exec(code, ns)
+    assert ns[new_outer]() == 1                    # 外层局部 X 未被污染
+    assert ns[module_x] == 2                       # 模块级 X 被 inner 写入
+
+
 def test_parity_docstring_none_slot():
     """docstring 剥离伴生（真实项目 db.py 抓出）：3.12 函数 scope const 池恒带
     docstring 槽位，无 docstring 时填 None 占位——原码「docstring + 全函数无
