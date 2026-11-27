@@ -174,9 +174,35 @@ def _encrypt_applocal_boot(stage: str, kl: KeyLib, key: bytes,
           f"{len(payload)}B → {blob_name(APPLOCAL_BOOT_MID)}）")
 
 
+def _check_no_namespace_packages(stage_app: str) -> None:
+    """加密 finder 只认 index.enc 中登记的模块（逐 .py 落 blob），隐式命名空间
+    包（目录含 .py 但缺 __init__.py）不会入索引——源码态可导入、打包后
+    ImportError。构建期 fail-fast：列出所有缺 __init__.py 的包目录（含中间
+    层），提示补空 __init__.py 或关闭 code_encryption。一次 walk 收集包目录
+    集合后纯集合判定，避免逐文件重复 stat。"""
+    files = walk_files(stage_app)
+    packages = {rel.rpartition("/")[0] for rel in files
+                if rel.endswith("/__init__.py")}
+    missing: set[str] = set()
+    for rel in files:
+        if not rel.endswith(".py"):
+            continue
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            d = "/".join(parts[:i])
+            if d not in packages:
+                missing.add(d)
+    if missing:
+        raise BuildError(
+            "code_encryption 不支持命名空间包（缺 __init__.py 的目录不进 "
+            "index.enc，打包后运行期 ImportError）: " + ", ".join(sorted(missing))
+            + "——请为上述目录补 __init__.py（空文件即可）或关闭 code_encryption")
+
+
 def _encrypt_app_tree_inner(stage_app: str, kl: KeyLib, key: bytes,
                             pyc_tag: str) -> str:
     """加密执行体（kl = K_app 烧件/补丁件；加密走参数 K、回验走内嵌 K）。"""
+    _check_no_namespace_packages(stage_app)
     mids: list[str] = []
     for rel in walk_files(stage_app):
         if not rel.endswith(".py"):
