@@ -350,6 +350,20 @@ def test_login_page_dist_override_and_fallback(env):
     assert hdrs.get("cache-control") == "no-store"      # 登录页不缓存
 
 
+def test_lan_spa_fallback_yields_api_and_docs(env):
+    """lan 门后静态同样不得截走 API/文档路径；真 SPA 路由仍走 index.html。"""
+    os.makedirs(env / "dist", exist_ok=True)
+    (env / "dist" / "index.html").write_text("<html>idx</html>", encoding="utf-8")
+    app = _gate(env)
+    cookie = _login(app)
+    hdrs = {"Accept": "text/html", "Cookie": cookie}
+    for p in ("/api/x", "/docs", "/docs/", "/redoc", "/openapi.json"):
+        s, body, _ = _runx(app, path=p, headers=hdrs)
+        assert s == 200 and b'"user": "admin"' in body, p   # 穿过门到用户 app
+    s, body, _ = _runx(app, path="/devices/42", headers=hdrs)
+    assert s == 200 and b"idx" in body                      # SPA 路由兜底未破
+
+
 def test_admin_seeded_default_password(env, capsys):
     app = _gate(env)                                    # 门构造即种初始管理员
     err = capsys.readouterr().err

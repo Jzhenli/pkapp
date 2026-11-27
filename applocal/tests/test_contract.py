@@ -305,6 +305,30 @@ def test_static_serve_and_spa_fallback(env):
     assert status == 401                                             # 穿越不落静态分支 → 走鉴权
 
 
+def test_spa_index_excludes_non_spa_namespaces(env):
+    static = str(env / "dist")
+    assert _core._spa_index(static, "/login") == os.path.join(static, "index.html")
+    for p in ("/api", "/api/", "/api/x", "/docs", "/docs/", "/redoc",
+              "/openapi.json", "/user/john.doe"):
+        assert _core._spa_index(static, p) is None, p
+
+
+def test_spa_fallback_yields_api_and_docs_to_user_app(env):
+    """浏览器导航（Accept: text/html）访问 API/文档路径不得被 index.html 截走。"""
+    dist = env / "dist"
+    dist.mkdir(exist_ok=True)
+    (dist / "index.html").write_text("<html>idx</html>", encoding="utf-8")
+    app = applocal.build_asgi_app(_ok_app, _cfg(env, strict=True))
+    hdrs = {"Accept": "text/html", "X-MYAPP-Token": "T" * 32}
+    for p in ("/api/x", "/api", "/docs", "/docs/", "/redoc", "/openapi.json"):
+        status, body, _ = _run(app, path=p, headers=hdrs)
+        assert status == 200 and b'{"api":true}' in body, p   # 到得了用户 app
+    status, body, _ = _run(app, path="/healthz", headers={"Accept": "text/html"})
+    assert status == 200 and b'"ok"' in body                   # 心跳仍恒豁免
+    status, body, _ = _run(app, path="/login", headers={"Accept": "text/html"})
+    assert status == 200 and b"idx" in body                    # 真 SPA 路由仍兜底
+
+
 def test_static_read_race_falls_through(env, monkeypatch):
     dist = env / "dist"
     dist.mkdir(exist_ok=True)

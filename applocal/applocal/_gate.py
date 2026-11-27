@@ -26,7 +26,7 @@ import urllib.parse
 
 from . import rbac
 from ._core import (_AUTH_BODY_MAX, _MIME, _header, _json, _read_static,
-                    _resolve_static, _respond, _wants_html)
+                    _resolve_static, _respond, _spa_index, _wants_html)
 from .session import (RateLimiter, SessionStore, UserStore, cookie_clear_header,
                       cookie_header, cookie_token)
 
@@ -194,7 +194,7 @@ def build_lan_app(user_app, cfg, *, roles_table=None, route_perms=None):
             static = cfg.paths.static_dir
             hit = _resolve_static(static, scope["path"])
             if hit is None and _wants_html(scope):
-                hit = os.path.join(static, "index.html")     # SPA 路由兜底
+                hit = _spa_index(static, scope["path"])      # SPA 路由兜底（排除非 SPA 命名空间）
             if hit and os.path.isfile(hit):
                 body = _read_static(hit)
                 if body is not None:

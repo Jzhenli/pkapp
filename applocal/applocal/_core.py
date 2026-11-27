@@ -215,6 +215,27 @@ def _wants_html(scope) -> bool:
     return "text/html" in _header(scope, "accept")
 
 
+# SPA 兜底保留命名空间：这些路径永不替换为 index.html，交回鉴权链/用户应用。
+_SPA_EXCLUDE = frozenset({"/api", "/docs", "/redoc", "/openapi.json"})
+# /healthz 在两条链的静态分支之前已恒豁免（_core / _gate 最外层），无需列入。
+
+
+def _spa_index(static_dir: str, path: str) -> str | None:
+    """SPA 路由兜底目标；非 SPA 命名空间（API/文档/带扩展名资源）返回 None。
+
+    浏览器直接导航 /api/x、/docs 等路径时 Accept 含 text/html，旧逻辑无差别
+    返回 index.html，用户 app 永远拿不到请求。统一收口到本函数，非 lan/lan
+    两种链序共用，避免两处规则漂移。尾斜杠归一（/docs/ 亦命中）；点号分段
+    视为资源路径（SPA 路由约定为无扩展名）。
+    """
+    p = path.rstrip("/") or "/"
+    if p in _SPA_EXCLUDE or p.startswith("/api/"):
+        return None
+    if "." in p.rsplit("/", 1)[-1]:
+        return None
+    return os.path.join(static_dir, "index.html")
+
+
 def _resolve_static(static_dir: str, path: str) -> str | None:
     """dist 内已存在的文件 → 返回绝对路径；防路径穿越；目录 → index.html。"""
     rel = (path or "/").lstrip("/") or "index.html"
@@ -303,7 +324,7 @@ def build_asgi_app(user_app, cfg: Cfg | None = None, *,
         if method in ("GET", "HEAD"):                 # HEAD 同属静态豁免面（§8①）
             hit = _resolve_static(static, path)
             if hit is None and _wants_html(scope):
-                hit = os.path.join(static, "index.html")  # SPA 路由兜底
+                hit = _spa_index(static, path)            # SPA 路由兜底（排除非 SPA 命名空间）
             if hit and os.path.isfile(hit):
                 body = _read_static(hit)
                 if body is not None:                      # isfile 后被删等竞态 → 视为未命中
