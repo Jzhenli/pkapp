@@ -11,6 +11,8 @@
 """
 import os as _os
 import time as _time
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _dist_version
 
 _IMPORT_T0 = _time.perf_counter()  # 模块导入起点（__init__ 自身 + _core 链）
 
@@ -26,7 +28,10 @@ from ._core import (bootstrap, build_asgi_app, diag, migrate, on_background,
 from ._audit import record_event
 from ._env import ContractError, load_env
 
-__version__ = "0.1.0"
+try:
+    __version__ = _dist_version("applocal")   # 版本单源 = 安装元数据（vendor 闸门对账 pyproject）
+except _PackageNotFoundError:
+    __version__ = "0+unknown"                 # 源码树未安装：仅供 import 不炸，不参与发布
 
 APP_DIR = "app"  # 保留常量：用户代码 import 根目录名
 

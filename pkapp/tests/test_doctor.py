@@ -16,6 +16,20 @@ def test_doctor_reports_problems(tmp_path, capsys):
     assert "[doctor]" in out and "WebView2" in out
 
 
+def test_doctor_flags_applocal_version_drift(tmp_path, capsys, monkeypatch):
+    """版本列车：.venv 中 applocal 与内置 wheel 不等即报漂移（不再只按下限放行）。"""
+    from pkapp import vendor
+    from pkapp.commands import doctor as doctor_mod
+
+    root = str(tmp_path / "demo")
+    assert cmd_create("demo", root, no_venv=True) == 0
+    monkeypatch.setattr(doctor_mod, "_venv_applocal_version", lambda _p: "0.1.17")
+    monkeypatch.setattr(vendor, "applocal_wheel_version", lambda: "0.1.18")
+    cmd_doctor(root)
+    out = capsys.readouterr().out
+    assert "版本列车期望=0.1.18" in out and "0.1.17" in out
+
+
 # ---------------------------------------------------------------- ★P0★ Q5 离线审计
 def _make_deployed(tmp_path, name="deploy"):
     """项目（.pkapp/sign.key）+ 部署面（exe 旁侧车 + _runtime 树）→ (proj, install, rt)。"""

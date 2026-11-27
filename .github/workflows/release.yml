@@ -172,7 +172,12 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} 与 pkapp/pyproject.toml version ${PKG_VER} 不一致，拒绝发布"
             exit 1
           fi
-          echo "version check ok: v${PKG_VER}"
+          AL_VER=$(python -c "import tomllib; print(tomllib.load(open('applocal/pyproject.toml','rb'))['project']['version'])")
+          if [ "$PKG_VER" != "$AL_VER" ]; then
+            echo "::error::版本列车断裂：pkapp ${PKG_VER} ≠ applocal ${AL_VER}，拒绝发布"
+            exit 1
+          fi
+          echo "version check ok: v${PKG_VER}（applocal 同版本）"
       - name: Build Windows shell (build.bat)
         working-directory: shell-windows
         run: .\build.bat

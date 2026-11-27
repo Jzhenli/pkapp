@@ -65,15 +65,20 @@ def test_dev_applocal_auto_align(tmp_path, monkeypatch, capsys):
     dev_mod._align_applocal("py")
     assert "--no-index" in calls[-1] and "applocal==9.9.9" in calls[-1]
     assert "0.1.10 → 9.9.9" in capsys.readouterr().out
-    # 已对齐（9.9.9 ≥ 9.9.9）→ 只有 probe，不动
+    # 已对齐（9.9.9 == 9.9.9）→ 只有 probe，不动
     probe_out = "9.9.9 0\n"
     before = len(calls)
     dev_mod._align_applocal("py")
     assert len(calls) == before + 1 and capsys.readouterr().out == ""
+    # 超前版本也对齐回内置（版本列车等值，非单向 >=）
+    probe_out = "9.9.10 0\n"
+    dev_mod._align_applocal("py")
+    assert "applocal==9.9.9" in calls[-1] and "9.9.10 → 9.9.9" in capsys.readouterr().out
+    before = len(calls)
     # editable（源码调试契约层）→ 绝不 clobber
     probe_out = "0.1.10 1\n"
     dev_mod._align_applocal("py")
-    assert len(calls) == before + 2
+    assert len(calls) == before + 1
     # 未装 applocal（probe 失败）→ 补装
     calls.clear()
 

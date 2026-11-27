@@ -164,7 +164,7 @@ def _align_applocal(py: str) -> None:
         return
     if have is not None:
         from ..appspec._core import _ver_tuple
-        if _ver_tuple(have) >= _ver_tuple(want):
+        if _ver_tuple(have) == _ver_tuple(want):
             return
     try:
         s = subprocess.run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check",

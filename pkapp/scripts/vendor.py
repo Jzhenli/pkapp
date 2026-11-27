@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from functools import partial
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -206,8 +207,21 @@ def _vendor_android_shell(vroot: str, root: str) -> tuple[str, str]:
     return "OK", f"_vendor/shell-android（android 壳模板 {n} 个源码文件）"
 
 
+def _pyproject_version(root: str, pkg: str) -> str:
+    with open(os.path.join(root, pkg, "pyproject.toml"), "rb") as f:
+        return tomllib.load(f)["project"]["version"]
+
+
 def _build_applocal_wheel(vroot: str, root: str) -> tuple[str, str]:
-    """applocal 离线 wheel 构建（applocal 不在 PyPI——build/create 零配置入口全靠它）。"""
+    """applocal 离线 wheel 构建（非 PyPI 私有件的零配置入口）。
+
+    ★版本列车★：applocal 与 pkapp 共用版本号（pkapp/pyproject 为事实源）——
+    版本不一致或 wheel 文件名版本不符即 SKIP（applocal-wheel 是硬闸门，发布拒收）。
+    """
+    want = _pyproject_version(root, "pkapp")
+    have = _pyproject_version(root, "applocal")
+    if want != have:
+        return "SKIP", f"版本闸门失败：pkapp {want} ≠ applocal {have}（版本列车须一致）"
     wheels_dir = os.path.join(vroot, "wheels")
     shutil.rmtree(wheels_dir, ignore_errors=True)   # 防旧版本 wheel 滞留进 pkapp wheel
     os.makedirs(wheels_dir, exist_ok=True)
@@ -215,8 +229,11 @@ def _build_applocal_wheel(vroot: str, root: str) -> tuple[str, str]:
                         "-w", wheels_dir, os.path.join(root, "applocal")])
     if r.returncode != 0:
         return "SKIP", "applocal wheel 构建失败"
-    n = len([f for f in os.listdir(wheels_dir) if f.endswith(".whl")])
-    return "OK", f"_vendor/wheels（{n} wheel）"
+    wheels = [f for f in os.listdir(wheels_dir) if f.endswith(".whl")]
+    built = [f.split("-")[1] for f in wheels if f.startswith("applocal-")]
+    if built != [want]:
+        return "SKIP", f"applocal wheel 版本 {built} ≠ 期望 {want}"
+    return "OK", f"_vendor/wheels（{len(wheels)} wheel，版本 {want}）"
 
 
 def run(argv: list[str] | None = None, root: str = ROOT) -> int:

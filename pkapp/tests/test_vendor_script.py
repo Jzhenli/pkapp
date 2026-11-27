@@ -62,6 +62,10 @@ def fake_repo(tmp_path):
     sa.mkdir(parents=True)
     (sa / "AndroidManifest.xml").write_text("<manifest/>", encoding="utf-8")
     (root / "applocal").mkdir()
+    (root / "pkapp").mkdir()
+    for pkg in ("pkapp", "applocal"):
+        (root / pkg / "pyproject.toml").write_text(
+            '[project]\nversion = "0.0.0"\n', encoding="utf-8")
     sl = root / "shell-linux" / "build"                   # launcher ELF ×3（arch 分位）
     (sl / "aarch64").mkdir(parents=True)
     (sl / "armv7l").mkdir()
@@ -278,15 +282,32 @@ def test_applocal_wheel_clears_stale_wheels(vendor_mod, fake_repo, monkeypatch):
     with open(os.path.join(wheels_dir, "applocal-0.0.9-py3-none-any.whl"), "wb") as f:
         f.write(b"stale-wheel")
 
-    class _R:                                        # pip 假跑：成功、不产 wheel
+    class _R:                                        # pip 假跑：成功
         returncode = 0
 
-    monkeypatch.setattr(vendor_mod.subprocess, "run", lambda *_a, **_k: _R())
+    def _fake_pip(*_a, **_k):
+        with open(os.path.join(wheels_dir, "applocal-0.0.0-py3-none-any.whl"), "wb") as f:
+            f.write(b"fake-wheel")
+        return _R()
+
+    monkeypatch.setattr(vendor_mod.subprocess, "run", _fake_pip)
     status, detail = vendor_mod._build_applocal_wheel(
         os.path.join(fake_repo, "pkapp", "pkapp", "_vendor"), fake_repo)
-    assert status == "OK" and "0 wheel" in detail
+    assert status == "OK" and "1 wheel" in detail
     assert not os.path.isfile(os.path.join(wheels_dir,
                                            "applocal-0.0.9-py3-none-any.whl"))
+    assert os.path.isfile(os.path.join(wheels_dir,
+                                       "applocal-0.0.0-py3-none-any.whl"))
+
+
+def test_applocal_wheel_version_gate(vendor_mod, fake_repo):
+    """版本列车闸门：pkapp/applocal pyproject 不一致 → SKIP（硬闸门拒发布）。"""
+    with open(os.path.join(fake_repo, "applocal", "pyproject.toml"), "w",
+              encoding="utf-8") as f:
+        f.write('[project]\nversion = "9.9.9"\n')
+    status, detail = vendor_mod._build_applocal_wheel(
+        os.path.join(fake_repo, "pkapp", "pkapp", "_vendor"), fake_repo)
+    assert status == "SKIP" and "版本闸门失败" in detail
 
 
 def test_locate_dll_android_env_only(monkeypatch):

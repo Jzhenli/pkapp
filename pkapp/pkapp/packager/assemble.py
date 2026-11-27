@@ -19,7 +19,7 @@ from . import runtime
 from .closure import check_closure
 from .consolidate import APPLOCAL_UNIT, _consolidate_site_packages
 from .deps import (_android_pip_tags, _detect_applocal, _install_site_packages,
-                   _linux_pip_tags, _wheels_cache)
+                   _linux_pip_tags, _wheels_cache, pin_applocal)
 from .emit import _emit_spk, _manifest_fields
 from .encrypt import _encrypt_app_tree, _ensure_same_runtime_version
 from .errors import BuildError
@@ -120,7 +120,10 @@ def build_spk(project_dir: str, spec: AppSpec, platform: str, out_path: str, *,
         # 5) site-packages + B.v certifi 断言（依赖 = 公共 + 平台段追加，AppSpec §platforms）
         #    wheels_dir 缺省 → 全局托管缓存（<cache_root>/wheels/windows，跨项目/跨次构建复用）
         index_url, extra_index = spec.wheels_index(platform)
-        sp_dir = _install_site_packages(stage, spec.deps_for(platform),
+        deps = spec.deps_for(platform)
+        if wheels_dir is None:
+            deps = pin_applocal(deps)             # 托管缓存路径：契约层锁到内置 wheel 版本
+        sp_dir = _install_site_packages(stage, deps,
                                         wheels_dir or _wheels_cache(platform),
                                         allow_download=wheels_dir is None,
                                         index_url=index_url, extra_index_url=extra_index)
@@ -229,7 +232,10 @@ def _build_spk_android(project_dir: str, spec: AppSpec, out_path: str, *,
         #    分层防跨 ABI 互踩）；交叉安装 + 平台 wheel 源（AppSpec
         #    [platforms.android].extra_index_url，如 flet 索引）
         index_url, extra_index = spec.wheels_index("android")
-        sp_dir = _install_site_packages(stage, spec.deps_for("android"),
+        deps = spec.deps_for("android")
+        if wheels_dir is None:
+            deps = pin_applocal(deps)
+        sp_dir = _install_site_packages(stage, deps,
                                         wheels_dir or _wheels_cache("android",
                                                                    spec.android.abis[0]),
                                         allow_download=wheels_dir is None,
@@ -405,6 +411,8 @@ def _build_spk_linux(project_dir: str, spec: AppSpec, out_path: str, *,
         #    wheels_dir 缺省 → 托管缓存 <root>/wheels/linux/<arch>）
         index_url, extra_index = spec.wheels_index("linux")
         deps = spec.deps_for("linux")
+        if wheels_dir is None:
+            deps = pin_applocal(deps)
         sp_dir = _install_site_packages(stage, deps,
                                         wheels_dir or _wheels_cache("linux", arch),
                                         allow_download=wheels_dir is None,

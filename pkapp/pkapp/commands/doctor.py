@@ -132,9 +132,10 @@ def cmd_doctor(project: str, integrity_dir: str | None = None) -> int:
         al = _venv_applocal_version(project)
         from ..appspec._core import _ver_tuple
         from ..vendor import applocal_wheel_version
-        floor = applocal_wheel_version() or "0.1.0"   # 单一事实源=内置 wheel；无 _vendor 退回历史下限
-        ok = bool(al) and not al.startswith("missing") and _ver_tuple(al) >= _ver_tuple(floor)
-        print(f"[doctor] applocal in .venv: {al}（契约层，下限={floor} 随工具内置 wheel 抬升）")
+        want = applocal_wheel_version() or __import__("pkapp").__version__
+        # 单一事实源=内置 wheel；源码形态无 _vendor 时退回 pkapp 版本（版本列车同号）
+        ok = bool(al) and not al.startswith("missing") and _ver_tuple(al) == _ver_tuple(want)
+        print(f"[doctor] applocal in .venv: {al}（契约层，版本列车期望={want}）")
         if not ok:
             problems += 1
     except SpecError as e:

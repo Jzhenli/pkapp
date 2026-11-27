@@ -209,8 +209,21 @@ def test_seed_vendored_wheel(tmp_path, pkapp_cache, monkeypatch):
     assert len(seeded) == 1
 
     make_wheel(str(src), "applocal", "0.2.0", {"applocal/__init__.py": ""})
-    _seed_vendored_wheel("windows")   # 缓存已有 applocal → 不覆盖
-    assert len([f for f in os.listdir(cache) if f.startswith("applocal-")]) == 1
+    _seed_vendored_wheel("windows")   # 同名幂等；新版本照常播入（精确 pin 决定 pip 选谁）
+    seeded = [f for f in os.listdir(cache) if f.startswith("applocal-")]
+    assert len(seeded) == 2 and any("0.2.0" in f for f in seeded)
+
+
+def test_pin_applocal_to_vendored_version(monkeypatch):
+    """版本列车消费端：构建依赖锁到内置 wheel 版本，缺项则补必装件。"""
+    from pkapp import vendor
+    from pkapp.packager.deps import pin_applocal
+
+    monkeypatch.setattr(vendor, "applocal_wheel_version", lambda: "0.2.0")
+    assert pin_applocal(("applocal>=0.1.0", "uvicorn>=0.30")) == (
+        "applocal==0.2.0", "uvicorn>=0.30")
+    assert pin_applocal(("uvicorn>=0.30",)) == (
+        "uvicorn>=0.30", "applocal==0.2.0")
 
 
 def test_seed_vendored_wheel_absent_quiet(pkapp_cache):

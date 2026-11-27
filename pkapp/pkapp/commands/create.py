@@ -86,13 +86,14 @@ def cmd_create(name: str, target_dir: str | None = None, *,
             print("[create] venv 创建失败（可 --no-venv 跳过）")
             return 1
         py = os.path.join(venv_dir, "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
-        deps = ["applocal>=0.1.0", "uvicorn>=0.30"]
+        from .. import vendor
+        vw = vendor.wheels_dir()
+        want = vendor.applocal_wheel_version()
+        deps = [f"applocal=={want}" if want else "applocal>=0.1.0", "uvicorn>=0.30"]
         if template == "fullstack":
             deps.append("fastapi>=0.115")
-        print(f"[create] 安装依赖（{' + '.join(d.split('>')[0] for d in deps)}）…")
+        print(f"[create] 安装依赖（{' + '.join(d.split('>')[0].split('=')[0] for d in deps)}）…")
         cmd = [py, "-m", "pip", "install", "-q", *deps]
-        from ..vendor import wheels_dir as vendored_wheels
-        vw = vendored_wheels()
         if vw:
             # applocal 不在 PyPI：wheel 安装形态经内置离线 wheel 命中（其余件照常走索引）
             cmd += ["--find-links", vw]

@@ -27,7 +27,7 @@ def _seed_vendored_wheel(platform: str, abis: tuple[str, ...] = ()) -> None:
 
     applocal 不在 PyPI——托管缓存 allow_download 在线补齐永远装不到它，
     "先入缓存"是唯一入口（deps._uncached_deps 剔除语义）。缓存已有
-    applocal 则不覆盖（平台内多版本共存无害，pip 按需求挑）。平台内分层键
+    同名 wheel 不覆盖；新版本 wheel 照常播入（版本列车 + 精确 pin 保证 pip 挑新）。平台内分层键
     （android=abi / ★M3★ linux=arch）各子目录都要播种到——读位在
     _wheels_cache(platform, layer) 子层，种顶层 = 种进永不被读的位置
     （android 双 ABI 缓存混判的同源教训）。
@@ -43,9 +43,9 @@ def _seed_vendored_wheel(platform: str, abis: tuple[str, ...] = ()) -> None:
               if layered else [_wheels_cache(platform)])
     for cache in caches:
         os.makedirs(cache, exist_ok=True)
-        have = {fn.split("-")[0].lower() for fn in os.listdir(cache) if fn.endswith(".whl")}
+        have = {fn.lower() for fn in os.listdir(cache) if fn.endswith(".whl")}
         for fn in os.listdir(src):
-            if fn.endswith(".whl") and fn.split("-")[0].lower() not in have:
+            if fn.endswith(".whl") and fn.lower() not in have:
                 shutil.copyfile(os.path.join(src, fn), os.path.join(cache, fn))
                 print(f"[build] 内置 wheel 已入托管缓存: {fn}")
 

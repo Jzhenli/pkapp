@@ -40,6 +40,28 @@ def _dep_name(req: str) -> str:
     return re.sub(r"[-_.]+", "-", re.split(r"[!<>=~;\[\s]", req.strip(), 1)[0]).lower()
 
 
+def pin_applocal(deps: tuple[str, ...]) -> tuple[str, ...]:
+    """构建期把契约层需求锁到内置 wheel 版本（版本列车，pkapp ≡ applocal）。
+
+    无内置 wheel（源码仓库形态）→ 原样返回；显式 --wheels-dir 供应商目录不走此路径
+    （调用方保留逃生门）。缺 applocal 需求则补一条——它是协议 A 必装件。
+    """
+    from ..vendor import applocal_wheel_version
+    want = applocal_wheel_version()
+    if not want:
+        return tuple(deps)
+    out, seen = [], False
+    for req in deps:
+        if _dep_name(req) == "applocal":
+            out.append(f"applocal=={want}")
+            seen = True
+        else:
+            out.append(req)
+    if not seen:
+        out.append(f"applocal=={want}")
+    return tuple(out)
+
+
 def _wheel_name(fn: str) -> str:
     """wheel 文件名 → 归一化发行版名（Foo_bar-1.0-*.whl → foo-bar）。"""
     return re.sub(r"[-_.]+", "-", fn.split("-", 1)[0]).lower()
